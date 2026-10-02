@@ -264,6 +264,68 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
 }
 
 #[test]
+fn daemon_uses_its_first_poll_to_authenticate_and_detect_fencing() {
+    let directory = TestDirectory::new();
+    let config_dir = directory.config_dir().join("tines-runner-rs");
+    fs::create_dir_all(&config_dir).expect("create runner config directory");
+    fs::write(
+        directory.credentials_path(),
+        "runner_id = \"rnr_daemon\"\nrunner_token = \"daemon-token\"\n",
+    )
+    .expect("write stored runner credentials");
+    let (server_url, server) = mock_server(vec![(
+        409,
+        r#"{"error":{"code":"runner_conflict","message":"another daemon instance is serving this runner; this one has been superseded"}}"#,
+    )]);
+    let credentials_path =
+        toml::Value::String(directory.credentials_path().to_string_lossy().into_owned());
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+        ),
+    )
+    .expect("write runner config");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.configure_command(&mut command);
+    let output = command
+        .env_remove("TINES_API_KEY")
+        .output()
+        .expect("start daemon with a superseded runner token");
+
+    assert!(!output.status.success(), "superseded daemon must exit");
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("Tines superseded this daemon for runner rnr_daemon; exiting"),
+        "unexpected daemon diagnostic: {diagnostic}"
+    );
+
+    let request = server
+        .join()
+        .expect("daemon's first poll request")
+        .remove(0);
+    let (headers, body) = request
+        .split_once("\r\n\r\n")
+        .expect("poll request headers");
+    assert!(headers.contains("POST /api/v1/runners/rnr_daemon/poll HTTP/1.1"));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer daemon-token")
+    );
+    let body: serde_json::Value = serde_json::from_str(body).expect("first poll request JSON");
+    assert!(body["instance_id"].as_str().is_some());
+    assert_eq!(body["owned_runs"], serde_json::json!([]));
+    assert_eq!(body["max_concurrent"], 2);
+    assert_eq!(body["draining"], false);
+}
+
+#[test]
 fn startup_fails_when_saved_runner_token_is_rejected() {
     let directory = TestDirectory::new();
     let config_dir = directory.config_dir().join("tines-runner-rs");

@@ -30,7 +30,9 @@ fn main() -> ExitCode {
 fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     let config = tines_runner_rs::config::Config::load_default()?;
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
-    connection.verify()?;
+    if check {
+        connection.verify()?;
+    }
 
     tracing::info!(
         version = tines_runner_rs::VERSION,
