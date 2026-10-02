@@ -53,6 +53,9 @@ impl ProcessIdentity {
     pub fn matches_live_process(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
+            if self.process_group_id != Some(self.process_id) {
+                return false;
+            }
             let (boot_id, start_time_ticks, process_group_id) =
                 match linux_process_details(self.process_id) {
                     Ok(details) => details,
@@ -72,6 +75,47 @@ impl ProcessIdentity {
 
         #[cfg(not(any(target_os = "linux", windows)))]
         false
+    }
+
+    /// Terminate this process tree only when the stored identity still names
+    /// the same live process generation.
+    ///
+    /// Returns `false` when the process exited or its PID now names a different
+    /// process. This is used during crash recovery, where a stale PID must not
+    /// be treated as ownership of an unrelated process.
+    pub fn terminate_if_matches(&self, grace: Duration) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            if !self.matches_live_process() {
+                return Ok(false);
+            }
+            let Some(process_group_id) = self.process_group_id else {
+                return Ok(false);
+            };
+            signal_unix_group(process_group_id, SIGTERM)?;
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline && unix_group_exists(process_group_id)? {
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            if unix_group_exists(process_group_id)? {
+                signal_unix_group(process_group_id, SIGKILL)?;
+            }
+            Ok(true)
+        }
+
+        #[cfg(windows)]
+        {
+            terminate_windows_process_if_matches(self, grace)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = grace;
+            Ok(false)
+        }
     }
 
     fn for_child(child: &Child) -> Self {
@@ -681,6 +725,8 @@ const WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 #[cfg(windows)]
 const WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 #[cfg(windows)]
+const WINDOWS_PROCESS_TERMINATE: u32 = 0x0001;
+#[cfg(windows)]
 const WINDOWS_THREAD_SUSPEND_RESUME: u32 = 0x0002;
 #[cfg(windows)]
 const WINDOWS_CTRL_BREAK_EVENT: u32 = 1;
@@ -795,6 +841,8 @@ unsafe extern "system" {
     ) -> i32;
     fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
     fn GenerateConsoleCtrlEvent(event: u32, process_group_id: u32) -> i32;
+    fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
     fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> *mut std::ffi::c_void;
     fn GetProcessTimes(
         process: *mut std::ffi::c_void,
@@ -808,6 +856,64 @@ unsafe extern "system" {
     fn Thread32Next(snapshot: *mut std::ffi::c_void, entry: *mut WindowsThreadEntry32) -> i32;
     fn OpenThread(access: u32, inherit_handle: i32, thread_id: u32) -> *mut std::ffi::c_void;
     fn ResumeThread(thread: *mut std::ffi::c_void) -> u32;
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_if_matches(
+    identity: &ProcessIdentity,
+    grace: Duration,
+) -> io::Result<bool> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    let process = unsafe {
+        OpenProcess(
+            WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION | WINDOWS_PROCESS_TERMINATE,
+            0,
+            identity.process_id,
+        )
+    };
+    if process.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(87) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    if identity.start_time_ticks
+        != Some(windows_process_creation_time_from_raw_handle(
+            process.as_raw_handle(),
+        )?)
+    {
+        return Ok(false);
+    }
+    if unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } == 0 {
+        return Ok(false);
+    }
+
+    let _ = windows_generate_console_ctrl_break(
+        identity.process_group_id.unwrap_or(identity.process_id),
+    );
+    let wait_ms = grace.as_millis().min(u128::from(u32::MAX)) as u32;
+    match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), wait_ms) } {
+        0 => return Ok(true),
+        u32::MAX => return Err(io::Error::last_os_error()),
+        _ => {}
+    }
+
+    if unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) } == 0 {
+        let error = io::Error::last_os_error();
+        // A process that exited after the creation-time check is already safe.
+        if unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } == 0 {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    if unsafe { WaitForSingleObject(process.as_raw_handle().cast(), wait_ms) } == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -1100,6 +1206,32 @@ mod tests {
         assert!(result.timed_out);
         assert_eq!(result.exit, ProcessExit::Signal(9));
         assert_descendant_stopped(descendant);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_process_generation_does_not_kill_a_reused_pid() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let process = SupervisedProcess::spawn(&mut command).expect("spawn test harness");
+        let live_identity = process.identity().clone();
+        assert!(live_identity.matches_live_process());
+
+        let mut stale_identity = live_identity.clone();
+        stale_identity.start_time_ticks = stale_identity
+            .start_time_ticks
+            .map(|start| start.saturating_add(1));
+        assert!(
+            !stale_identity
+                .terminate_if_matches(Duration::from_millis(50))
+                .unwrap()
+        );
+        assert!(live_identity.matches_live_process());
+
+        let output = process
+            .wait_timeout(Duration::from_millis(50), Duration::from_millis(50))
+            .expect("stop test harness after identity check");
+        assert!(output.timed_out);
     }
 
     #[cfg(unix)]
