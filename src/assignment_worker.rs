@@ -117,6 +117,7 @@ pub fn run_assignment(
         connection,
         issue_client,
         &capabilities,
+        &config.workspace_retention,
         cancellation,
     )
     .map(|outcome| match outcome {

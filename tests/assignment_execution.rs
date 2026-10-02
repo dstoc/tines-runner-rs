@@ -214,8 +214,14 @@ fn run_case(exit_code: i32, expected_status: &str) {
     let workspace_path = workspace.path().to_path_buf();
     let prepared = PreparedAssignment::new(resolved, workspace);
 
-    execute_assignment(prepared, &connection, &client, &capabilities())
-        .expect("execute and settle assignment");
+    execute_assignment(
+        prepared,
+        &connection,
+        &client,
+        &capabilities(),
+        &config.workspace_retention,
+    )
+    .expect("execute and settle assignment");
     assert!(
         !workspace_path.exists(),
         "workspace is removed after finish"

@@ -10,11 +10,13 @@ use crate::assignment::PreparedAssignment;
 use crate::cancellation::CancellationToken;
 use crate::codex::CodexLaunch;
 use crate::codex_stream::CodexStreamParser;
+use crate::config::WorkspaceRetention;
 use crate::effort::EffortCapabilities;
 use crate::finish::CodexRunReport;
 use crate::process::{ProcessExit, ProcessOutput, SupervisedProcess};
 use crate::protocol::client::{Client, ClientError, ErrorCategory};
 use crate::protocol::{FinishRunRequest, FinishStatus};
+use crate::retention::{self, RetentionError};
 use crate::runner::{RunnerConnection, RunnerError};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -29,12 +31,14 @@ pub fn execute_assignment(
     connection: &RunnerConnection,
     client: &Client,
     capabilities: &EffortCapabilities,
+    retention: &WorkspaceRetention,
 ) -> Result<(), ExecutionError> {
     execute_assignment_cancellable(
         assignment,
         connection,
         client,
         capabilities,
+        retention,
         &CancellationToken::default(),
     )
     .map(|_| ())
@@ -47,6 +51,7 @@ pub fn execute_assignment_cancellable(
     connection: &RunnerConnection,
     client: &Client,
     capabilities: &EffortCapabilities,
+    retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     if cancellation.is_cancelled() {
@@ -123,10 +128,21 @@ pub fn execute_assignment_cancellable(
             .map_err(ExecutionError::WorkspaceCleanup)?;
         return Ok(ExecutionOutcome::Cancelled);
     }
-    assignment
-        .workspace()
-        .cleanup()
-        .map_err(ExecutionError::WorkspaceCleanup)?;
+    let issue_ref = assignment
+        .assignment()
+        .run
+        .issue_ref
+        .as_ref()
+        .map(|issue| format!("{}/{}", issue.project_name, issue.number));
+    retention::settle_workspace(
+        assignment.workspace().path(),
+        retention,
+        &run_id,
+        issue_ref,
+        finish_request.status,
+        finish_request.error.as_deref(),
+    )
+    .map_err(ExecutionError::WorkspaceRetention)?;
     Ok(ExecutionOutcome::Finished)
 }
 
@@ -389,6 +405,7 @@ fn retry_delay(failures: u32) -> Duration {
 pub enum ExecutionError {
     FinishReport(RunnerError),
     WorkspaceCleanup(io::Error),
+    WorkspaceRetention(RetentionError),
 }
 
 impl fmt::Display for ExecutionError {
@@ -401,6 +418,10 @@ impl fmt::Display for ExecutionError {
                     "run finish was accepted, but workspace cleanup failed: {error}"
                 )
             }
+            Self::WorkspaceRetention(error) => write!(
+                f,
+                "run finish was accepted, but workspace retention failed: {error}"
+            ),
         }
     }
 }
@@ -410,6 +431,7 @@ impl Error for ExecutionError {
         match self {
             Self::FinishReport(error) => Some(error),
             Self::WorkspaceCleanup(error) => Some(error),
+            Self::WorkspaceRetention(error) => Some(error),
         }
     }
 }
