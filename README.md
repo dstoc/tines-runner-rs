@@ -3,9 +3,9 @@
 An independent Rust binary for running Tines assignments on a local machine.
 The crate has no dependency on the Tines monorepo or `@tines/shared`.
 
-The executable loads the runner configuration and registers or loads saved
-runner credentials at startup. Polling and assignment execution will be added
-in later steps.
+The executable loads the runner configuration, registers or loads saved runner
+credentials, and makes an authenticated poll at startup. Ongoing polling and
+assignment execution will be added in later steps.
 
 ## Build and run
 

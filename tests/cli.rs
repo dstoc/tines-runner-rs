@@ -67,22 +67,42 @@ fn read_http_request(stream: &mut TcpStream) -> String {
     }
 }
 
-fn registration_server() -> (String, JoinHandle<String>) {
+fn mock_server(responses: Vec<(u16, &'static str)>) -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Tines server");
     let address = listener.local_addr().expect("read mock address");
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept Tines request");
-        let request = read_http_request(&mut stream);
-        let response = r#"{"runner":{"id":"rnr_cli_test"},"runner_token":"cli-runner-token"}"#;
-        write!(
-            stream,
-            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-            response.len()
-        )
-        .expect("write registration response");
-        request
+        responses
+            .into_iter()
+            .map(|(status, body)| {
+                let (mut stream, _) = listener.accept().expect("accept Tines request");
+                let request = read_http_request(&mut stream);
+                let reason = match status {
+                    200 => "OK",
+                    201 => "Created",
+                    401 => "Unauthorized",
+                    _ => "Mock",
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write mock response");
+                request
+            })
+            .collect()
     });
     (format!("http://{address}"), server)
+}
+
+fn registration_server() -> (String, JoinHandle<Vec<String>>) {
+    mock_server(vec![
+        (
+            201,
+            r#"{"runner":{"id":"rnr_cli_test"},"runner_token":"cli-runner-token"}"#,
+        ),
+        (200, r#"{"assignments":[],"cancels":[]}"#),
+    ])
 }
 
 #[test]
@@ -121,14 +141,16 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
         .env("TINES_API_KEY", "bootstrap-key-test")
         .output()
         .expect("start runner for registration");
-    let request = server.join().expect("registration server request");
+    let requests = server
+        .join()
+        .expect("registration and startup poll requests");
 
     assert!(
         first_start.status.success(),
         "startup should register the runner: {}",
         String::from_utf8_lossy(&first_start.stderr)
     );
-    let (headers, body) = request
+    let (headers, body) = requests[0]
         .split_once("\r\n\r\n")
         .expect("registration request headers");
     assert!(headers.contains("POST /api/v1/runners/register HTTP/1.1"));
@@ -142,12 +164,30 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     assert_eq!(body["harness"], "codex");
     assert_eq!(body["max_concurrent"], 2);
 
+    let (poll_headers, _) = requests[1]
+        .split_once("\r\n\r\n")
+        .expect("startup poll request headers");
+    assert!(poll_headers.contains("POST /api/v1/runners/rnr_cli_test/poll HTTP/1.1"));
+    assert!(
+        poll_headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cli-runner-token")
+    );
+
     let saved_credentials = fs::read_to_string(directory.credentials_path())
         .expect("read persisted runner credentials");
     assert!(saved_credentials.contains("rnr_cli_test"));
     assert!(saved_credentials.contains("cli-runner-token"));
     assert!(!saved_credentials.contains("bootstrap-key-test"));
 
+    let (server_url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+        ),
+    )
+    .expect("update runner config for restart");
     let mut second_start = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
     directory.configure_command(&mut second_start);
     let second_start = second_start
@@ -158,5 +198,117 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
         second_start.status.success(),
         "restart should use saved credentials without TINES_API_KEY: {}",
         String::from_utf8_lossy(&second_start.stderr)
+    );
+    let request = server.join().expect("restart poll request").remove(0);
+    let (headers, _) = request
+        .split_once("\r\n\r\n")
+        .expect("restart poll request headers");
+    assert!(headers.contains("POST /api/v1/runners/rnr_cli_test/poll HTTP/1.1"));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cli-runner-token")
+    );
+}
+
+#[test]
+fn startup_fails_when_saved_runner_token_is_rejected() {
+    let directory = TestDirectory::new();
+    let config_dir = directory.config_dir().join("tines-runner-rs");
+    fs::create_dir_all(&config_dir).expect("create runner config directory");
+    fs::write(
+        directory.credentials_path(),
+        "runner_id = \"rnr_rejected\"\nrunner_token = \"rejected-token\"\n",
+    )
+    .expect("write stored runner credentials");
+    let (server_url, server) = mock_server(vec![(401, r#"{"error":"invalid_runner_token"}"#)]);
+    let credentials_path =
+        toml::Value::String(directory.credentials_path().to_string_lossy().into_owned());
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\n[storage]\ncredentials_file = {credentials_path}\n"
+        ),
+    )
+    .expect("write runner config");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.configure_command(&mut command);
+    let output = command
+        .env("TINES_API_KEY", "must-not-be-used")
+        .output()
+        .expect("start runner with a rejected token");
+
+    assert!(!output.status.success(), "rejected token must fail startup");
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains(
+        "Tines rejected the runner token for runner rnr_rejected; stopped without falling back to TINES_API_KEY."
+    ), "unexpected startup diagnostic: {diagnostic}");
+    let request = server
+        .join()
+        .expect("rejected-token poll request")
+        .remove(0);
+    let (headers, _) = request
+        .split_once("\r\n\r\n")
+        .expect("rejected-token request headers");
+    assert!(headers.contains("POST /api/v1/runners/rnr_rejected/poll HTTP/1.1"));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer rejected-token")
+    );
+    assert!(!headers.contains("/register"));
+}
+
+#[test]
+fn startup_fails_when_tines_is_unavailable() {
+    let directory = TestDirectory::new();
+    let config_dir = directory.config_dir().join("tines-runner-rs");
+    fs::create_dir_all(&config_dir).expect("create runner config directory");
+    fs::write(
+        directory.credentials_path(),
+        "runner_id = \"rnr_offline\"\nrunner_token = \"saved-token\"\n",
+    )
+    .expect("write stored runner credentials");
+    let unavailable = TcpListener::bind("127.0.0.1:0").expect("reserve local port");
+    let address = unavailable.local_addr().expect("read local port");
+    drop(unavailable);
+    let credentials_path =
+        toml::Value::String(directory.credentials_path().to_string_lossy().into_owned());
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server]\nurl = \"http://{address}\"\n[runner]\nname = \"cli-test-runner\"\n[storage]\ncredentials_file = {credentials_path}\n"
+        ),
+    )
+    .expect("write runner config");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.configure_command(&mut command);
+    let output = command
+        .env_remove("TINES_API_KEY")
+        .output()
+        .expect("start runner while Tines is unavailable");
+
+    assert!(
+        !output.status.success(),
+        "unavailable Tines must fail startup"
+    );
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("Tines runner protocol request failed"),
+        "unexpected startup diagnostic: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("retryable transport/server"),
+        "unexpected startup diagnostic: {diagnostic}"
     );
 }
