@@ -11,7 +11,8 @@ use crate::credentials::{
 };
 use crate::protocol::client::{Client, ClientError, ErrorCategory};
 use crate::protocol::{
-    RegisterRunnerRequest, RunnerHarness, RunnerPollRequest, RunnerPollResponse,
+    FinishRunRequest, FinishRunResponse, FinishStatus, RegisterRunnerRequest, RunnerHarness,
+    RunnerPollRequest, RunnerPollResponse,
 };
 
 const MAX_REGISTERED_CONCURRENCY: usize = 100;
@@ -107,6 +108,24 @@ impl RunnerConnection {
                 self.credentials.runner_id(),
                 self.credentials.runner_token(),
                 request,
+            )
+            .map_err(|error| self.protocol_error(error))
+    }
+
+    /// Report a local assignment preparation failure.
+    pub fn finish_failed_assignment(
+        &self,
+        run_id: &str,
+        error: &str,
+    ) -> Result<FinishRunResponse, RunnerError> {
+        self.client
+            .finish_run(
+                run_id,
+                self.credentials.runner_token(),
+                &FinishRunRequest {
+                    status: FinishStatus::Failed,
+                    error: Some(error.to_owned()),
+                },
             )
             .map_err(|error| self.protocol_error(error))
     }

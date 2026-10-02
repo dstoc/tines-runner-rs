@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
-use crate::assignment::ResolvedAssignment;
+use crate::assignment::PreparedAssignment;
 use crate::config::Config;
 use crate::protocol::client::ErrorCategory;
 use crate::protocol::{
@@ -26,7 +26,8 @@ pub struct PollState {
     owned_runs: BTreeSet<String>,
     cancellation_acks: BTreeMap<String, String>,
     declined_assignments: BTreeSet<String>,
-    pending_assignments: BTreeMap<String, ResolvedAssignment>,
+    pending_assignments: BTreeMap<String, PreparedAssignment>,
+    assignment_failures: BTreeMap<String, String>,
     allow_remote_concurrency: bool,
     local_ceiling: u32,
     effective_concurrency: u32,
@@ -42,6 +43,7 @@ impl PollState {
             cancellation_acks: BTreeMap::new(),
             declined_assignments: BTreeSet::new(),
             pending_assignments: BTreeMap::new(),
+            assignment_failures: BTreeMap::new(),
             allow_remote_concurrency: config.allow_remote_concurrency,
             local_ceiling: config.max_concurrent as u32,
             effective_concurrency: config.max_concurrent as u32,
@@ -94,19 +96,37 @@ impl PollState {
     }
 
     /// Resolved assignments delivered by Tines and not yet claimed by an executor.
-    pub fn pending_assignments(&self) -> impl Iterator<Item = &ResolvedAssignment> {
+    pub fn pending_assignments(&self) -> impl Iterator<Item = &PreparedAssignment> {
         self.pending_assignments.values()
     }
 
-    /// Queue an assignment after its match context and config have resolved.
-    pub fn queue_assignment(&mut self, assignment: ResolvedAssignment) {
+    /// Queue an assignment after its workspace has been materialized.
+    pub fn queue_assignment(&mut self, assignment: PreparedAssignment) {
         self.pending_assignments
             .insert(assignment.assignment().run.id.clone(), assignment);
     }
 
-    /// Remove a resolved assignment from the pending queue when an executor claims it.
-    pub fn take_assignment(&mut self, run_id: &str) -> Option<ResolvedAssignment> {
+    /// Remove a prepared assignment from the pending queue when an executor claims it.
+    pub fn take_assignment(&mut self, run_id: &str) -> Option<PreparedAssignment> {
         self.pending_assignments.remove(run_id)
+    }
+
+    /// Record a local preparation failure for reporting through run finish.
+    pub fn fail_assignment(&mut self, run_id: impl Into<String>, error: impl Into<String>) {
+        let run_id = run_id.into();
+        self.pending_assignments.remove(&run_id);
+        self.assignment_failures.insert(run_id, error.into());
+    }
+
+    fn assignment_failures(&self) -> Vec<(String, String)> {
+        self.assignment_failures
+            .iter()
+            .map(|(run_id, error)| (run_id.clone(), error.clone()))
+            .collect()
+    }
+
+    fn acknowledge_assignment_failure(&mut self, run_id: &str) {
+        self.assignment_failures.remove(run_id);
     }
 
     fn request(&self) -> RunnerPollRequest {
@@ -134,6 +154,7 @@ impl PollState {
             cancellation_acks,
             declined_assignments,
             draining: Some(self.draining),
+            env_delivery: Some(1),
         }
     }
 
@@ -218,6 +239,34 @@ impl PollLoop {
                 Ok(response) => {
                     self.state.observe(&response)?;
                     handle_response(&response, &mut self.state);
+                    for (run_id, error) in self.state.assignment_failures() {
+                        let mut finish_failures = 0u32;
+                        loop {
+                            match self.connection.finish_failed_assignment(&run_id, &error) {
+                                Ok(_) => {
+                                    self.state.acknowledge_assignment_failure(&run_id);
+                                    tracing::error!(
+                                        run_id,
+                                        error,
+                                        "assignment failed during preparation"
+                                    );
+                                    break;
+                                }
+                                Err(error) if is_retryable(&error) => {
+                                    let delay = retry_delay(finish_failures);
+                                    finish_failures = finish_failures.saturating_add(1);
+                                    tracing::warn!(
+                                        run_id,
+                                        error = %error,
+                                        backoff_seconds = delay.as_secs(),
+                                        "reporting assignment failure failed; retrying"
+                                    );
+                                    sleep(delay);
+                                }
+                                Err(error) => return Err(PollError::Runner(error)),
+                            }
+                        }
+                    }
                     consecutive_failures = 0;
                     if should_continue() {
                         sleep(self.interval);
@@ -414,6 +463,7 @@ mod tests {
         assert_eq!(requests[0]["concurrency_control"]["ceiling"], 3);
         assert_eq!(requests[0]["concurrency_control"]["allow_remote"], true);
         assert_eq!(requests[0]["draining"], false);
+        assert_eq!(requests[0]["env_delivery"], 1);
         assert!(sleeps.is_empty());
     }
 
@@ -442,6 +492,73 @@ mod tests {
         assert_eq!(requests[1]["owned_runs"], serde_json::json!(["arun_live"]));
         assert_eq!(requests[0]["instance_id"], requests[1]["instance_id"]);
         assert_eq!(sleeps, [Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn queued_assignment_failures_retry_and_report_each_run() {
+        let directory = TestDirectory::new();
+        let poll_response = r#"{"assignments":[],"cancels":[]}"#;
+        let finish_response = r#"{"id":"arun_finished","status":"failed"}"#;
+        let (url, server) = mock_server(vec![
+            (200, poll_response),
+            (503, r#"{"error":{"code":"unavailable","message":"retry"}}"#),
+            (200, finish_response),
+            (200, finish_response),
+        ]);
+        let mut poller = poller(&directory, &url, false);
+        let polls = Cell::new(0);
+        let mut sleeps = Vec::new();
+        poller
+            .run_with(
+                |_, state| {
+                    state.fail_assignment("arun_a", "first preparation error");
+                    state.fail_assignment("arun_b", "second preparation error");
+                    polls.set(polls.get() + 1);
+                },
+                || polls.get() == 0,
+                |delay| sleeps.push(delay),
+            )
+            .expect("retry and report all queued assignment failures");
+
+        let requests = server.join().expect("mock server");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1]["error"], "first preparation error");
+        assert_eq!(requests[2]["error"], "first preparation error");
+        assert_eq!(requests[3]["error"], "second preparation error");
+        assert_eq!(sleeps, [Duration::from_secs(1)]);
+        assert!(poller.state().assignment_failures.is_empty());
+    }
+
+    #[test]
+    fn non_retryable_finish_error_keeps_assignment_failure_queued() {
+        let directory = TestDirectory::new();
+        let poll_response = r#"{"assignments":[],"cancels":[]}"#;
+        let (url, server) = mock_server(vec![
+            (200, poll_response),
+            (
+                400,
+                r#"{"error":{"code":"invalid_request","message":"invalid"}}"#,
+            ),
+        ]);
+        let mut poller = poller(&directory, &url, false);
+        let polls = Cell::new(0);
+        let error = poller
+            .run_with(
+                |_, state| {
+                    state.fail_assignment("arun_unconfirmed", "preparation error");
+                    polls.set(polls.get() + 1);
+                },
+                || polls.get() == 0,
+                |_| panic!("non-retryable finish errors must not back off"),
+            )
+            .expect_err("invalid finish request must stop the loop");
+
+        assert!(error.to_string().contains("400"));
+        assert_eq!(
+            poller.state().assignment_failures.get("arun_unconfirmed"),
+            Some(&"preparation error".to_owned())
+        );
+        assert_eq!(server.join().expect("mock server").len(), 2);
     }
 
     #[test]

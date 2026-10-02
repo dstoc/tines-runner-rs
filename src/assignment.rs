@@ -6,6 +6,52 @@ use std::fmt;
 use crate::config::{Config, ConfigResolution, MatchContext};
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::{Client, ClientError};
+use crate::workspace::MaterializedWorkspace;
+
+/// A resolved assignment with its cold-run workspace ready for process launch.
+#[derive(Clone)]
+pub struct PreparedAssignment {
+    resolved: ResolvedAssignment,
+    workspace: MaterializedWorkspace,
+}
+
+impl PreparedAssignment {
+    pub fn new(resolved: ResolvedAssignment, workspace: MaterializedWorkspace) -> Self {
+        Self {
+            resolved,
+            workspace,
+        }
+    }
+
+    pub fn resolved(&self) -> &ResolvedAssignment {
+        &self.resolved
+    }
+
+    pub fn workspace(&self) -> &MaterializedWorkspace {
+        &self.workspace
+    }
+
+    pub fn assignment(&self) -> &RunnerAssignment {
+        self.resolved.assignment()
+    }
+}
+
+impl std::ops::Deref for PreparedAssignment {
+    type Target = ResolvedAssignment;
+
+    fn deref(&self) -> &Self::Target {
+        &self.resolved
+    }
+}
+
+impl fmt::Debug for PreparedAssignment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedAssignment")
+            .field("resolved", &self.resolved)
+            .field("workspace", &self.workspace)
+            .finish()
+    }
+}
 
 /// Owned project, workflow, and state names for one assignment.
 ///

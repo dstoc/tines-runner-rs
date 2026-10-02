@@ -56,6 +56,9 @@ pub struct RunnerPollRequest {
     pub declined_assignments: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draining: Option<bool>,
+    /// Capability: accept resolved assignment environment metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_delivery: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,7 +115,19 @@ pub struct RunnerAssignment {
     pub prompt: String,
     pub bundle: Value,
     pub run_key: String,
+    /// Resolved environment values for the child process. These values are
+    /// never written into the assignment workspace.
+    #[serde(default)]
+    pub env: Vec<RunnerAssignmentEnv>,
     pub timeout_minutes: u64,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+pub struct RunnerAssignmentEnv {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub secret: bool,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -242,6 +257,9 @@ mod tests {
             4
         );
         assert_eq!(response.assignments[0].run_key, "fixture-run-key");
+        assert_eq!(response.assignments[0].env[0].name, "FIXTURE_TOKEN");
+        assert_eq!(response.assignments[0].env[0].value, "fixture-secret");
+        assert!(response.assignments[0].env[0].secret);
         assert_eq!(response.assignments[0].timeout_minutes, 120);
         assert!(response.cancels.is_empty());
     }
