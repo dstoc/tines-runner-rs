@@ -3,8 +3,9 @@
 An independent Rust binary for running Tines assignments on a local machine.
 The crate has no dependency on the Tines monorepo or `@tines/shared`.
 
-The current version establishes the executable, module layout, and CI checks.
-Runner protocol and assignment execution behavior will be added in later steps.
+The executable loads the runner configuration and registers or loads saved
+runner credentials at startup. Polling and assignment execution will be added
+in later steps.
 
 ## Build and run
 
