@@ -236,6 +236,7 @@ impl PollState {
         }
         for canceled in &response.cancels {
             self.pending_assignments.remove(canceled);
+            self.assignment_failures.remove(canceled);
         }
         if let Some(control) = &response.concurrency_control {
             if control.available {

@@ -2,16 +2,22 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
+use crate::cancellation::CancellationToken;
+use crate::process::{ProcessExit, ProcessStream, SupervisedProcess};
 use crate::protocol::{RunnerAssignment, RunnerAssignmentEnv};
 
 const SKILLS_PATH: &str = ".agents/skills";
@@ -33,11 +39,47 @@ impl MaterializedWorkspace {
         Self::create_with_git_log(parent, assignment, api_url, |_| {})
     }
 
-    /// Create a workspace and send Git output to `on_git_output` as it arrives.
+    /// Create a workspace and send Git output to `on_git_output`.
     pub fn create_with_git_log(
         parent: impl AsRef<Path>,
         assignment: &RunnerAssignment,
         api_url: &Url,
+        on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
+        Self::create_cancellable_with_git_log(
+            parent,
+            assignment,
+            api_url,
+            &CancellationToken::default(),
+            on_git_output,
+        )
+    }
+
+    /// Create a workspace that stops repository checkouts when cancellation
+    /// arrives.
+    pub fn create_cancellable_with_git_log(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        cancellation: &CancellationToken,
+        on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
+        Self::create_with_git_program(
+            parent,
+            assignment,
+            api_url,
+            cancellation,
+            OsStr::new("git"),
+            on_git_output,
+        )
+    }
+
+    fn create_with_git_program(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        cancellation: &CancellationToken,
+        git_program: &OsStr,
         mut on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
         let environment = LaunchEnvironment::new(
@@ -45,15 +87,33 @@ impl MaterializedWorkspace {
             api_url.as_str().trim_end_matches('/').to_owned(),
             &assignment.env,
         )?;
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceError::Cancelled);
+        }
         let parent = parent.as_ref();
         fs::create_dir_all(parent).map_err(|source| WorkspaceError::Io {
             operation: "create workspace parent",
             source,
         })?;
         let path = create_unique_workspace(parent)?;
-        let result = materialize_contents(&path, assignment, &mut on_git_output);
+        let result = materialize_contents(
+            &path,
+            assignment,
+            cancellation,
+            git_program,
+            &mut on_git_output,
+        );
         if let Err(error) = result {
-            let _ = fs::remove_dir_all(&path);
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(WorkspaceError::Io {
+                        operation: "remove incomplete assignment workspace",
+                        source,
+                    });
+                }
+            }
             return Err(error);
         }
 
@@ -198,6 +258,7 @@ pub enum WorkspaceError {
     InvalidEnvironment,
     DuplicateEnvironmentName,
     WorkspaceNameCollision,
+    Cancelled,
 }
 
 impl fmt::Display for WorkspaceError {
@@ -251,6 +312,7 @@ impl fmt::Display for WorkspaceError {
             Self::WorkspaceNameCollision => {
                 f.write_str("could not allocate a unique assignment workspace")
             }
+            Self::Cancelled => f.write_str("assignment was canceled during workspace setup"),
         }
     }
 }
@@ -312,8 +374,13 @@ fn create_unique_workspace(parent: &Path) -> Result<PathBuf, WorkspaceError> {
 fn materialize_contents(
     root: &Path,
     assignment: &RunnerAssignment,
+    cancellation: &CancellationToken,
+    git_program: &OsStr,
     on_git_output: &mut impl FnMut(&str),
 ) -> Result<(), WorkspaceError> {
+    if cancellation.is_cancelled() {
+        return Err(WorkspaceError::Cancelled);
+    }
     let bundle: BundleFiles = serde_json::from_value(assignment.bundle.clone())
         .map_err(|_| WorkspaceError::InvalidBundle("skills or repositories"))?;
     let repositories = validate_repositories(&bundle.repos)?;
@@ -325,6 +392,9 @@ fn materialize_contents(
             source,
         }
     })?;
+    if cancellation.is_cancelled() {
+        return Err(WorkspaceError::Cancelled);
+    }
     let repos = serde_json::to_vec_pretty(&bundle.repos)
         .map_err(|_| WorkspaceError::InvalidBundle("repositories"))?;
     fs::write(root.join("repos.json"), [repos.as_slice(), b"\n"].concat()).map_err(|source| {
@@ -333,8 +403,17 @@ fn materialize_contents(
             source,
         }
     })?;
+    if cancellation.is_cancelled() {
+        return Err(WorkspaceError::Cancelled);
+    }
     materialize_skills(root, &bundle.skills)?;
-    clone_repositories(root, &repositories, on_git_output)
+    clone_repositories(
+        root,
+        &repositories,
+        cancellation,
+        git_program,
+        on_git_output,
+    )
 }
 
 fn validate_skills(skills: &[Skill]) -> Result<(), WorkspaceError> {
@@ -402,13 +481,18 @@ fn validate_repositories(repositories: &[Value]) -> Result<Vec<Repository>, Work
 fn clone_repositories(
     root: &Path,
     repositories: &[Repository],
+    cancellation: &CancellationToken,
+    git_program: &OsStr,
     on_git_output: &mut impl FnMut(&str),
 ) -> Result<(), WorkspaceError> {
     for repository in repositories {
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceError::Cancelled);
+        }
         let destination = root.join(&repository.dir);
         ensure_safe_repository_parent(root, &repository.dir)?;
 
-        let mut command = Command::new("git");
+        let mut command = Command::new(git_program);
         command
             .arg("clone")
             .arg("--progress")
@@ -418,38 +502,73 @@ fn clone_repositories(
                 .arg(format!("--branch={branch}"))
                 .arg("--single-branch");
         }
-        command
-            .arg("--")
-            .arg(&repository.url)
-            .arg(&destination)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        command.arg("--").arg(&repository.url).arg(&destination);
 
-        let mut child = command.spawn().map_err(|source| WorkspaceError::Io {
-            operation: "start git clone",
-            source,
-        })?;
-        if let Some(mut stderr) = child.stderr.take() {
-            stream_git_output(
-                &mut stderr,
-                &repository.url,
-                &repository.name,
-                &repository.dir,
-                on_git_output,
-            )
+        let (sender, receiver) = mpsc::sync_channel(16);
+        let process =
+            SupervisedProcess::spawn_streaming(&mut command, sender).map_err(|source| {
+                WorkspaceError::Io {
+                    operation: "start git clone",
+                    source,
+                }
+            })?;
+        let wait_cancellation = cancellation.clone();
+        let waiter = thread::spawn(move || {
+            process.wait_or_cancel(Duration::from_secs(2), &wait_cancellation)
+        });
+        let mut line = Vec::new();
+        while !waiter.is_finished() {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok((ProcessStream::Stderr, chunk)) => stream_git_chunk(
+                    &mut line,
+                    &chunk,
+                    &repository.url,
+                    &repository.name,
+                    &repository.dir,
+                    on_git_output,
+                ),
+                Ok((ProcessStream::Stdout, _)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+        let output = waiter
+            .join()
+            .map_err(|_| WorkspaceError::Io {
+                operation: "wait for git clone",
+                source: io::Error::other("git process supervisor panicked"),
+            })?
             .map_err(|source| WorkspaceError::Io {
-                operation: "read git clone output",
+                operation: "wait for git clone",
                 source,
             })?;
+        loop {
+            match receiver.try_recv() {
+                Ok((ProcessStream::Stderr, chunk)) => stream_git_chunk(
+                    &mut line,
+                    &chunk,
+                    &repository.url,
+                    &repository.name,
+                    &repository.dir,
+                    on_git_output,
+                ),
+                Ok((ProcessStream::Stdout, _)) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
         }
-        let status = child.wait().map_err(|source| WorkspaceError::Io {
-            operation: "wait for git clone",
-            source,
-        })?;
-        if !status.success() {
+        if output.cancelled {
+            return Err(WorkspaceError::Cancelled);
+        }
+        emit_git_line(
+            &mut line,
+            &repository.url,
+            &repository.name,
+            &repository.dir,
+            on_git_output,
+        );
+        if output.exit != ProcessExit::Code(0) {
             return Err(WorkspaceError::GitCloneFailed {
                 directory: repository.dir.clone(),
-                status: status.to_string(),
+                status: format!("{:?}", output.exit),
             });
         }
     }
@@ -497,43 +616,28 @@ fn ensure_safe_repository_parent(root: &Path, directory: &str) -> Result<(), Wor
     }
 }
 
-fn stream_git_output(
-    stderr: &mut impl Read,
+fn stream_git_chunk(
+    line: &mut Vec<u8>,
+    chunk: &[u8],
     repository_url: &str,
     repository_name: &str,
     directory: &str,
     on_git_output: &mut impl FnMut(&str),
-) -> io::Result<()> {
+) {
     const MAX_LINE_BYTES: usize = 8192;
-    let mut line = Vec::new();
-    let mut buffer = [0; 4096];
-    loop {
-        let count = stderr.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        for byte in &buffer[..count] {
-            if *byte == b'\n' || *byte == b'\r' {
-                emit_git_line(
-                    &mut line,
-                    repository_url,
-                    repository_name,
-                    directory,
-                    on_git_output,
-                );
-            } else if line.len() < MAX_LINE_BYTES {
-                line.push(*byte);
-            }
+    for byte in chunk {
+        if *byte == b'\n' || *byte == b'\r' {
+            emit_git_line(
+                line,
+                repository_url,
+                repository_name,
+                directory,
+                on_git_output,
+            );
+        } else if line.len() < MAX_LINE_BYTES {
+            line.push(*byte);
         }
     }
-    emit_git_line(
-        &mut line,
-        repository_url,
-        repository_name,
-        directory,
-        on_git_output,
-    );
-    Ok(())
 }
 
 fn emit_git_line(
@@ -705,12 +809,15 @@ fn valid_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{MaterializedWorkspace, Skill, SkillFile, WorkspaceError, materialize_skills};
+    use crate::cancellation::CancellationToken;
     use crate::protocol::RunnerAssignment;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use url::Url;
 
     struct TestDirectory(PathBuf);
@@ -793,6 +900,81 @@ mod tests {
                 "branch": branch
             }]
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_during_git_clone_kills_clone_and_removes_workspace() {
+        let directory = TestDirectory::new();
+        let pid_path = directory.0.join("git-clone.pid");
+        let fake_git = directory.0.join("slow-git");
+        fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\ntrap '' TERM\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .expect("write fake git command");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
+            .expect("make fake git executable");
+        let api_url = Url::parse("https://tines.example.test/api/").expect("valid URL");
+        let assignment = assignment(
+            json!({
+                "skills": [],
+                "repos": [{"name": "slow", "dir": "repo", "url": "unused", "branch": null}]
+            }),
+            json!([]),
+        );
+        let parent = directory.0.join("workspaces");
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let fake_git_path = fake_git.clone();
+        let worker_parent = parent.clone();
+        let worker_assignment = assignment.clone();
+        let worker = thread::spawn(move || {
+            MaterializedWorkspace::create_with_git_program(
+                &worker_parent,
+                &worker_assignment,
+                &api_url,
+                &worker_cancellation,
+                fake_git_path.as_os_str(),
+                |_| {},
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let process_id = fs::read_to_string(&pid_path)
+            .expect("fake git wrote its PID")
+            .trim()
+            .parse::<u32>()
+            .expect("parse fake git PID");
+        cancellation.cancel();
+
+        assert!(matches!(
+            worker.join().expect("join workspace worker"),
+            Err(WorkspaceError::Cancelled)
+        ));
+        assert_eq!(
+            fs::read_dir(&parent)
+                .expect("read workspace parent")
+                .count(),
+            0,
+            "canceled workspace is removed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+                Ok(stat) if stat.rsplit_once(") ").unwrap().1.starts_with('Z') => break,
+                Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                result => panic!("fake git process remained live: {result:?}"),
+            }
+        }
     }
 
     #[test]

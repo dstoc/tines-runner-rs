@@ -33,6 +33,16 @@ impl PreparedAssignment {
         self
     }
 
+    /// Move the preparation log buffer to a concurrent start-log request.
+    pub fn take_run_log_buffer(&mut self) -> RunLogBuffer {
+        std::mem::take(&mut self.run_logs)
+    }
+
+    /// Restore the sequence state after a concurrent start-log request.
+    pub fn restore_run_log_buffer(&mut self, run_logs: RunLogBuffer) {
+        self.run_logs = run_logs;
+    }
+
     pub fn resolved(&self) -> &ResolvedAssignment {
         &self.resolved
     }

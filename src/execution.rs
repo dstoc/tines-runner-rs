@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::assignment::PreparedAssignment;
+use crate::cancellation::CancellationToken;
 use crate::codex::CodexLaunch;
 use crate::codex_stream::CodexStreamParser;
 use crate::effort::EffortCapabilities;
@@ -24,11 +25,37 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// A retryable finish error keeps the workspace in place until Tines accepts
 /// the report. A non-retryable error also leaves it in place for recovery.
 pub fn execute_assignment(
-    mut assignment: PreparedAssignment,
+    assignment: PreparedAssignment,
     connection: &RunnerConnection,
     client: &Client,
     capabilities: &EffortCapabilities,
 ) -> Result<(), ExecutionError> {
+    execute_assignment_cancellable(
+        assignment,
+        connection,
+        client,
+        capabilities,
+        &CancellationToken::default(),
+    )
+    .map(|_| ())
+}
+
+/// Execute one assignment while honoring supervisor cancellation at every
+/// process, log, and finish boundary.
+pub fn execute_assignment_cancellable(
+    mut assignment: PreparedAssignment,
+    connection: &RunnerConnection,
+    client: &Client,
+    capabilities: &EffortCapabilities,
+    cancellation: &CancellationToken,
+) -> Result<ExecutionOutcome, ExecutionError> {
+    if cancellation.is_cancelled() {
+        assignment
+            .workspace()
+            .cleanup()
+            .map_err(ExecutionError::WorkspaceCleanup)?;
+        return Ok(ExecutionOutcome::Cancelled);
+    }
     let run_id = assignment.assignment().run.id.clone();
     let runner_token = connection.credentials().runner_token();
     let secrets = assignment
@@ -40,7 +67,21 @@ pub fn execute_assignment(
         .collect::<Vec<_>>();
     let mut report = CodexRunReport::new(assignment.assignment().run.model.as_deref());
     let timeout = Duration::from_secs(assignment.assignment().timeout_minutes.saturating_mul(60));
-    let run_output = run_harness(&mut assignment, client, runner_token, capabilities, timeout);
+    let run_output = run_harness(
+        &mut assignment,
+        client,
+        runner_token,
+        capabilities,
+        timeout,
+        cancellation,
+    );
+    if cancellation.is_cancelled() || run_output.as_ref().is_ok_and(|output| output.cancelled) {
+        assignment
+            .workspace()
+            .cleanup()
+            .map_err(ExecutionError::WorkspaceCleanup)?;
+        return Ok(ExecutionOutcome::Cancelled);
+    }
 
     let (status, error, output) = match run_output {
         Ok(output) if !output.timed_out && output.exit == ProcessExit::Code(0) => {
@@ -62,15 +103,60 @@ pub fn execute_assignment(
             runner_token,
             &secrets,
             &output,
+            cancellation,
         );
     }
 
+    if cancellation.is_cancelled() {
+        assignment
+            .workspace()
+            .cleanup()
+            .map_err(ExecutionError::WorkspaceCleanup)?;
+        return Ok(ExecutionOutcome::Cancelled);
+    }
+
     let finish_request = report.into_finish_request(status, error);
-    finish_with_retry(connection, &run_id, &finish_request)?;
+    if !finish_with_retry(connection, &run_id, &finish_request, cancellation)? {
+        assignment
+            .workspace()
+            .cleanup()
+            .map_err(ExecutionError::WorkspaceCleanup)?;
+        return Ok(ExecutionOutcome::Cancelled);
+    }
     assignment
         .workspace()
         .cleanup()
-        .map_err(ExecutionError::WorkspaceCleanup)
+        .map_err(ExecutionError::WorkspaceCleanup)?;
+    Ok(ExecutionOutcome::Finished)
+}
+
+/// The terminal action taken for one assignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionOutcome {
+    Finished,
+    Cancelled,
+}
+
+/// Report a workspace-preparation failure unless supervisor cancellation has
+/// already settled the run.
+pub fn report_preparation_failure(
+    connection: &RunnerConnection,
+    run_id: &str,
+    error: &str,
+    cancellation: &CancellationToken,
+) -> Result<ExecutionOutcome, ExecutionError> {
+    let request = FinishRunRequest {
+        status: FinishStatus::Failed,
+        error: Some(error.to_owned()),
+        provider_session_id: None,
+        usage: None,
+        pricing_evidence: None,
+    };
+    if finish_with_retry(connection, run_id, &request, cancellation)? {
+        Ok(ExecutionOutcome::Finished)
+    } else {
+        Ok(ExecutionOutcome::Cancelled)
+    }
 }
 
 fn run_harness(
@@ -79,7 +165,11 @@ fn run_harness(
     runner_token: &str,
     capabilities: &EffortCapabilities,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, String> {
+    if cancellation.is_cancelled() {
+        return Err("assignment was canceled before process launch".to_owned());
+    }
     let launch = CodexLaunch::for_assignment(assignment, capabilities)
         .map_err(|error| format!("could not prepare Codex command: {error}"))?;
     tracing::info!(
@@ -88,26 +178,51 @@ fn run_harness(
         "starting Codex harness"
     );
     let mut command = launch.command();
+    if cancellation.is_cancelled() {
+        return Err("assignment was canceled before process launch".to_owned());
+    }
     let process = SupervisedProcess::spawn(&mut command)
         .map_err(|error| format!("could not start Codex harness: {error}"))?;
     let deadline = Instant::now() + timeout;
+    let mut run_logs = assignment.take_run_log_buffer();
+    let log_client = client.clone();
+    let log_run_id = assignment.assignment().run.id.clone();
+    let log_token = runner_token.to_owned();
+    let log_cancellation = cancellation.clone();
+    let log_task = thread::spawn(move || {
+        if !log_cancellation.is_cancelled()
+            && let Some(Err(error)) = retry_protocol_until(deadline, &log_cancellation, || {
+                run_logs.harness_started_until(&log_client, &log_run_id, &log_token, deadline)
+            })
+        {
+            tracing::warn!(
+                run_id = log_run_id,
+                error = %error,
+                "could not report that the Codex harness started"
+            );
+        }
+        run_logs
+    });
 
-    if let Err(error) = retry_protocol_until(deadline, || {
-        assignment.harness_started_until(client, runner_token, deadline)
-    }) {
-        tracing::warn!(
-            run_id = %assignment.assignment().run.id,
-            error = %error,
-            "could not report that the Codex harness started"
-        );
-    }
-
-    process
-        .wait_timeout(
+    let output = process
+        .wait_timeout_or_cancel(
             deadline.saturating_duration_since(Instant::now()),
             TERMINATION_GRACE,
+            cancellation,
         )
-        .map_err(|error| format!("could not wait for Codex harness: {error}"))
+        .map_err(|error| format!("could not wait for Codex harness: {error}"))?;
+    if output.cancelled || cancellation.is_cancelled() {
+        // The start-log request is already in flight, if one started. It owns
+        // no workspace state and checks cancellation before retrying.
+        drop(log_task);
+        return Ok(output);
+    }
+    assignment.restore_run_log_buffer(
+        log_task
+            .join()
+            .map_err(|_| "harness-start log worker panicked".to_owned())?,
+    );
+    Ok(output)
 }
 
 fn collect_output(
@@ -117,7 +232,11 @@ fn collect_output(
     runner_token: &str,
     secrets: &[String],
     output: &ProcessOutput,
+    cancellation: &CancellationToken,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut parser = CodexStreamParser::default();
     let events = parser
@@ -145,7 +264,7 @@ fn collect_output(
         return;
     }
 
-    if let Err(error) = retry_protocol(|| {
+    if let Err(error) = retry_protocol(cancellation, || {
         assignment.append_harness_output(client, runner_token, &format!("{rendered}\n"))
     }) {
         tracing::warn!(
@@ -184,11 +303,15 @@ fn finish_with_retry(
     connection: &RunnerConnection,
     run_id: &str,
     request: &FinishRunRequest,
-) -> Result<(), ExecutionError> {
+    cancellation: &CancellationToken,
+) -> Result<bool, ExecutionError> {
     let mut failures = 0u32;
     loop {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
         match connection.finish_assignment(run_id, request) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(true),
             Err(RunnerError::Protocol(error)) if error.category() == ErrorCategory::Retryable => {
                 let delay = retry_delay(failures);
                 failures = failures.saturating_add(1);
@@ -198,7 +321,7 @@ fn finish_with_retry(
                     backoff_seconds = delay.as_secs(),
                     "finish report failed; retrying"
                 );
-                thread::sleep(delay);
+                cancellation.wait(delay);
             }
             Err(error) => return Err(ExecutionError::FinishReport(error)),
         }
@@ -206,16 +329,20 @@ fn finish_with_retry(
 }
 
 fn retry_protocol<T>(
+    cancellation: &CancellationToken,
     mut request: impl FnMut() -> Result<T, ClientError>,
-) -> Result<T, ClientError> {
+) -> Result<(), ClientError> {
     let mut failures = 0u32;
     loop {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         match request() {
-            Ok(response) => return Ok(response),
+            Ok(_) => return Ok(()),
             Err(error) if error.category() == ErrorCategory::Retryable => {
                 let delay = retry_delay(failures);
                 failures = failures.saturating_add(1);
-                thread::sleep(delay);
+                cancellation.wait(delay);
             }
             Err(error) => return Err(error),
         }
@@ -224,16 +351,20 @@ fn retry_protocol<T>(
 
 fn retry_protocol_until<T>(
     deadline: Instant,
+    cancellation: &CancellationToken,
     mut request: impl FnMut() -> Result<T, ClientError>,
-) -> Result<T, ClientError> {
+) -> Option<Result<(), ClientError>> {
     let mut failures = 0u32;
     loop {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         match request() {
-            Ok(response) => return Ok(response),
+            Ok(_) => return Some(Ok(())),
             Err(error) if error.category() == ErrorCategory::Retryable => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(error);
+                    return Some(Err(error));
                 }
                 let delay = retry_delay(failures).min(remaining);
                 failures = failures.saturating_add(1);
@@ -242,9 +373,9 @@ fn retry_protocol_until<T>(
                     backoff_seconds = delay.as_secs_f64(),
                     "harness-start log request failed; retrying before the run deadline"
                 );
-                thread::sleep(delay);
+                cancellation.wait(delay);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Some(Err(error)),
         }
     }
 }
@@ -287,6 +418,7 @@ impl Error for ExecutionError {
 mod tests {
     use super::run_harness;
     use crate::assignment::{PreparedAssignment, resolve_assignment};
+    use crate::cancellation::CancellationToken;
     use crate::config::Config;
     use crate::effort::EffortCapabilities;
     use crate::protocol::RunnerAssignment;
@@ -443,6 +575,7 @@ mod tests {
             "runner-token",
             &capabilities,
             Duration::from_millis(200),
+            &CancellationToken::default(),
         )
         .expect("supervise harness after start-log outage");
 

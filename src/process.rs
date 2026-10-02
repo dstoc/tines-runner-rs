@@ -8,8 +8,11 @@
 
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crate::cancellation::CancellationToken;
 
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -100,17 +103,28 @@ impl ProcessIdentity {
     }
 }
 
-/// The result of a supervised process, including both captured output streams.
+/// The result of a supervised process, including any captured output streams.
+/// Streaming process launches return empty output vectors after sending chunks
+/// to their receiver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessOutput {
     /// The direct child's exit code or terminating signal.
     pub exit: ProcessExit,
     /// Whether `wait_timeout` reached its deadline and terminated the group.
     pub timed_out: bool,
+    /// Whether the shared assignment cancellation signal ended this process.
+    pub cancelled: bool,
     /// Bytes written to stdout by the child and its descendants.
     pub stdout: Vec<u8>,
     /// Bytes written to stderr by the child and its descendants.
     pub stderr: Vec<u8>,
+}
+
+/// The pipe that produced one streamed process chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessStream {
+    Stdout,
+    Stderr,
 }
 
 /// A portable description of how the direct child ended.
@@ -144,6 +158,24 @@ impl SupervisedProcess {
     /// The returned identity is captured before this method returns, so callers
     /// can persist it before awaiting the command.
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_inner(command, None, true)
+    }
+
+    /// Start a command that streams bounded output chunks to `sender` instead
+    /// of retaining its output. The receiver must be drained while the process
+    /// is running so the child cannot block on a full channel.
+    pub fn spawn_streaming(
+        command: &mut Command,
+        sender: SyncSender<(ProcessStream, Vec<u8>)>,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(command, Some(sender), false)
+    }
+
+    fn spawn_inner(
+        command: &mut Command,
+        output_sender: Option<SyncSender<(ProcessStream, Vec<u8>)>>,
+        capture_output: bool,
+    ) -> io::Result<Self> {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -171,8 +203,10 @@ impl SupervisedProcess {
 
         let stdout = match thread::Builder::new()
             .name("runner-child-stdout".to_owned())
-            .spawn(move || read_to_end(stdout))
-        {
+            .spawn({
+                let sender = output_sender.clone();
+                move || read_child_output(stdout, ProcessStream::Stdout, sender, capture_output)
+            }) {
             Ok(stdout) => stdout,
             Err(error) => {
                 #[cfg(unix)]
@@ -186,8 +220,10 @@ impl SupervisedProcess {
         };
         let stderr = match thread::Builder::new()
             .name("runner-child-stderr".to_owned())
-            .spawn(move || read_to_end(stderr))
-        {
+            .spawn({
+                let sender = output_sender;
+                move || read_child_output(stderr, ProcessStream::Stderr, sender, capture_output)
+            }) {
             Ok(stderr) => stderr,
             Err(error) => {
                 #[cfg(unix)]
@@ -223,24 +259,62 @@ impl SupervisedProcess {
     pub fn wait(mut self) -> io::Result<ProcessOutput> {
         let status = self.child.wait()?;
         self.terminate_remaining_group(Duration::from_secs(2))?;
-        self.collect(status, false)
+        self.collect(status, false, false)
     }
 
     /// Wait up to `timeout`, then request graceful group termination and force
     /// termination after `grace` if the group remains alive.
-    pub fn wait_timeout(mut self, timeout: Duration, grace: Duration) -> io::Result<ProcessOutput> {
-        let deadline = Instant::now() + timeout;
+    pub fn wait_timeout(self, timeout: Duration, grace: Duration) -> io::Result<ProcessOutput> {
+        self.wait_control(Some(timeout), grace, None)
+    }
+
+    /// Wait for the timeout or shared cancellation signal, then terminate the
+    /// complete process group and collect its output.
+    pub fn wait_timeout_or_cancel(
+        self,
+        timeout: Duration,
+        grace: Duration,
+        cancellation: &CancellationToken,
+    ) -> io::Result<ProcessOutput> {
+        self.wait_control(Some(timeout), grace, Some(cancellation))
+    }
+
+    /// Wait until either the process exits or the shared cancellation signal
+    /// arrives.
+    pub fn wait_or_cancel(
+        self,
+        grace: Duration,
+        cancellation: &CancellationToken,
+    ) -> io::Result<ProcessOutput> {
+        self.wait_control(None, grace, Some(cancellation))
+    }
+
+    fn wait_control(
+        mut self,
+        timeout: Option<Duration>,
+        grace: Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> io::Result<ProcessOutput> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.terminate_remaining_group(grace)?;
-                return self.collect(status, false);
+                return self.collect(status, false, false);
+            }
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                let status = self.terminate_group(grace)?;
+                return self.collect(status, false, true);
             }
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 let status = self.terminate_group(grace)?;
-                return self.collect(status, true);
+                return self.collect(status, true, false);
             }
-            thread::sleep((deadline - now).min(Duration::from_millis(10)));
+            let poll_delay = deadline
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .unwrap_or(Duration::from_millis(10))
+                .min(Duration::from_millis(10));
+            thread::sleep(poll_delay);
         }
     }
 
@@ -249,7 +323,7 @@ impl SupervisedProcess {
     /// termination.
     pub fn terminate(mut self, grace: Duration) -> io::Result<ProcessOutput> {
         let status = self.terminate_group(grace)?;
-        self.collect(status, false)
+        self.collect(status, false, false)
     }
 
     fn terminate_remaining_group(&mut self, grace: Duration) -> io::Result<()> {
@@ -328,7 +402,12 @@ impl SupervisedProcess {
         }
     }
 
-    fn collect(mut self, status: ExitStatus, timed_out: bool) -> io::Result<ProcessOutput> {
+    fn collect(
+        mut self,
+        status: ExitStatus,
+        timed_out: bool,
+        cancelled: bool,
+    ) -> io::Result<ProcessOutput> {
         #[cfg(unix)]
         {
             self.finished = true;
@@ -346,6 +425,7 @@ impl SupervisedProcess {
         Ok(ProcessOutput {
             exit: process_exit(status),
             timed_out,
+            cancelled,
             stdout,
             stderr,
         })
@@ -374,9 +454,29 @@ impl Drop for SupervisedProcess {
     }
 }
 
-fn read_to_end(mut reader: impl Read) -> io::Result<Vec<u8>> {
+fn read_child_output(
+    mut reader: impl Read,
+    stream: ProcessStream,
+    mut sender: Option<SyncSender<(ProcessStream, Vec<u8>)>>,
+    capture_output: bool,
+) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
+    let mut buffer = [0; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if capture_output {
+            output.extend_from_slice(&buffer[..count]);
+        }
+        if sender
+            .as_ref()
+            .is_some_and(|sender| sender.send((stream, buffer[..count].to_vec())).is_err())
+        {
+            sender = None;
+        }
+    }
     Ok(output)
 }
 
