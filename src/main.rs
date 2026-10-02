@@ -52,7 +52,29 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
     poller.run_with(
         |response, state| {
+            let fresh_capabilities = response
+                .assignments
+                .iter()
+                .any(|assignment| assignment.effort.is_some())
+                .then(|| state.refresh_effort_capabilities(true).clone());
             for assignment in &response.assignments {
+                if assignment.effort.is_some() {
+                    let capabilities = fresh_capabilities
+                        .as_ref()
+                        .expect("effort assignments trigger a fresh capability probe");
+                    if let Some(reason) =
+                        tines_runner_rs::effort::assignment_effort_rejection(assignment, capabilities)
+                    {
+                        tracing::warn!(
+                            run_id = %assignment.run.id,
+                            model = assignment.run.model.as_deref().unwrap_or("provider default"),
+                            error = %reason,
+                            "assignment declined because Codex cannot verify the requested effort"
+                        );
+                        state.decline_assignment(assignment.run.id.clone());
+                        continue;
+                    }
+                }
                 match tines_runner_rs::assignment::resolve_assignment(
                     &config,
                     &issue_client,
