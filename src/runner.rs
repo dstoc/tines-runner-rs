@@ -87,6 +87,21 @@ impl RunnerConnection {
         self.registered
     }
 
+    /// Validate stored credentials without polling or claiming assignments.
+    pub fn verify(&self) -> Result<(), RunnerError> {
+        let identity = self
+            .client
+            .get_runner_identity(
+                self.credentials.runner_id(),
+                self.credentials.runner_token(),
+            )
+            .map_err(|error| self.protocol_error(error))?;
+        if identity.runner_id != self.credentials.runner_id() {
+            return Err(RunnerError::InvalidRunnerIdentity);
+        }
+        Ok(())
+    }
+
     /// Poll Tines with the stored runner token.
     ///
     /// Authentication rejection is fatal. The connection does not attempt
@@ -98,15 +113,17 @@ impl RunnerConnection {
                 self.credentials.runner_token(),
                 request,
             )
-            .map_err(|error| {
-                if error.category() == ErrorCategory::Authentication {
-                    RunnerError::RejectedRunnerToken {
-                        runner_id: self.credentials.runner_id().to_owned(),
-                    }
-                } else {
-                    RunnerError::Protocol(error)
-                }
-            })
+            .map_err(|error| self.protocol_error(error))
+    }
+
+    fn protocol_error(&self, error: ClientError) -> RunnerError {
+        if error.category() == ErrorCategory::Authentication {
+            RunnerError::RejectedRunnerToken {
+                runner_id: self.credentials.runner_id().to_owned(),
+            }
+        } else {
+            RunnerError::Protocol(error)
+        }
     }
 }
 
@@ -149,6 +166,7 @@ pub enum RunnerError {
     Registration(ClientError),
     InvalidConcurrency(usize),
     InvalidRegistrationResponse,
+    InvalidRunnerIdentity,
     RejectedRunnerToken { runner_id: String },
     Protocol(ClientError),
 }
@@ -169,6 +187,9 @@ impl fmt::Display for RunnerError {
             Self::InvalidRegistrationResponse => {
                 f.write_str("Tines returned an empty runner ID or runner token")
             }
+            Self::InvalidRunnerIdentity => {
+                f.write_str("Tines returned an unexpected runner identity")
+            }
             Self::RejectedRunnerToken { runner_id } => write!(
                 f,
                 "Tines rejected the runner token for runner {runner_id}; stopped without falling back to TINES_API_KEY. Verify the credentials file and register the runner again if needed."
@@ -188,6 +209,7 @@ impl Error for RunnerError {
             Self::BootstrapKey(error) => Some(error),
             Self::InvalidConcurrency(_)
             | Self::InvalidRegistrationResponse
+            | Self::InvalidRunnerIdentity
             | Self::RejectedRunnerToken { .. } => None,
         }
     }

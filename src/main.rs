@@ -26,13 +26,12 @@ fn main() -> ExitCode {
 fn start_runner() -> Result<(), Box<dyn Error>> {
     let config = tines_runner_rs::config::Config::load_default()?;
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
-    let poll = connection.poll(&tines_runner_rs::protocol::RunnerPollRequest::default())?;
+    connection.verify()?;
 
     tracing::info!(
         version = tines_runner_rs::VERSION,
         runner_id = connection.credentials().runner_id(),
         registered = connection.registered(),
-        assignments = poll.assignments.len(),
         "runner credentials ready"
     );
 

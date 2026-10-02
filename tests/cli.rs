@@ -96,13 +96,45 @@ fn mock_server(responses: Vec<(u16, &'static str)>) -> (String, JoinHandle<Vec<S
 }
 
 fn registration_server() -> (String, JoinHandle<Vec<String>>) {
-    mock_server(vec![
-        (
-            201,
-            r#"{"runner":{"id":"rnr_cli_test"},"runner_token":"cli-runner-token"}"#,
-        ),
-        (200, r#"{"assignments":[],"cancels":[]}"#),
-    ])
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Tines server");
+    let address = listener.local_addr().expect("read mock address");
+    let server = thread::spawn(move || {
+        (0..2)
+            .map(|_| {
+                let (mut stream, _) = listener.accept().expect("accept Tines request");
+                let request = read_http_request(&mut stream);
+                let (status, body) = if request.contains("/runners/register ") {
+                    (
+                        201,
+                        r#"{"runner":{"id":"rnr_cli_test"},"runner_token":"cli-runner-token"}"#,
+                    )
+                } else if request.contains("/runners/rnr_cli_test/identity ") {
+                    (200, r#"{"runner_id":"rnr_cli_test"}"#)
+                } else if request.contains("/runners/rnr_cli_test/poll ") {
+                    // If startup polls instead of validating identity, this is queued work.
+                    (
+                        200,
+                        r#"{"assignments":[{"run":{"id":"arun_queued","issue_id":"iss_queued"},"prompt":"queued work","bundle":{},"run_key":"run-key","timeout_minutes":30}],"cancels":[]}"#,
+                    )
+                } else {
+                    (500, r#"{"error":"unexpected_request"}"#)
+                };
+                let reason = match status {
+                    200 => "OK",
+                    201 => "Created",
+                    _ => "Mock",
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write mock response");
+                request
+            })
+            .collect()
+    });
+    (format!("http://{address}"), server)
 }
 
 #[test]
@@ -164,12 +196,13 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     assert_eq!(body["harness"], "codex");
     assert_eq!(body["max_concurrent"], 2);
 
-    let (poll_headers, _) = requests[1]
+    assert_eq!(requests.len(), 2, "startup must not poll and claim work");
+    let (identity_headers, _) = requests[1]
         .split_once("\r\n\r\n")
-        .expect("startup poll request headers");
-    assert!(poll_headers.contains("POST /api/v1/runners/rnr_cli_test/poll HTTP/1.1"));
+        .expect("startup identity request headers");
+    assert!(identity_headers.contains("GET /api/v1/runners/rnr_cli_test/identity HTTP/1.1"));
     assert!(
-        poll_headers
+        identity_headers
             .to_ascii_lowercase()
             .contains("authorization: bearer cli-runner-token")
     );
@@ -180,7 +213,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     assert!(saved_credentials.contains("cli-runner-token"));
     assert!(!saved_credentials.contains("bootstrap-key-test"));
 
-    let (server_url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
+    let (server_url, server) = mock_server(vec![(200, r#"{"runner_id":"rnr_cli_test"}"#)]);
     fs::write(
         config_dir.join("config.toml"),
         format!(
@@ -199,11 +232,11 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
         "restart should use saved credentials without TINES_API_KEY: {}",
         String::from_utf8_lossy(&second_start.stderr)
     );
-    let request = server.join().expect("restart poll request").remove(0);
+    let request = server.join().expect("restart identity request").remove(0);
     let (headers, _) = request
         .split_once("\r\n\r\n")
-        .expect("restart poll request headers");
-    assert!(headers.contains("POST /api/v1/runners/rnr_cli_test/poll HTTP/1.1"));
+        .expect("restart identity request headers");
+    assert!(headers.contains("GET /api/v1/runners/rnr_cli_test/identity HTTP/1.1"));
     assert!(
         headers
             .to_ascii_lowercase()
@@ -250,12 +283,12 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
     ), "unexpected startup diagnostic: {diagnostic}");
     let request = server
         .join()
-        .expect("rejected-token poll request")
+        .expect("rejected-token identity request")
         .remove(0);
     let (headers, _) = request
         .split_once("\r\n\r\n")
-        .expect("rejected-token request headers");
-    assert!(headers.contains("POST /api/v1/runners/rnr_rejected/poll HTTP/1.1"));
+        .expect("rejected-token identity request headers");
+    assert!(headers.contains("GET /api/v1/runners/rnr_rejected/identity HTTP/1.1"));
     assert!(
         headers
             .to_ascii_lowercase()

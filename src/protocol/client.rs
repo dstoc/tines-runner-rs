@@ -11,8 +11,8 @@ use serde::de::DeserializeOwned;
 
 use crate::protocol::{
     AppendRunLogRequest, AppendRunLogResponse, FinishRunRequest, FinishRunResponse,
-    IssueDetailResponse, RegisterRunnerRequest, RunnerPollRequest, RunnerPollResponse,
-    RunnerTokenResponse,
+    IssueDetailResponse, RegisterRunnerRequest, RunnerIdentityResponse, RunnerPollRequest,
+    RunnerPollResponse, RunnerTokenResponse,
 };
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -148,6 +148,15 @@ impl Client {
         request: &RegisterRunnerRequest,
     ) -> Result<RunnerTokenResponse, ClientError> {
         self.post_json(&["runners", "register"], user_api_key, request)
+    }
+
+    pub fn get_runner_identity(
+        &self,
+        runner_id: &str,
+        runner_token: &str,
+    ) -> Result<RunnerIdentityResponse, ClientError> {
+        let url = self.endpoint(&["runners", runner_id, "identity"])?;
+        self.send_json(self.http.get(url), runner_token)
     }
 
     pub fn poll_runner(
@@ -300,6 +309,7 @@ mod tests {
         let server = thread::spawn(move || {
             let responses = [
                 r#"{"runner":{"id":"rnr_1"},"runner_token":"runner-secret"}"#,
+                r#"{"runner_id":"rnr_1"}"#,
                 r#"{"assignments":[],"cancels":[]}"#,
                 r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
                 r#"{"id":"arun_1","status":"completed"}"#,
@@ -356,6 +366,9 @@ mod tests {
             )
             .expect("register runner");
         client
+            .get_runner_identity("rnr_1", "runner-token")
+            .expect("get runner identity");
+        client
             .poll_runner(
                 "rnr_1",
                 "runner-token",
@@ -392,13 +405,15 @@ mod tests {
         let requests = server.join().expect("join test server");
         assert!(requests[0].contains("post /tines/api/v1/runners/register "));
         assert!(requests[0].contains("authorization: bearer user-key"));
-        assert!(requests[1].contains("post /tines/api/v1/runners/rnr_1/poll "));
+        assert!(requests[1].contains("get /tines/api/v1/runners/rnr_1/identity "));
         assert!(requests[1].contains("authorization: bearer runner-token"));
-        assert!(requests[2].contains("post /tines/api/v1/runs/arun_1/logs "));
+        assert!(requests[2].contains("post /tines/api/v1/runners/rnr_1/poll "));
         assert!(requests[2].contains("authorization: bearer runner-token"));
-        assert!(requests[3].contains("post /tines/api/v1/runs/arun_1/finish "));
+        assert!(requests[3].contains("post /tines/api/v1/runs/arun_1/logs "));
         assert!(requests[3].contains("authorization: bearer runner-token"));
-        assert!(requests[4].contains("get /tines/api/v1/issues/iss_1 "));
-        assert!(requests[4].contains("authorization: bearer run-key"));
+        assert!(requests[4].contains("post /tines/api/v1/runs/arun_1/finish "));
+        assert!(requests[4].contains("authorization: bearer runner-token"));
+        assert!(requests[5].contains("get /tines/api/v1/issues/iss_1 "));
+        assert!(requests[5].contains("authorization: bearer run-key"));
     }
 }
