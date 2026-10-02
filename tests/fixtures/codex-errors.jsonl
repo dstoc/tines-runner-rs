@@ -1,0 +1,3 @@
+{"type":"turn.failed","error":{"message":"The provider stopped this turn."}}
+{"type":"error","message":"Rate limit reached."}
+{"type":"item.completed","item":{"type":"error","message":"The selected model was unavailable."}}

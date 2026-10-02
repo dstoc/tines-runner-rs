@@ -2,6 +2,7 @@
 
 pub mod assignment;
 pub mod codex;
+pub mod codex_stream;
 pub mod config;
 pub mod credentials;
 pub mod logging;

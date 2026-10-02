@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"01a09e68-24d8-78d3-8bc7-67037a0cd7de"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"cargo test","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"cargo test","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Patch complete."}}
+{"type":"item.completed","item":{"id":"item_3","type":"mcp_tool_call","server":"docs","tool":"search"}}
+{"type":"turn.completed","usage":{"input_tokens":110801,"cached_input_tokens":101888,"cache_write_input_tokens":0,"output_tokens":1980,"reasoning_output_tokens":306},"future_metadata":{"source":"codex"}}
+{"type":"thread.metadata.updated","thread_id":"01a09e68-24d8-78d3-8bc7-67037a0cd7de","revision":2}
