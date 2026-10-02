@@ -8,13 +8,17 @@ use std::process::ExitCode;
     version,
     about = "An independent Rust runner for Tines assignments"
 )]
-struct Cli {}
+struct Cli {
+    /// Validate configuration and stored credentials, then exit without polling.
+    #[arg(long)]
+    check: bool,
+}
 
 fn main() -> ExitCode {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
     tines_runner_rs::logging::init();
 
-    match start_runner() {
+    match start_runner(cli.check) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "runner startup failed");
@@ -23,10 +27,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn start_runner() -> Result<(), Box<dyn Error>> {
+fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     let config = tines_runner_rs::config::Config::load_default()?;
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
-    connection.verify()?;
+    if check {
+        connection.verify()?;
+    }
 
     tracing::info!(
         version = tines_runner_rs::VERSION,
@@ -34,6 +40,39 @@ fn start_runner() -> Result<(), Box<dyn Error>> {
         registered = connection.registered(),
         "runner credentials ready"
     );
+
+    if check {
+        return Ok(());
+    }
+
+    let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
+    let boot_id = poller.state().instance_id().to_owned();
+    tracing::info!(instance_id = %boot_id, "runner poll loop started");
+    poller.run_with(
+        |response, state| {
+            for assignment in &response.assignments {
+                tracing::info!(run_id = %assignment.run.id, "assignment received and queued");
+            }
+            for run_id in &response.cancels {
+                tracing::warn!(
+                    run_id,
+                    "supervisor settled run; executor must stop it without finish reporting"
+                );
+            }
+            for request in &response.cancel_requests {
+                tracing::warn!(run_id = %request.run_id, "supervisor requested run cancellation");
+            }
+            if let Some(control) = &response.concurrency_control {
+                tracing::info!(
+                    concurrency = state.effective_concurrency(),
+                    available = control.available,
+                    "runner concurrency policy updated"
+                );
+            }
+        },
+        || true,
+        std::thread::sleep,
+    )?;
 
     Ok(())
 }

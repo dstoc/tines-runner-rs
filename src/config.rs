@@ -48,6 +48,7 @@ pub struct Config {
     /// An argv prefix. Entries are passed directly to process creation.
     pub wrapper: Vec<String>,
     pub max_concurrent: usize,
+    pub allow_remote_concurrency: bool,
     pub poll_interval: Duration,
     pub credentials_file: PathBuf,
     pub workspace_retention: WorkspaceRetention,
@@ -253,6 +254,7 @@ impl Config {
             workspace_parent,
             wrapper: raw.runner.wrapper.unwrap_or_default(),
             max_concurrent,
+            allow_remote_concurrency: raw.runner.allow_remote_concurrency,
             poll_interval: Duration::from_secs(poll_interval_seconds),
             credentials_file,
             workspace_retention: WorkspaceRetention {
@@ -318,6 +320,8 @@ struct RawRunner {
     workspace_parent: Option<PathBuf>,
     wrapper: Option<Vec<String>>,
     max_concurrent: Option<usize>,
+    #[serde(default)]
+    allow_remote_concurrency: bool,
     poll_interval_seconds: Option<u64>,
 }
 
@@ -637,6 +641,7 @@ wrapper = ["bin/wrapper", "; echo should-not-run"]
                 wrapper = ["/usr/local/bin/codex-wrapper", "--trace"]
                 max_concurrent = 4
                 poll_interval_seconds = 9
+                allow_remote_concurrency = true
 
                 [storage]
                 credentials_file = "~/.config/runner/credentials.toml"
@@ -660,6 +665,7 @@ wrapper = ["bin/wrapper", "; echo should-not-run"]
         );
         assert_eq!(config.wrapper, ["/usr/local/bin/codex-wrapper", "--trace"]);
         assert_eq!(config.max_concurrent, 4);
+        assert!(config.allow_remote_concurrency);
         assert_eq!(config.poll_interval, Duration::from_secs(9));
         assert_eq!(
             config.credentials_file,
