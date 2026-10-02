@@ -41,11 +41,6 @@ pub struct RunnerIdentity {
     pub id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct RunnerIdentityResponse {
-    pub runner_id: String,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerPollRequest {
     #[serde(skip_serializing_if = "Option::is_none")]

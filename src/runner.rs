@@ -89,17 +89,12 @@ impl RunnerConnection {
 
     /// Validate stored credentials without polling or claiming assignments.
     pub fn verify(&self) -> Result<(), RunnerError> {
-        let identity = self
-            .client
-            .get_runner_identity(
+        self.client
+            .verify_runner_token(
                 self.credentials.runner_id(),
                 self.credentials.runner_token(),
             )
-            .map_err(|error| self.protocol_error(error))?;
-        if identity.runner_id != self.credentials.runner_id() {
-            return Err(RunnerError::InvalidRunnerIdentity);
-        }
-        Ok(())
+            .map_err(|error| self.protocol_error(error))
     }
 
     /// Poll Tines with the stored runner token.
@@ -166,7 +161,6 @@ pub enum RunnerError {
     Registration(ClientError),
     InvalidConcurrency(usize),
     InvalidRegistrationResponse,
-    InvalidRunnerIdentity,
     RejectedRunnerToken { runner_id: String },
     Protocol(ClientError),
 }
@@ -187,9 +181,6 @@ impl fmt::Display for RunnerError {
             Self::InvalidRegistrationResponse => {
                 f.write_str("Tines returned an empty runner ID or runner token")
             }
-            Self::InvalidRunnerIdentity => {
-                f.write_str("Tines returned an unexpected runner identity")
-            }
             Self::RejectedRunnerToken { runner_id } => write!(
                 f,
                 "Tines rejected the runner token for runner {runner_id}; stopped without falling back to TINES_API_KEY. Verify the credentials file and register the runner again if needed."
@@ -209,7 +200,6 @@ impl Error for RunnerError {
             Self::BootstrapKey(error) => Some(error),
             Self::InvalidConcurrency(_)
             | Self::InvalidRegistrationResponse
-            | Self::InvalidRunnerIdentity
             | Self::RejectedRunnerToken { .. } => None,
         }
     }
@@ -283,6 +273,7 @@ mod tests {
             let reason = match status {
                 200 => "OK",
                 201 => "Created",
+                400 => "Bad Request",
                 401 => "Unauthorized",
                 _ => "Mock",
             };
@@ -400,13 +391,47 @@ mod tests {
     }
 
     #[test]
+    fn startup_verifies_saved_token_with_a_malformed_poll_body() {
+        let directory = TestDirectory::new();
+        let store = CredentialStore::at(directory.credentials_path());
+        store
+            .save(&RunnerCredentials::new("rnr_saved", "saved-runner-token"))
+            .expect("write saved credentials");
+        let (url, server) = mock_response(
+            400,
+            r#"{"error":{"code":"invalid_json","message":"Request body must be valid JSON"}}"#,
+        );
+        let config = config(&url, store.path());
+        let connection = RunnerConnection::connect_with_key_provider(
+            &config,
+            Client::new(&url).expect("Tines client"),
+            || panic!("a saved token must not require a bootstrap key"),
+        )
+        .expect("load saved runner credentials");
+
+        connection.verify().expect("validate saved runner token");
+        let request = server.join().expect("mock request");
+        let (headers, body) = request_parts(&request);
+        assert!(headers.contains("POST /api/v1/runners/rnr_saved/poll HTTP/1.1"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer saved-runner-token")
+        );
+        assert_eq!(body, "{");
+    }
+
+    #[test]
     fn rejected_saved_token_fails_closed_without_bootstrap_fallback() {
         let directory = TestDirectory::new();
         let store = CredentialStore::at(directory.credentials_path());
         store
             .save(&RunnerCredentials::new("rnr_rejected", "rejected-token"))
             .expect("write saved credentials");
-        let (url, server) = mock_response(401, r#"{"error":"invalid_runner_token"}"#);
+        let (url, server) = mock_response(
+            401,
+            r#"{"error":{"code":"runner_token_invalid","message":"Invalid token"}}"#,
+        );
         let config = config(&url, store.path());
         let connection = RunnerConnection::connect_with_key_provider(
             &config,
@@ -415,8 +440,8 @@ mod tests {
         )
         .expect("load saved runner credentials");
 
-        let error = match connection.poll(&RunnerPollRequest::default()) {
-            Ok(_) => panic!("rejected token should stop the runner"),
+        let error = match connection.verify() {
+            Ok(()) => panic!("rejected token should stop startup"),
             Err(error) => error,
         };
         assert_eq!(
@@ -425,6 +450,7 @@ mod tests {
         );
         let request = server.join().expect("mock request");
         let (headers, _) = request_parts(&request);
+        assert!(headers.contains("POST /api/v1/runners/rnr_rejected/poll HTTP/1.1"));
         assert!(
             headers
                 .to_ascii_lowercase()

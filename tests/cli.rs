@@ -108,20 +108,27 @@ fn registration_server() -> (String, JoinHandle<Vec<String>>) {
                         201,
                         r#"{"runner":{"id":"rnr_cli_test"},"runner_token":"cli-runner-token"}"#,
                     )
-                } else if request.contains("/runners/rnr_cli_test/identity ") {
-                    (200, r#"{"runner_id":"rnr_cli_test"}"#)
                 } else if request.contains("/runners/rnr_cli_test/poll ") {
-                    // If startup polls instead of validating identity, this is queued work.
-                    (
-                        200,
-                        r#"{"assignments":[{"run":{"id":"arun_queued","issue_id":"iss_queued"},"prompt":"queued work","bundle":{},"run_key":"run-key","timeout_minutes":30}],"cancels":[]}"#,
-                    )
+                    let (_, body) = request
+                        .split_once("\r\n\r\n")
+                        .expect("runner poll request headers");
+                    if body == "{" {
+                        // The API authenticates first, then rejects malformed JSON before poll logic.
+                        (400, r#"{"error":{"code":"invalid_json","message":"Request body must be valid JSON"}}"#)
+                    } else {
+                        // A valid poll would claim this one-shot assignment.
+                        (
+                            200,
+                            r#"{"assignments":[{"run":{"id":"arun_queued","issue_id":"iss_queued"},"prompt":"queued work","bundle":{},"run_key":"run-key","timeout_minutes":30}],"cancels":[]}"#,
+                        )
+                    }
                 } else {
                     (500, r#"{"error":"unexpected_request"}"#)
                 };
                 let reason = match status {
                     200 => "OK",
                     201 => "Created",
+                    400 => "Bad Request",
                     _ => "Mock",
                 };
                 write!(
@@ -173,9 +180,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
         .env("TINES_API_KEY", "bootstrap-key-test")
         .output()
         .expect("start runner for registration");
-    let requests = server
-        .join()
-        .expect("registration and startup poll requests");
+    let requests = server.join().expect("registration and startup token check");
 
     assert!(
         first_start.status.success(),
@@ -196,16 +201,21 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     assert_eq!(body["harness"], "codex");
     assert_eq!(body["max_concurrent"], 2);
 
-    assert_eq!(requests.len(), 2, "startup must not poll and claim work");
-    let (identity_headers, _) = requests[1]
+    assert_eq!(
+        requests.len(),
+        2,
+        "startup should register and validate once"
+    );
+    let (check_headers, check_body) = requests[1]
         .split_once("\r\n\r\n")
-        .expect("startup identity request headers");
-    assert!(identity_headers.contains("GET /api/v1/runners/rnr_cli_test/identity HTTP/1.1"));
+        .expect("startup token-check request headers");
+    assert!(check_headers.contains("POST /api/v1/runners/rnr_cli_test/poll HTTP/1.1"));
     assert!(
-        identity_headers
+        check_headers
             .to_ascii_lowercase()
             .contains("authorization: bearer cli-runner-token")
     );
+    assert_eq!(check_body, "{", "startup must not send a valid poll body");
 
     let saved_credentials = fs::read_to_string(directory.credentials_path())
         .expect("read persisted runner credentials");
@@ -213,7 +223,10 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     assert!(saved_credentials.contains("cli-runner-token"));
     assert!(!saved_credentials.contains("bootstrap-key-test"));
 
-    let (server_url, server) = mock_server(vec![(200, r#"{"runner_id":"rnr_cli_test"}"#)]);
+    let (server_url, server) = mock_server(vec![(
+        400,
+        r#"{"error":{"code":"invalid_json","message":"Request body must be valid JSON"}}"#,
+    )]);
     fs::write(
         config_dir.join("config.toml"),
         format!(
@@ -232,16 +245,20 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
         "restart should use saved credentials without TINES_API_KEY: {}",
         String::from_utf8_lossy(&second_start.stderr)
     );
-    let request = server.join().expect("restart identity request").remove(0);
-    let (headers, _) = request
+    let request = server
+        .join()
+        .expect("restart token-check request")
+        .remove(0);
+    let (headers, body) = request
         .split_once("\r\n\r\n")
-        .expect("restart identity request headers");
-    assert!(headers.contains("GET /api/v1/runners/rnr_cli_test/identity HTTP/1.1"));
+        .expect("restart token-check request headers");
+    assert!(headers.contains("POST /api/v1/runners/rnr_cli_test/poll HTTP/1.1"));
     assert!(
         headers
             .to_ascii_lowercase()
             .contains("authorization: bearer cli-runner-token")
     );
+    assert_eq!(body, "{");
 }
 
 #[test]
@@ -254,7 +271,10 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
         "runner_id = \"rnr_rejected\"\nrunner_token = \"rejected-token\"\n",
     )
     .expect("write stored runner credentials");
-    let (server_url, server) = mock_server(vec![(401, r#"{"error":"invalid_runner_token"}"#)]);
+    let (server_url, server) = mock_server(vec![(
+        401,
+        r#"{"error":{"code":"runner_token_invalid","message":"Invalid token"}}"#,
+    )]);
     let credentials_path =
         toml::Value::String(directory.credentials_path().to_string_lossy().into_owned());
     fs::write(
@@ -283,17 +303,18 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
     ), "unexpected startup diagnostic: {diagnostic}");
     let request = server
         .join()
-        .expect("rejected-token identity request")
+        .expect("rejected-token token-check request")
         .remove(0);
-    let (headers, _) = request
+    let (headers, body) = request
         .split_once("\r\n\r\n")
-        .expect("rejected-token identity request headers");
-    assert!(headers.contains("GET /api/v1/runners/rnr_rejected/identity HTTP/1.1"));
+        .expect("rejected-token token-check request headers");
+    assert!(headers.contains("POST /api/v1/runners/rnr_rejected/poll HTTP/1.1"));
     assert!(
         headers
             .to_ascii_lowercase()
             .contains("authorization: bearer rejected-token")
     );
+    assert_eq!(body, "{");
     assert!(!headers.contains("/register"));
 }
 

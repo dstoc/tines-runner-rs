@@ -4,15 +4,15 @@ use std::fmt;
 use std::time::Duration;
 
 use reqwest::blocking::{Client as HttpClient, RequestBuilder};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::protocol::{
     AppendRunLogRequest, AppendRunLogResponse, FinishRunRequest, FinishRunResponse,
-    IssueDetailResponse, RegisterRunnerRequest, RunnerIdentityResponse, RunnerPollRequest,
-    RunnerPollResponse, RunnerTokenResponse,
+    IssueDetailResponse, RegisterRunnerRequest, RunnerPollRequest, RunnerPollResponse,
+    RunnerTokenResponse,
 };
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -150,13 +150,38 @@ impl Client {
         self.post_json(&["runners", "register"], user_api_key, request)
     }
 
-    pub fn get_runner_identity(
+    /// Check a runner token without letting the poll endpoint deliver work.
+    ///
+    /// The current Tines API authenticates poll requests before parsing their
+    /// JSON body. This sends malformed JSON and accepts only the API's
+    /// `invalid_json` response. The handler returns before poll processing, so
+    /// this request cannot claim an assignment.
+    pub fn verify_runner_token(
         &self,
         runner_id: &str,
         runner_token: &str,
-    ) -> Result<RunnerIdentityResponse, ClientError> {
-        let url = self.endpoint(&["runners", runner_id, "identity"])?;
-        self.send_json(self.http.get(url), runner_token)
+    ) -> Result<(), ClientError> {
+        let url = self.endpoint(&["runners", runner_id, "poll"])?;
+        let request = self
+            .http
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, "1")
+            .body("{");
+        let response = self.send(request, runner_token)?;
+        let status = response.status();
+        if status != StatusCode::BAD_REQUEST {
+            return Err(ClientError::http_status(status));
+        }
+
+        let body = response
+            .json::<serde_json::Value>()
+            .map_err(|_| ClientError::local_protocol_error())?;
+        if body["error"]["code"] == "invalid_json" {
+            Ok(())
+        } else {
+            Err(ClientError::http_status(status))
+        }
     }
 
     pub fn poll_runner(
@@ -215,20 +240,27 @@ impl Client {
         request: RequestBuilder,
         bearer_token: &str,
     ) -> Result<T, ClientError> {
-        let authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
-            .map_err(|_| ClientError::local_protocol_error())?;
-        let response = request
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, authorization)
-            .send()
-            .map_err(|_| ClientError::transport_error())?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ClientError::http_status(status));
+        let response = self.send(request, bearer_token)?;
+        if !response.status().is_success() {
+            return Err(ClientError::http_status(response.status()));
         }
         response
             .json::<T>()
             .map_err(|_| ClientError::local_protocol_error())
+    }
+
+    fn send(
+        &self,
+        request: RequestBuilder,
+        bearer_token: &str,
+    ) -> Result<reqwest::blocking::Response, ClientError> {
+        let authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
+            .map_err(|_| ClientError::local_protocol_error())?;
+        request
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, authorization)
+            .send()
+            .map_err(|_| ClientError::transport_error())
     }
 
     fn endpoint(&self, path: &[&str]) -> Result<Url, ClientError> {
@@ -308,15 +340,27 @@ mod tests {
         let address = listener.local_addr().expect("read listener address");
         let server = thread::spawn(move || {
             let responses = [
-                r#"{"runner":{"id":"rnr_1"},"runner_token":"runner-secret"}"#,
-                r#"{"runner_id":"rnr_1"}"#,
-                r#"{"assignments":[],"cancels":[]}"#,
-                r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
-                r#"{"id":"arun_1","status":"completed"}"#,
-                r#"{"id":"iss_1","workflow":{"name":"Implementation"}}"#,
+                (
+                    200,
+                    r#"{"runner":{"id":"rnr_1"},"runner_token":"runner-secret"}"#,
+                ),
+                (
+                    400,
+                    r#"{"error":{"code":"invalid_json","message":"Request body must be valid JSON"}}"#,
+                ),
+                (200, r#"{"assignments":[],"cancels":[]}"#),
+                (
+                    200,
+                    r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
+                ),
+                (200, r#"{"id":"arun_1","status":"completed"}"#),
+                (
+                    200,
+                    r#"{"id":"iss_1","workflow":{"name":"Implementation"}}"#,
+                ),
             ];
             let mut requests = Vec::new();
-            for response_body in responses {
+            for (status, response_body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
                 let mut request = String::new();
@@ -339,7 +383,7 @@ mod tests {
 
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 )
@@ -366,8 +410,8 @@ mod tests {
             )
             .expect("register runner");
         client
-            .get_runner_identity("rnr_1", "runner-token")
-            .expect("get runner identity");
+            .verify_runner_token("rnr_1", "runner-token")
+            .expect("verify runner token without polling");
         client
             .poll_runner(
                 "rnr_1",
@@ -405,8 +449,10 @@ mod tests {
         let requests = server.join().expect("join test server");
         assert!(requests[0].contains("post /tines/api/v1/runners/register "));
         assert!(requests[0].contains("authorization: bearer user-key"));
-        assert!(requests[1].contains("get /tines/api/v1/runners/rnr_1/identity "));
+        assert!(requests[1].contains("post /tines/api/v1/runners/rnr_1/poll "));
         assert!(requests[1].contains("authorization: bearer runner-token"));
+        assert!(requests[1].contains("content-length: 1\r\n"));
+        assert!(requests[1].ends_with('{'));
         assert!(requests[2].contains("post /tines/api/v1/runners/rnr_1/poll "));
         assert!(requests[2].contains("authorization: bearer runner-token"));
         assert!(requests[3].contains("post /tines/api/v1/runs/arun_1/logs "));
