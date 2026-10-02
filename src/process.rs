@@ -128,8 +128,10 @@ pub enum ProcessExit {
 pub struct SupervisedProcess {
     child: Child,
     identity: ProcessIdentity,
-    stdout: JoinHandle<io::Result<Vec<u8>>>,
-    stderr: JoinHandle<io::Result<Vec<u8>>>,
+    stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    #[cfg(unix)]
+    finished: bool,
     #[cfg(windows)]
     job: WindowsJob,
 }
@@ -202,8 +204,10 @@ impl SupervisedProcess {
         Ok(Self {
             child,
             identity,
-            stdout,
-            stderr,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            #[cfg(unix)]
+            finished: false,
             #[cfg(windows)]
             job,
         })
@@ -324,15 +328,49 @@ impl SupervisedProcess {
         }
     }
 
-    fn collect(self, status: ExitStatus, timed_out: bool) -> io::Result<ProcessOutput> {
-        let stdout = join_reader(self.stdout)?;
-        let stderr = join_reader(self.stderr)?;
+    fn collect(mut self, status: ExitStatus, timed_out: bool) -> io::Result<ProcessOutput> {
+        #[cfg(unix)]
+        {
+            self.finished = true;
+        }
+        let stdout = join_reader(
+            self.stdout
+                .take()
+                .ok_or_else(|| io::Error::other("child stdout reader was already joined"))?,
+        )?;
+        let stderr = join_reader(
+            self.stderr
+                .take()
+                .ok_or_else(|| io::Error::other("child stderr reader was already joined"))?,
+        )?;
         Ok(ProcessOutput {
             exit: process_exit(status),
             timed_out,
             stdout,
             stderr,
         })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SupervisedProcess {
+    fn drop(&mut self) {
+        if !self.finished && self.terminate_group(Duration::from_secs(2)).is_err() {
+            let process_group_id = self
+                .identity
+                .process_group_id
+                .unwrap_or_else(|| self.child.id());
+            let _ = signal_unix_group(process_group_id, SIGKILL);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+
+        if let Some(stdout) = self.stdout.take() {
+            let _ = stdout.join();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
     }
 }
 
@@ -835,6 +873,35 @@ mod tests {
             .expect("terminate timed-out process group");
         assert!(result.timed_out);
         assert_eq!(result.exit, ProcessExit::Signal(9));
+        assert_descendant_stopped(descendant);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_live_process_kills_descendants() {
+        let directory = TestDirectory::new();
+        let pid_path = directory.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap '' TERM; (trap '' TERM; exec sleep 30) & echo $! > \"$1\"; wait",
+            "stub-harness",
+        ]);
+        command.arg(&pid_path);
+
+        let process = SupervisedProcess::spawn(&mut command).expect("spawn harness");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let descendant = fs::read_to_string(&pid_path)
+            .expect("harness wrote descendant PID")
+            .trim()
+            .parse::<u32>()
+            .expect("valid descendant PID");
+
+        drop(process);
+
         assert_descendant_stopped(descendant);
     }
 
