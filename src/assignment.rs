@@ -4,8 +4,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::config::{Config, ConfigResolution, MatchContext};
+use crate::protocol::AppendRunLogResponse;
 use crate::protocol::RunnerAssignment;
-use crate::protocol::client::{Client, ClientError};
+use crate::protocol::client::{Client, ClientError, RunLogBuffer};
 use crate::workspace::MaterializedWorkspace;
 
 /// A resolved assignment with its cold-run workspace ready for process launch.
@@ -13,6 +14,7 @@ use crate::workspace::MaterializedWorkspace;
 pub struct PreparedAssignment {
     resolved: ResolvedAssignment,
     workspace: MaterializedWorkspace,
+    run_logs: RunLogBuffer,
 }
 
 impl PreparedAssignment {
@@ -20,7 +22,14 @@ impl PreparedAssignment {
         Self {
             resolved,
             workspace,
+            run_logs: RunLogBuffer::new(),
         }
+    }
+
+    /// Keep workspace preparation output for delivery once the harness starts.
+    pub fn with_run_log_buffer(mut self, run_logs: RunLogBuffer) -> Self {
+        self.run_logs = run_logs;
+        self
     }
 
     pub fn resolved(&self) -> &ResolvedAssignment {
@@ -33,6 +42,18 @@ impl PreparedAssignment {
 
     pub fn assignment(&self) -> &RunnerAssignment {
         self.resolved.assignment()
+    }
+
+    /// Append harness output and flush buffered workspace output first.
+    pub fn append_harness_output(
+        &mut self,
+        client: &Client,
+        runner_token: &str,
+        chunk: &str,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .append_harness_output(client, &run_id, runner_token, chunk)
     }
 }
 
@@ -49,6 +70,7 @@ impl fmt::Debug for PreparedAssignment {
         f.debug_struct("PreparedAssignment")
             .field("resolved", &self.resolved)
             .field("workspace", &self.workspace)
+            .field("run_logs", &self.run_logs)
             .finish()
     }
 }

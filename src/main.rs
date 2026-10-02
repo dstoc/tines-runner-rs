@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::error::Error;
 use std::process::ExitCode;
-use tines_runner_rs::protocol::AppendRunLogRequest;
+use tines_runner_rs::protocol::client::RunLogBuffer;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,7 +47,6 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     }
 
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
-    let runner_token = connection.credentials().runner_token().to_owned();
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
@@ -60,7 +59,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     assignment,
                 ) {
                     Ok(resolved) => {
-                        let mut log_seq = 1;
+                        let mut run_logs = RunLogBuffer::new();
                         let workspace = match tines_runner_rs::workspace::MaterializedWorkspace::create_with_git_log(
                             &resolved.resolution().config.workspace_parent,
                             resolved.assignment(),
@@ -71,27 +70,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                                     git_output = %chunk.trim_end(),
                                     "repository checkout progress"
                                 );
-                                let request = AppendRunLogRequest {
-                                    chunk: chunk.to_owned(),
-                                    seq: Some(log_seq),
-                                };
-                                match issue_client.append_run_log(
-                                    &assignment.run.id,
-                                    &runner_token,
-                                    &request,
-                                ) {
-                                    Ok(response) => {
-                                        log_seq = response.log_seq.saturating_add(1);
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            run_id = %assignment.run.id,
-                                            error = %error,
-                                            "could not append repository checkout output to the run log"
-                                        );
-                                        log_seq = log_seq.saturating_add(1);
-                                    }
-                                }
+                                run_logs.buffer_preparation_output(chunk);
                             },
                         ) {
                             Ok(workspace) => workspace,
@@ -101,7 +80,13 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                                     error = %error,
                                     "assignment failed during workspace materialization"
                                 );
-                                state.fail_assignment(assignment.run.id.clone(), error.to_string());
+                                let output = run_logs.preparation_output();
+                                let failure = if output.is_empty() {
+                                    error.to_string()
+                                } else {
+                                    format!("{error}\nRepository checkout output:\n{output}")
+                                };
+                                state.fail_assignment(assignment.run.id.clone(), failure);
                                 continue;
                             }
                         };
@@ -114,9 +99,12 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                             workspace = %workspace.path().display(),
                             "assignment workspace materialized and queued"
                         );
-                        state.queue_assignment(tines_runner_rs::assignment::PreparedAssignment::new(
-                            resolved, workspace,
-                        ));
+                        state.queue_assignment(
+                            tines_runner_rs::assignment::PreparedAssignment::new(
+                                resolved, workspace,
+                            )
+                            .with_run_log_buffer(run_logs),
+                        );
                     }
                     Err(error) => {
                         state.decline_assignment(assignment.run.id.clone());
