@@ -69,6 +69,15 @@ impl MaterializedWorkspace {
     pub fn environment(&self) -> &LaunchEnvironment {
         &self.environment
     }
+
+    /// Remove this assignment's workspace after its run is settled.
+    pub fn cleanup(&self) -> io::Result<()> {
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl fmt::Debug for MaterializedWorkspace {

@@ -306,6 +306,7 @@ impl PollLoop {
                             match self.connection.finish_failed_assignment(&run_id, &error) {
                                 Ok(_) => {
                                     self.state.acknowledge_assignment_failure(&run_id);
+                                    self.state.release_run(&run_id);
                                     tracing::error!(
                                         run_id,
                                         error,

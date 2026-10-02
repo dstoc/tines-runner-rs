@@ -22,6 +22,7 @@ const MAX_REGISTERED_CONCURRENCY: usize = 100;
 /// The session holds the runner token in memory and uses it for runner
 /// protocol requests. The bootstrap user API key is used only during first
 /// registration and is never retained by this type.
+#[derive(Clone)]
 pub struct RunnerConnection {
     client: Client,
     credentials: RunnerCredentials,
@@ -118,15 +119,26 @@ impl RunnerConnection {
         run_id: &str,
         error: &str,
     ) -> Result<FinishRunResponse, RunnerError> {
+        self.finish_assignment(
+            run_id,
+            &FinishRunRequest {
+                status: FinishStatus::Failed,
+                error: Some(error.to_owned()),
+                provider_session_id: None,
+                usage: None,
+                pricing_evidence: None,
+            },
+        )
+    }
+
+    /// Report an ordinary assignment outcome with any observed provider data.
+    pub fn finish_assignment(
+        &self,
+        run_id: &str,
+        request: &FinishRunRequest,
+    ) -> Result<FinishRunResponse, RunnerError> {
         self.client
-            .finish_run(
-                run_id,
-                self.credentials.runner_token(),
-                &FinishRunRequest {
-                    status: FinishStatus::Failed,
-                    error: Some(error.to_owned()),
-                },
-            )
+            .finish_run(run_id, self.credentials.runner_token(), request)
             .map_err(|error| self.protocol_error(error))
     }
 

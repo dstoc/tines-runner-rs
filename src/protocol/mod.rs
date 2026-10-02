@@ -184,18 +184,78 @@ pub struct AppendRunLogResponse {
     pub log_seq: u64,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FinishStatus {
     Completed,
     Failed,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexRawUsageV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexMeasurementStatus {
+    Complete,
+    Missing,
+    Invalid,
+    Nonmonotonic,
+    IncompleteAttempt,
+    MultipleThreads,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexPricingEvidenceV1 {
+    pub version: u8,
+    pub harness: String,
+    /// Null means the launch did not specify a model.
+    pub model: Option<String>,
+    pub identity_source: String,
+    pub usage_scope: String,
+    pub session_mode: String,
+    pub normalization: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_usage: Option<CodexRawUsageV1>,
+    pub model_rerouted: bool,
+    pub measurement_status: CodexMeasurementStatus,
+    pub terminal_snapshots: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinishRunRequest {
     pub status: FinishStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing_evidence: Option<CodexPricingEvidenceV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

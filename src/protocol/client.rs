@@ -126,9 +126,11 @@ pub fn classify_http_status(status: StatusCode) -> ErrorCategory {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     base_url: Url,
     http: HttpClient,
+    request_timeout: Duration,
 }
 
 impl Client {
@@ -150,14 +152,19 @@ impl Client {
         base_url.set_query(None);
         base_url.set_fragment(None);
 
+        let request_timeout = timeout.min(MAX_REQUEST_TIMEOUT);
         let http = HttpClient::builder()
-            .timeout(timeout.min(MAX_REQUEST_TIMEOUT))
+            .timeout(request_timeout)
             // Credentials must remain scoped to the configured Tines host.
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| ClientError::local_protocol_error())?;
 
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            http,
+            request_timeout,
+        })
     }
 
     pub fn register_runner(
@@ -220,6 +227,23 @@ impl Client {
         self.post_json(&["runs", run_id, "logs"], runner_token, request)
     }
 
+    /// Append a run log before an absolute deadline. This keeps a blocked
+    /// start-log request within the time left for the harness.
+    pub fn append_run_log_until(
+        &self,
+        run_id: &str,
+        runner_token: &str,
+        request: &AppendRunLogRequest,
+        deadline: std::time::Instant,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        self.post_json_with_deadline(
+            &["runs", run_id, "logs"],
+            runner_token,
+            request,
+            Some(deadline),
+        )
+    }
+
     pub fn finish_run(
         &self,
         run_id: &str,
@@ -243,13 +267,34 @@ impl Client {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
+        self.post_json_with_deadline(path, bearer_token, body, None)
+    }
+
+    fn post_json_with_deadline<T, B>(
+        &self,
+        path: &[&str],
+        bearer_token: &str,
+        body: &B,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<T, ClientError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
         let body = serde_json::to_vec(body).map_err(|_| ClientError::local_protocol_error())?;
         let url = self.endpoint(path)?;
-        let request = self
+        let mut request = self
             .http
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .body(body);
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::transport_error());
+            }
+            request = request.timeout(remaining.min(self.request_timeout));
+        }
         self.send_json(request, bearer_token)
     }
 
@@ -350,6 +395,34 @@ impl RunLogBuffer {
         Ok(response)
     }
 
+    /// Flush preparation output and mark the harness as started before a
+    /// deadline. Every append uses the time still available at that point.
+    pub fn harness_started_until(
+        &mut self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        deadline: std::time::Instant,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        if let Some(response) =
+            self.flush_preparation_output_until(client, run_id, runner_token, deadline)?
+        {
+            return Ok(response);
+        }
+
+        let response = client.append_run_log_until(
+            run_id,
+            runner_token,
+            &AppendRunLogRequest {
+                chunk: String::new(),
+                seq: Some(self.next_seq),
+            },
+            deadline,
+        )?;
+        self.next_seq = response.log_seq.saturating_add(1);
+        Ok(response)
+    }
+
     /// Append harness output, flushing any preparation output first.
     pub fn append_harness_output(
         &mut self,
@@ -394,6 +467,31 @@ impl RunLogBuffer {
         }
         Ok(last_response)
     }
+
+    fn flush_preparation_output_until(
+        &mut self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let mut last_response = None;
+        while let Some(preparation_chunk) = self.preparation_chunks.front() {
+            let response = client.append_run_log_until(
+                run_id,
+                runner_token,
+                &AppendRunLogRequest {
+                    chunk: preparation_chunk.clone(),
+                    seq: Some(self.next_seq),
+                },
+                deadline,
+            )?;
+            self.preparation_chunks.pop_front();
+            self.next_seq = response.log_seq.saturating_add(1);
+            last_response = Some(response);
+        }
+        Ok(last_response)
+    }
 }
 
 impl Default for RunLogBuffer {
@@ -425,7 +523,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn classifies_http_failures() {
@@ -494,6 +592,57 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::Retryable);
         assert_eq!(error.status(), None);
         assert!(!error.to_string().contains("run-secret-token"));
+    }
+
+    #[test]
+    fn run_log_request_uses_the_remaining_deadline_as_its_http_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("read listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept log request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request header");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().expect("content length");
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).expect("read request body");
+
+            thread::sleep(Duration::from_millis(600));
+            let response = r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            );
+        });
+
+        let client = Client::with_timeout(&format!("http://{address}"), Duration::from_secs(5))
+            .expect("create client");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let error = client
+            .append_run_log_until(
+                "arun_deadline",
+                "runner-token",
+                &AppendRunLogRequest {
+                    chunk: String::new(),
+                    seq: Some(1),
+                },
+                deadline,
+            )
+            .expect_err("server response must arrive after the deadline");
+
+        assert_eq!(error.category(), ErrorCategory::Retryable);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().expect("join fake Tines server");
     }
 
     #[test]
@@ -785,6 +934,9 @@ mod tests {
                 &FinishRunRequest {
                     status: FinishStatus::Completed,
                     error: None,
+                    provider_session_id: None,
+                    usage: None,
+                    pricing_evidence: None,
                 },
             )
             .expect("finish run");
