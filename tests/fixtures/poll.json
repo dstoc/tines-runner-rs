@@ -1,7 +1,8 @@
 {
   "request": {
     "instance_id": "boot-456",
-    "owned_runs": []
+    "owned_runs": [],
+    "env_delivery": 1
   },
   "response": {
     "assignments": [
@@ -24,6 +25,9 @@
           "repos": []
         },
         "run_key": "fixture-run-key",
+        "env": [
+          { "name": "FIXTURE_TOKEN", "value": "fixture-secret", "secret": true }
+        ],
         "timeout_minutes": 120,
         "future_assignment_field": true
       }

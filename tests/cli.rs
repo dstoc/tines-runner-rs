@@ -323,6 +323,7 @@ fn daemon_uses_its_first_poll_to_authenticate_and_detect_fencing() {
     assert_eq!(body["owned_runs"], serde_json::json!([]));
     assert_eq!(body["max_concurrent"], 2);
     assert_eq!(body["draining"], false);
+    assert_eq!(body["env_delivery"], 1);
 }
 
 #[test]

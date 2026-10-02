@@ -58,15 +58,34 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     assignment,
                 ) {
                     Ok(resolved) => {
+                        let workspace = match tines_runner_rs::workspace::MaterializedWorkspace::create(
+                            &resolved.resolution().config.workspace_parent,
+                            resolved.assignment(),
+                            &config.server_url,
+                        ) {
+                            Ok(workspace) => workspace,
+                            Err(error) => {
+                                tracing::error!(
+                                    run_id = %assignment.run.id,
+                                    error = %error,
+                                    "assignment failed during workspace materialization"
+                                );
+                                state.fail_assignment(assignment.run.id.clone(), error.to_string());
+                                continue;
+                            }
+                        };
                         tracing::info!(
                             run_id = %assignment.run.id,
                             project = resolved.context().project(),
                             workflow = resolved.context().workflow(),
                             state = resolved.context().state(),
                             matched_overrides = ?resolved.resolution().matching_overrides(),
-                            "assignment configuration resolved and queued"
+                            workspace = %workspace.path().display(),
+                            "assignment workspace materialized and queued"
                         );
-                        state.queue_assignment(resolved);
+                        state.queue_assignment(tines_runner_rs::assignment::PreparedAssignment::new(
+                            resolved, workspace,
+                        ));
                     }
                     Err(error) => {
                         state.decline_assignment(assignment.run.id.clone());
