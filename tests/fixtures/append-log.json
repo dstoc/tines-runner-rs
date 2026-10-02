@@ -1,0 +1,12 @@
+{
+  "request": {
+    "chunk": "[agent] started\n",
+    "seq": 1
+  },
+  "response": {
+    "status": "running",
+    "log_bytes_dropped": 0,
+    "log_seq": 1,
+    "future_log_field": true
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "response": {
+    "id": "iss_789",
+    "project_name": "Tines",
+    "number": 4,
+    "title": "Define protocol types",
+    "workflow": {
+      "id": "wfl_123",
+      "name": "Implementation",
+      "future_workflow_field": true
+    },
+    "future_issue_field": true
+  }
+}

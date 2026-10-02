@@ -1,0 +1,34 @@
+{
+  "request": {
+    "instance_id": "boot-456",
+    "owned_runs": []
+  },
+  "response": {
+    "assignments": [
+      {
+        "run": {
+          "id": "arun_456",
+          "issue_id": "iss_789",
+          "issue_ref": {
+            "project_name": "Tines",
+            "number": 4,
+            "title": "Define protocol types"
+          },
+          "state_at_start_name": "Implement",
+          "future_run_field": "ignored"
+        },
+        "prompt": "Implement the assigned issue.",
+        "bundle": {
+          "prompt": { "text": "Issue context" },
+          "skills": [],
+          "repos": []
+        },
+        "run_key": "fixture-run-key",
+        "timeout_minutes": 120,
+        "future_assignment_field": true
+      }
+    ],
+    "cancels": [],
+    "future_poll_field": true
+  }
+}
