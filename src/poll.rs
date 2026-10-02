@@ -118,10 +118,15 @@ impl PollState {
         self.assignment_failures.insert(run_id, error.into());
     }
 
-    fn take_assignment_failures(&mut self) -> Vec<(String, String)> {
-        std::mem::take(&mut self.assignment_failures)
-            .into_iter()
+    fn assignment_failures(&self) -> Vec<(String, String)> {
+        self.assignment_failures
+            .iter()
+            .map(|(run_id, error)| (run_id.clone(), error.clone()))
             .collect()
+    }
+
+    fn acknowledge_assignment_failure(&mut self, run_id: &str) {
+        self.assignment_failures.remove(run_id);
     }
 
     fn request(&self) -> RunnerPollRequest {
@@ -234,11 +239,33 @@ impl PollLoop {
                 Ok(response) => {
                     self.state.observe(&response)?;
                     handle_response(&response, &mut self.state);
-                    for (run_id, error) in self.state.take_assignment_failures() {
-                        self.connection
-                            .finish_failed_assignment(&run_id, &error)
-                            .map_err(PollError::Runner)?;
-                        tracing::error!(run_id, error, "assignment failed during preparation");
+                    for (run_id, error) in self.state.assignment_failures() {
+                        let mut finish_failures = 0u32;
+                        loop {
+                            match self.connection.finish_failed_assignment(&run_id, &error) {
+                                Ok(_) => {
+                                    self.state.acknowledge_assignment_failure(&run_id);
+                                    tracing::error!(
+                                        run_id,
+                                        error,
+                                        "assignment failed during preparation"
+                                    );
+                                    break;
+                                }
+                                Err(error) if is_retryable(&error) => {
+                                    let delay = retry_delay(finish_failures);
+                                    finish_failures = finish_failures.saturating_add(1);
+                                    tracing::warn!(
+                                        run_id,
+                                        error = %error,
+                                        backoff_seconds = delay.as_secs(),
+                                        "reporting assignment failure failed; retrying"
+                                    );
+                                    sleep(delay);
+                                }
+                                Err(error) => return Err(PollError::Runner(error)),
+                            }
+                        }
                     }
                     consecutive_failures = 0;
                     if should_continue() {
@@ -465,6 +492,73 @@ mod tests {
         assert_eq!(requests[1]["owned_runs"], serde_json::json!(["arun_live"]));
         assert_eq!(requests[0]["instance_id"], requests[1]["instance_id"]);
         assert_eq!(sleeps, [Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn queued_assignment_failures_retry_and_report_each_run() {
+        let directory = TestDirectory::new();
+        let poll_response = r#"{"assignments":[],"cancels":[]}"#;
+        let finish_response = r#"{"id":"arun_finished","status":"failed"}"#;
+        let (url, server) = mock_server(vec![
+            (200, poll_response),
+            (503, r#"{"error":{"code":"unavailable","message":"retry"}}"#),
+            (200, finish_response),
+            (200, finish_response),
+        ]);
+        let mut poller = poller(&directory, &url, false);
+        let polls = Cell::new(0);
+        let mut sleeps = Vec::new();
+        poller
+            .run_with(
+                |_, state| {
+                    state.fail_assignment("arun_a", "first preparation error");
+                    state.fail_assignment("arun_b", "second preparation error");
+                    polls.set(polls.get() + 1);
+                },
+                || polls.get() == 0,
+                |delay| sleeps.push(delay),
+            )
+            .expect("retry and report all queued assignment failures");
+
+        let requests = server.join().expect("mock server");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1]["error"], "first preparation error");
+        assert_eq!(requests[2]["error"], "first preparation error");
+        assert_eq!(requests[3]["error"], "second preparation error");
+        assert_eq!(sleeps, [Duration::from_secs(1)]);
+        assert!(poller.state().assignment_failures.is_empty());
+    }
+
+    #[test]
+    fn non_retryable_finish_error_keeps_assignment_failure_queued() {
+        let directory = TestDirectory::new();
+        let poll_response = r#"{"assignments":[],"cancels":[]}"#;
+        let (url, server) = mock_server(vec![
+            (200, poll_response),
+            (
+                400,
+                r#"{"error":{"code":"invalid_request","message":"invalid"}}"#,
+            ),
+        ]);
+        let mut poller = poller(&directory, &url, false);
+        let polls = Cell::new(0);
+        let error = poller
+            .run_with(
+                |_, state| {
+                    state.fail_assignment("arun_unconfirmed", "preparation error");
+                    polls.set(polls.get() + 1);
+                },
+                || polls.get() == 0,
+                |_| panic!("non-retryable finish errors must not back off"),
+            )
+            .expect_err("invalid finish request must stop the loop");
+
+        assert!(error.to_string().contains("400"));
+        assert_eq!(
+            poller.state().assignment_failures.get("arun_unconfirmed"),
+            Some(&"preparation error".to_owned())
+        );
+        assert_eq!(server.join().expect("mock server").len(), 2);
     }
 
     #[test]
