@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod recovery;
 pub mod retention;
 pub mod runner;
+pub mod shutdown;
 pub mod workspace;
 
 /// Version of this runner, set from the Cargo package metadata.

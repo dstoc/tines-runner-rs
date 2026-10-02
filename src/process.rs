@@ -108,24 +108,11 @@ impl ProcessIdentity {
 
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         {
-            if !self.matches_live_process() {
-                return Ok(false);
-            }
-            let Some(process_group_id) = self.process_group_id else {
-                return Ok(false);
-            };
-            signal_unix_group(process_group_id, SIGTERM)?;
-            let deadline = Instant::now() + grace;
-            while Instant::now() < deadline && unix_group_exists(process_group_id)? {
-                thread::sleep(
-                    Duration::from_millis(10)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            if unix_group_exists(process_group_id)? {
-                signal_unix_group(process_group_id, SIGKILL)?;
-            }
-            Ok(true)
+            let _ = grace;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "generation-safe process identity checks are unavailable on this Unix platform",
+            ))
         }
 
         #[cfg(windows)]
@@ -136,7 +123,10 @@ impl ProcessIdentity {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = grace;
-            Ok(false)
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "generation-safe process identity checks are unavailable on this platform",
+            ))
         }
     }
 
@@ -189,6 +179,8 @@ pub struct ProcessOutput {
     pub timed_out: bool,
     /// Whether the shared assignment cancellation signal ended this process.
     pub cancelled: bool,
+    /// Whether daemon shutdown ended this process.
+    pub interrupted: bool,
     /// Bytes written to stdout by the child and its descendants.
     pub stdout: Vec<u8>,
     /// Bytes written to stderr by the child and its descendants.
@@ -404,16 +396,44 @@ impl SupervisedProcess {
     /// Wait while forwarding live output and observing supervisor cancellation.
     /// `on_tick` runs during quiet periods so callers can flush partial batches.
     pub fn wait_timeout_with_output<F, C, T>(
+        self,
+        timeout: Duration,
+        grace: Duration,
+        is_cancelled: C,
+        on_output: F,
+        on_tick: T,
+    ) -> io::Result<ProcessOutput>
+    where
+        F: FnMut(ProcessChunk),
+        C: FnMut() -> bool,
+        T: FnMut(),
+    {
+        self.wait_timeout_with_output_or_shutdown(
+            timeout,
+            grace,
+            is_cancelled,
+            || false,
+            on_output,
+            on_tick,
+        )
+    }
+
+    /// Wait while forwarding output and responding to cancellation or daemon
+    /// shutdown. Shutdown terminates the process tree and marks the result as
+    /// interrupted so the caller can report a runner-caused finish.
+    pub fn wait_timeout_with_output_or_shutdown<F, C, I, T>(
         mut self,
         timeout: Duration,
         grace: Duration,
         mut is_cancelled: C,
+        mut is_interrupted: I,
         mut on_output: F,
         mut on_tick: T,
     ) -> io::Result<ProcessOutput>
     where
         F: FnMut(ProcessChunk),
         C: FnMut() -> bool,
+        I: FnMut() -> bool,
         T: FnMut(),
     {
         let deadline = Instant::now() + timeout;
@@ -422,16 +442,20 @@ impl SupervisedProcess {
             on_tick();
             if is_cancelled() {
                 let status = self.terminate_group(grace)?;
-                return self.collect_with(status, false, true, &mut on_output);
+                return self.collect_with(status, false, true, false, &mut on_output);
+            }
+            if is_interrupted() {
+                let status = self.terminate_group(grace)?;
+                return self.collect_with(status, false, false, true, &mut on_output);
             }
             if let Some(status) = self.child.try_wait()? {
                 self.terminate_remaining_group(grace)?;
-                return self.collect_with(status, false, false, &mut on_output);
+                return self.collect_with(status, false, false, false, &mut on_output);
             }
             let now = Instant::now();
             if now >= deadline {
                 let status = self.terminate_group(grace)?;
-                return self.collect_with(status, true, false, &mut on_output);
+                return self.collect_with(status, true, false, false, &mut on_output);
             }
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
@@ -556,7 +580,7 @@ impl SupervisedProcess {
         timed_out: bool,
         cancelled: bool,
     ) -> io::Result<ProcessOutput> {
-        self.collect_with(status, timed_out, cancelled, &mut |_| {})
+        self.collect_with(status, timed_out, cancelled, false, &mut |_| {})
     }
 
     fn collect_with<F>(
@@ -564,6 +588,7 @@ impl SupervisedProcess {
         status: ExitStatus,
         timed_out: bool,
         cancelled: bool,
+        interrupted: bool,
         on_output: &mut F,
     ) -> io::Result<ProcessOutput>
     where
@@ -596,6 +621,7 @@ impl SupervisedProcess {
             exit: process_exit(status),
             timed_out,
             cancelled,
+            interrupted,
             stdout,
             stderr,
         })
@@ -784,10 +810,16 @@ fn terminate_linux_group_if_matches(
         identity.boot_id.as_deref(),
         identity.start_time_ticks,
     ) else {
-        return Ok(false);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded Linux process identity is incomplete",
+        ));
     };
     if process_group_id != identity.process_id {
-        return Ok(false);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded Linux process group does not match its process ID",
+        ));
     }
 
     let Some(members) = linux_process_group_members(
@@ -1064,10 +1096,16 @@ fn terminate_macos_group_if_matches(
     let (Some(process_group_id), Some(start_time_ticks)) =
         (identity.process_group_id, identity.start_time_ticks)
     else {
-        return Ok(false);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded macOS process identity is incomplete",
+        ));
     };
     if process_group_id != identity.process_id || start_time_ticks == 0 {
-        return Ok(false);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded macOS process identity is invalid",
+        ));
     }
 
     let mut members = macos_process_group_members(identity)?;
@@ -1400,6 +1438,18 @@ fn terminate_windows_process_if_matches(
 ) -> io::Result<bool> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
+    let Some(expected_creation_time) = identity.start_time_ticks else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded Windows process identity is incomplete",
+        ));
+    };
+    if identity.process_group_id != Some(identity.process_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded Windows process group does not match its process ID",
+        ));
+    }
     let process = unsafe {
         OpenProcess(
             WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION | WINDOWS_PROCESS_TERMINATE,
@@ -1416,10 +1466,8 @@ fn terminate_windows_process_if_matches(
         };
     }
     let process = unsafe { OwnedHandle::from_raw_handle(process) };
-    if identity.start_time_ticks
-        != Some(windows_process_creation_time_from_raw_handle(
-            process.as_raw_handle(),
-        )?)
+    if expected_creation_time
+        != windows_process_creation_time_from_raw_handle(process.as_raw_handle())?
     {
         return Ok(false);
     }
@@ -1649,6 +1697,7 @@ mod tests {
             exit: ProcessExit::Signal(9),
             timed_out: true,
             cancelled: false,
+            interrupted: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
         };

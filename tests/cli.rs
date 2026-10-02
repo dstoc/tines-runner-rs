@@ -2,13 +2,51 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Child;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
+
+#[cfg(unix)]
+struct RunnerGuard {
+    child: Child,
+    credentials_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for RunnerGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+        if let Ok(store) = tines_runner_rs::recovery::ActiveRunStore::open(
+            self.credentials_path.with_file_name("active-runs.json"),
+        ) {
+            for record in store.records() {
+                if let Some(process) = record.process {
+                    let _ = process.terminate_if_matches(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+}
 
 impl TestDirectory {
     fn new() -> Self {
@@ -140,6 +178,72 @@ fn registration_server() -> (String, JoinHandle<Vec<String>>) {
                 request
             })
             .collect()
+    });
+    (format!("http://{address}"), server)
+}
+
+#[cfg(unix)]
+fn shutdown_server() -> (String, JoinHandle<(Vec<String>, serde_json::Value)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Tines server");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
+    let address = listener.local_addr().expect("read mock address");
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut requests = Vec::new();
+        let mut assignment_sent = false;
+        let mut finish = None;
+        let mut draining_seen = false;
+        loop {
+            assert!(Instant::now() < deadline, "shutdown server timed out");
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("accept Tines request: {error}"),
+            };
+            let request = read_http_request(&mut stream);
+            let (headers, body) = request
+                .split_once("\r\n\r\n")
+                .expect("Tines request headers");
+            let mut done = false;
+            let response = if headers.starts_with("POST /api/v1/runners/rnr_shutdown/poll ") {
+                let poll: serde_json::Value = serde_json::from_str(body).expect("poll JSON");
+                draining_seen |= poll["draining"] == true;
+                if !assignment_sent {
+                    assignment_sent = true;
+                    r#"{"assignments":[{"run":{"id":"arun_shutdown","issue_id":"iss_shutdown","issue_ref":{"project_name":"Tines","number":18,"title":"Graceful shutdown"},"state_at_start_name":"Implement"},"prompt":"wait for shutdown","bundle":{"skills":[],"repos":[]},"run_key":"issue-run-key","timeout_minutes":5}],"cancels":[]}"#.to_owned()
+                } else {
+                    r#"{"assignments":[],"cancels":[]}"#.to_owned()
+                }
+            } else if headers.starts_with("GET /api/v1/issues/iss_shutdown ") {
+                r#"{"id":"iss_shutdown","workflow":{"name":"Implementation"}}"#.to_owned()
+            } else if headers.starts_with("POST /api/v1/runs/arun_shutdown/logs ") {
+                let log: serde_json::Value = serde_json::from_str(body).expect("log JSON");
+                let sequence = log["seq"].as_u64().expect("run-log sequence");
+                format!(r#"{{"status":"running","log_bytes_dropped":0,"log_seq":{sequence}}}"#)
+            } else if headers.starts_with("POST /api/v1/runs/arun_shutdown/finish ") {
+                finish = Some(serde_json::from_str(body).expect("finish JSON"));
+                r#"{"id":"arun_shutdown","status":"failed"}"#.to_owned()
+            } else {
+                panic!("unexpected Tines request: {request}");
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .expect("write Tines response");
+            requests.push(request);
+            done |= finish.is_some() && draining_seen;
+            if done {
+                break;
+            }
+        }
+        (requests, finish.expect("run finish report"))
     });
     (format!("http://{address}"), server)
 }
@@ -432,4 +536,141 @@ fn startup_fails_when_tines_is_unavailable() {
         diagnostic.contains("retryable transport/server"),
         "unexpected startup diagnostic: {diagnostic}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
+    let directory = TestDirectory::new();
+    let config_dir = directory.config_dir().join("tines-runner-rs");
+    fs::create_dir_all(&config_dir).expect("create runner config directory");
+    let (server_url, server) = shutdown_server();
+    let credentials_path = directory.credentials_path();
+    fs::write(
+        &credentials_path,
+        "runner_id = \"rnr_shutdown\"\nrunner_token = \"shutdown-token\"\n",
+    )
+    .expect("write runner credentials");
+    let wrapper_path = directory.0.join("stub-codex");
+    let descendant_path = directory.0.join("descendant.pid");
+    fs::write(
+        &wrapper_path,
+        format!(
+            "#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\necho running\nwait\n",
+            descendant_path.display()
+        ),
+    )
+    .expect("write harness wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
+            .expect("make wrapper executable");
+    }
+    let workspace_parent = directory.0.join("workspaces");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nwrapper = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+            serde_json::to_string(&wrapper_path.to_string_lossy().as_ref())
+                .expect("encode wrapper path"),
+            workspace_parent,
+            credentials_path
+        ),
+    )
+    .expect("write runner config");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.configure_command(&mut command);
+    let mut runner = RunnerGuard {
+        child: command
+            .env_remove("TINES_API_KEY")
+            .spawn()
+            .expect("start runner daemon"),
+        credentials_path: credentials_path.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !descendant_path.exists() && Instant::now() < deadline {
+        if let Some(status) = runner.child.try_wait().expect("check runner") {
+            panic!("runner exited before starting harness: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(descendant_path.exists(), "harness descendant did not start");
+    let descendant = fs::read_to_string(&descendant_path)
+        .expect("read descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("parse descendant PID");
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &runner.child.id().to_string()])
+        .status()
+        .expect("send SIGTERM to runner");
+    assert!(signal.success(), "SIGTERM command failed");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = runner.child.try_wait().expect("wait for runner shutdown") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "runner did not drain and exit"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "graceful shutdown exited with {status:?}");
+    assert_process_stopped(descendant);
+
+    let (requests, finish) = server.join().expect("join shutdown server");
+    assert!(
+        requests.iter().any(|request| {
+            let (_, body) = request.split_once("\r\n\r\n").unwrap_or_default();
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .is_some_and(|body| body["draining"] == true)
+        }),
+        "runner never reported draining"
+    );
+    assert_eq!(finish["status"], "failed");
+    assert_eq!(finish["judgment"], "interrupted");
+    assert!(
+        finish["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("shutdown")
+    );
+    let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(
+        credentials_path.with_file_name("active-runs.json"),
+    )
+    .expect("read settled active-run state");
+    assert!(active_runs.records().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+fn assert_process_stopped(process_id: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+            Ok(stat) => {
+                let state = stat
+                    .rsplit_once(") ")
+                    .expect("valid proc stat record")
+                    .1
+                    .chars()
+                    .next()
+                    .expect("process state");
+                if state == 'Z' {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("could not inspect descendant: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "harness descendant remained alive"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }

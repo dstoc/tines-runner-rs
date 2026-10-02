@@ -17,10 +17,14 @@ use tines_runner_rs::cancellation::CancellationToken;
 use tines_runner_rs::config::Config;
 use tines_runner_rs::credentials::{CredentialStore, RunnerCredentials};
 use tines_runner_rs::effort::EffortCapabilities;
-use tines_runner_rs::execution::{ExecutionOutcome, execute_assignment_cancellable};
+use tines_runner_rs::execution::{
+    ExecutionContext, ExecutionOutcome, execute_assignment_cancellable,
+};
 use tines_runner_rs::protocol::RunnerAssignment;
 use tines_runner_rs::protocol::client::Client;
+use tines_runner_rs::recovery::ActiveRunStore;
 use tines_runner_rs::runner::RunnerConnection;
+use tines_runner_rs::shutdown::ShutdownSignal;
 use tines_runner_rs::workspace::MaterializedWorkspace;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -220,6 +224,10 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
     let workspace_path = prepared.workspace().path().to_path_buf();
     let cancellation = CancellationToken::default();
     cancellation.cancel();
+    let shutdown = ShutdownSignal::inactive();
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let context = ExecutionContext::new(&shutdown, &active_runs);
 
     let outcome = execute_assignment_cancellable(
         prepared,
@@ -228,6 +236,7 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
         &capabilities(),
         &config.workspace_retention,
         &cancellation,
+        &context,
     )
     .expect("cancel before launch");
 
@@ -251,6 +260,10 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
     let mut assignment = assignment(None);
     assignment.timeout_minutes = 0;
     let prepared = prepared(&config, &client, &assignment);
+    let shutdown = ShutdownSignal::inactive();
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let context = ExecutionContext::new(&shutdown, &active_runs);
 
     let outcome = execute_assignment_cancellable(
         prepared,
@@ -259,6 +272,7 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
         &capabilities(),
         &config.workspace_retention,
         &CancellationToken::default(),
+        &context,
     )
     .expect("report local timeout");
 
@@ -301,7 +315,11 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
     let cancellation = CancellationToken::default();
     let worker_token = cancellation.clone();
     let worker_retention = config.workspace_retention.clone();
+    let worker_shutdown = ShutdownSignal::inactive();
+    let worker_active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
     let worker = thread::spawn(move || {
+        let context = ExecutionContext::new(&worker_shutdown, &worker_active_runs);
         execute_assignment_cancellable(
             prepared,
             &connection,
@@ -309,6 +327,7 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
             &capabilities(),
             &worker_retention,
             &worker_token,
+            &context,
         )
     });
 
@@ -370,7 +389,11 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
     let worker_config = config.clone();
     let worker_client = client.clone();
     let worker_connection = connection.clone();
+    let worker_shutdown = ShutdownSignal::inactive();
+    let worker_active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
     let worker = thread::spawn(move || {
+        let context = ExecutionContext::new(&worker_shutdown, &worker_active_runs);
         run_assignment(
             &worker_config,
             &worker_connection,
@@ -379,6 +402,7 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
             tines_runner_rs::protocol::client::RunLogBuffer::new(),
             &capabilities(),
             &worker_token,
+            &context,
         )
     });
 
