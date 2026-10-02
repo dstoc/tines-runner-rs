@@ -1,0 +1,4 @@
+{"type":"turn.failed","error":{"message":"Invalid API key","codex_error_info":"unauthorized"}}
+{"type":"turn.failed","error":{"message":"The selected model was unavailable.","codex_error_info":"bad_request"}}
+{"type":"turn.failed","error":{"message":"To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.","codex_error_info":"usage_limit_exceeded"}}
+{"type":"error","message":"Rate limit reached."}

@@ -1,6 +1,18 @@
 //! Incremental parsing and readable rendering for `codex exec --json` output.
 
+use chrono::{DateTime, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone};
 use serde_json::Value;
+
+const MAX_SAFE_EPOCH_MS: u64 = 9_007_199_254_740_991;
+
+/// A provider limit reported by a terminal Codex error event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexRateLimit {
+    /// Provider reset instant as epoch milliseconds, when available.
+    pub resume_at: Option<u64>,
+    /// The terminal provider message, when present.
+    pub message: Option<String>,
+}
 
 /// A structured Codex event or a non-JSON line from the child process.
 ///
@@ -43,6 +55,51 @@ impl CodexEvent {
         self.raw()?.get("usage")
     }
 
+    /// Return a supported provider usage-limit signal from a terminal event.
+    ///
+    /// Classification is limited to top-level `turn.failed` and `error`
+    /// events. Item errors and assistant text can describe a limit without
+    /// meaning that the provider rejected the run.
+    pub fn rate_limit(&self) -> Option<CodexRateLimit> {
+        let raw = self.raw()?;
+        let event_type = self.event_type()?;
+        let error = match event_type {
+            "turn.failed" => raw.get("error")?,
+            "error" => raw,
+            _ => return None,
+        };
+
+        let code = ["codex_error_info", "code"]
+            .into_iter()
+            .find_map(|key| error.get(key).and_then(Value::as_str));
+        let code = code.or_else(|| {
+            (event_type == "turn.failed")
+                .then(|| error.get("type").and_then(Value::as_str))
+                .flatten()
+        });
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty());
+
+        let supported_code = match code {
+            Some("usage_limit_exceeded" | "rate_limit_exceeded" | "quota_exceeded") => {
+                !message.is_some_and(is_plan_entitlement_message)
+            }
+            Some(_) => false,
+            None => message.is_some_and(is_supported_limit_message),
+        };
+        if !supported_code {
+            return None;
+        }
+
+        Some(CodexRateLimit {
+            resume_at: reset_timestamp(error)
+                .or_else(|| message.and_then(parse_timestamp_from_message)),
+            message: message.map(str::to_owned),
+        })
+    }
+
     /// Render this event as zero or more concise run-log lines.
     ///
     /// Unknown structured event types are ignored. Their complete JSON value
@@ -81,6 +138,124 @@ impl CodexEvent {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+fn is_plan_entitlement_message(message: &str) -> bool {
+    message
+        .trim_start()
+        .starts_with("To use Codex with your ChatGPT plan, upgrade to Plus:")
+}
+
+fn is_supported_limit_message(message: &str) -> bool {
+    let message = message.trim_start();
+    if message
+        .get(.."rate limit exceeded:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("rate limit exceeded:"))
+    {
+        return true;
+    }
+    [
+        "You've hit your usage limit",
+        "You’ve hit your usage limit",
+        "Quota exceeded. Check your plan and billing details.",
+        "Your workspace is out of credits.",
+        "You hit your spend cap set in your workspace.",
+        "You hit your spend cap set by the owner of your workspace.",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
+fn reset_timestamp(error: &Value) -> Option<u64> {
+    for key in [
+        "resets_at",
+        "reset_at",
+        "retry_at",
+        "resetsAt",
+        "resetAt",
+        "retryAt",
+    ] {
+        if let Some(timestamp) = error.get(key).and_then(parse_timestamp_value) {
+            return Some(timestamp);
+        }
+    }
+    error
+        .get("rate_limit_info")
+        .and_then(|info| info.get("resetsAt"))
+        .and_then(parse_timestamp_value)
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return normalize_epoch(number);
+    }
+    let value = value.as_str()?.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(normalize_epoch)
+        .or_else(|| parse_rfc3339(value))
+}
+
+fn normalize_epoch(value: u64) -> Option<u64> {
+    if value == 0 {
+        None
+    } else if value < 1_000_000_000_000 {
+        value
+            .checked_mul(1_000)
+            .filter(|milliseconds| *milliseconds <= MAX_SAFE_EPOCH_MS)
+    } else {
+        (value <= MAX_SAFE_EPOCH_MS).then_some(value)
+    }
+}
+
+fn parse_timestamp_from_message(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    let start = lower.find("try again at ")? + "try again at ".len();
+    let value = message[start..]
+        .split_once('\n')
+        .map_or(&message[start..], |(line, _)| line)
+        .trim()
+        .trim_end_matches(|character: char| {
+            matches!(character, '.' | ',' | ')' | ']' | '"' | '\'')
+        });
+    parse_rfc3339(value).or_else(|| parse_codex_local_reset(value))
+}
+
+fn parse_rfc3339(value: &str) -> Option<u64> {
+    u64::try_from(DateTime::parse_from_rfc3339(value).ok()?.timestamp_millis())
+        .ok()
+        .filter(|milliseconds| *milliseconds <= MAX_SAFE_EPOCH_MS)
+}
+
+fn parse_codex_local_reset(value: &str) -> Option<u64> {
+    if let Some((date, time)) = value.split_once(", ") {
+        let (month, day) = date.split_once(' ')?;
+        let day = ["st", "nd", "rd", "th"]
+            .iter()
+            .find_map(|suffix| day.strip_suffix(suffix))
+            .unwrap_or(day);
+        let (year, time) = time.split_once(' ')?;
+        let date_time = format!("{month} {day} {year} {time}");
+        let parsed = NaiveDateTime::parse_from_str(&date_time, "%b %d %Y %I:%M %p")
+            .or_else(|_| NaiveDateTime::parse_from_str(&date_time, "%b %d %Y %I %p"))
+            .ok()?;
+        return local_epoch_millis(parsed);
+    }
+
+    let time = NaiveTime::parse_from_str(value, "%I:%M %p")
+        .or_else(|_| NaiveTime::parse_from_str(value, "%I %p"))
+        .ok()?;
+    local_epoch_millis(Local::now().date_naive().and_time(time))
+}
+
+fn local_epoch_millis(value: NaiveDateTime) -> Option<u64> {
+    match Local.from_local_datetime(&value) {
+        LocalResult::Single(value) => u64::try_from(value.timestamp_millis())
+            .ok()
+            .filter(|milliseconds| *milliseconds <= MAX_SAFE_EPOCH_MS),
+        LocalResult::Ambiguous(_, _) | LocalResult::None => None,
     }
 }
 

@@ -937,6 +937,8 @@ mod tests {
                     provider_session_id: None,
                     usage: None,
                     pricing_evidence: None,
+                    judgment: None,
+                    resume_at: None,
                 },
             )
             .expect("finish run");

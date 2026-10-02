@@ -191,6 +191,13 @@ pub enum FinishStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishJudgment {
+    Interrupted,
+    RateLimited,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +263,11 @@ pub struct FinishRunRequest {
     pub usage: Option<RunUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_evidence: Option<CodexPricingEvidenceV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judgment: Option<FinishJudgment>,
+    /// Provider reset instant as epoch milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

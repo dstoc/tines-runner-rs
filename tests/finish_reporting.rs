@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use chrono::{Local, NaiveDateTime, TimeZone};
 use tines_runner_rs::codex_stream::CodexStreamParser;
 use tines_runner_rs::finish::CodexRunReport;
 use tines_runner_rs::protocol::client::Client;
@@ -42,6 +43,8 @@ fn finish_server(count: usize) -> (String, JoinHandle<Vec<String>>) {
                 let request = read_request(&mut stream);
                 let body = if request.contains("/arun_completed/finish ") {
                     r#"{"id":"arun_completed","status":"completed"}"#
+                } else if request.contains("/arun_limited/finish ") {
+                    r#"{"id":"arun_limited","status":"failed"}"#
                 } else {
                     r#"{"id":"arun_failed","status":"failed"}"#
                 };
@@ -59,9 +62,12 @@ fn finish_server(count: usize) -> (String, JoinHandle<Vec<String>>) {
 }
 
 fn report_from_fixture(status: FinishStatus, error: Option<&str>) -> FinishRunRequest {
+    report_from_stream(include_str!("fixtures/codex-stream.jsonl"), status, error)
+}
+
+fn report_from_stream(stream: &str, status: FinishStatus, error: Option<&str>) -> FinishRunRequest {
     let mut parser = CodexStreamParser::default();
     let mut report = CodexRunReport::new(Some("gpt-5.1-codex"));
-    let stream = include_str!("fixtures/codex-stream.jsonl");
     for chunk in stream.as_bytes().chunks(19) {
         let chunk = std::str::from_utf8(chunk).expect("fixture chunk is valid UTF-8");
         for event in parser.push(chunk) {
@@ -81,7 +87,7 @@ fn request_body(request: &str) -> serde_json::Value {
 
 #[test]
 fn fake_server_receives_completed_and_failed_finish_payloads_with_observed_usage() {
-    let (server_url, server) = finish_server(2);
+    let (server_url, server) = finish_server(3);
     let client = Client::with_timeout(&server_url, Duration::from_secs(5))
         .expect("create runner protocol client");
 
@@ -99,13 +105,26 @@ fn fake_server_receives_completed_and_failed_finish_payloads_with_observed_usage
             &report_from_fixture(FinishStatus::Failed, Some("harness exited with code 1")),
         )
         .expect("report failed run");
+    client
+        .finish_run(
+            "arun_limited",
+            "runner-token",
+            &report_from_stream(
+                include_str!("fixtures/codex-usage-limit.jsonl"),
+                FinishStatus::Failed,
+                Some("Codex exited with code 1"),
+            ),
+        )
+        .expect("report rate-limited run");
 
     let requests = server.join().expect("join fake Tines server");
     let completed = request_body(&requests[0]);
     let failed = request_body(&requests[1]);
+    let limited = request_body(&requests[2]);
 
     assert!(requests[0].starts_with("POST /api/v1/runs/arun_completed/finish "));
     assert!(requests[1].starts_with("POST /api/v1/runs/arun_failed/finish "));
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_limited/finish "));
     for request in &requests {
         assert!(
             request
@@ -159,6 +178,8 @@ fn fake_server_receives_completed_and_failed_finish_payloads_with_observed_usage
 
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error"], "harness exited with code 1");
+    assert!(failed.get("judgment").is_none());
+    assert!(failed.get("resume_at").is_none());
     assert_eq!(
         failed["provider_session_id"],
         completed["provider_session_id"]
@@ -172,4 +193,101 @@ fn fake_server_receives_completed_and_failed_finish_payloads_with_observed_usage
         failed["pricing_evidence"]["measurement_status"],
         "incomplete_attempt"
     );
+
+    assert_eq!(limited["status"], "failed");
+    assert_eq!(limited["judgment"], "rate_limited");
+    assert_eq!(limited["resume_at"], 1_791_000_000_000_u64);
+    assert_eq!(limited["provider_session_id"], "thread-limited");
+    assert_eq!(
+        limited["usage"],
+        serde_json::json!({
+            "input_tokens": 95,
+            "output_tokens": 8,
+            "cache_read_tokens": 20,
+            "cache_write_tokens": 5
+        })
+    );
+}
+
+#[test]
+fn structured_usage_limit_keeps_observed_session_and_usage_and_reports_reset() {
+    let request = report_from_stream(
+        include_str!("fixtures/codex-usage-limit.jsonl"),
+        FinishStatus::Failed,
+        Some("Codex exited with code 1"),
+    );
+    let value = serde_json::to_value(request).expect("serialize finish request");
+
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["judgment"], "rate_limited");
+    assert_eq!(value["resume_at"], 1_791_000_000_000_u64);
+    assert_eq!(value["provider_session_id"], "thread-limited");
+    assert_eq!(
+        value["usage"],
+        serde_json::json!({
+            "input_tokens": 95,
+            "output_tokens": 8,
+            "cache_read_tokens": 20,
+            "cache_write_tokens": 5
+        })
+    );
+}
+
+#[test]
+fn recognized_codex_rate_limit_message_without_code_gets_no_guessed_reset() {
+    let request = report_from_stream(
+        include_str!("fixtures/codex-rate-limit-message.jsonl"),
+        FinishStatus::Failed,
+        None,
+    );
+    let value = serde_json::to_value(request).expect("serialize finish request");
+
+    assert_eq!(value["judgment"], "rate_limited");
+    assert!(value.get("resume_at").is_none());
+}
+
+#[test]
+fn structured_rate_limit_code_parses_reset_with_offset() {
+    let request = report_from_stream(
+        include_str!("fixtures/codex-rate-limit.jsonl"),
+        FinishStatus::Failed,
+        Some("Codex exited with code 1"),
+    );
+    let value = serde_json::to_value(request).expect("serialize finish request");
+
+    assert_eq!(value["judgment"], "rate_limited");
+    assert_eq!(value["resume_at"], 1_791_075_723_000_u64);
+}
+
+#[test]
+fn recognized_usage_limit_message_parses_codex_local_reset_time() {
+    let request = report_from_stream(
+        include_str!("fixtures/codex-local-reset-message.jsonl"),
+        FinishStatus::Failed,
+        None,
+    );
+    let value = serde_json::to_value(request).expect("serialize finish request");
+    let reset = NaiveDateTime::parse_from_str("Oct 4 2026 11:02 AM", "%b %d %Y %I:%M %p")
+        .expect("fixture reset time");
+    let expected = Local
+        .from_local_datetime(&reset)
+        .single()
+        .expect("unambiguous fixture reset time")
+        .timestamp_millis() as u64;
+
+    assert_eq!(value["judgment"], "rate_limited");
+    assert_eq!(value["resume_at"], expected);
+}
+
+#[test]
+fn authentication_and_model_errors_do_not_become_rate_limits() {
+    let request = report_from_stream(
+        include_str!("fixtures/codex-provider-errors.jsonl"),
+        FinishStatus::Failed,
+        Some("Codex exited with code 1"),
+    );
+    let value = serde_json::to_value(request).expect("serialize finish request");
+
+    assert!(value.get("judgment").is_none());
+    assert!(value.get("resume_at").is_none());
 }
