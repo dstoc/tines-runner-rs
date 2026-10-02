@@ -1,7 +1,7 @@
 //! Codex effort capability discovery and assignment verification.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -268,27 +268,46 @@ enum AppServerLine {
 }
 
 fn read_lines_bounded(mut reader: impl Read, sender: mpsc::Sender<AppServerLine>) {
-    let mut reader = BufReader::new(&mut reader);
     let mut line = Vec::new();
     let mut total = 0usize;
+    let mut chunk = [0; 8192];
     loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        let remaining = MAX_STDOUT.saturating_sub(total);
+        let read_limit = chunk.len().min(remaining.saturating_add(1));
+        match reader.read(&mut chunk[..read_limit]) {
             Ok(0) => {
+                if !line.is_empty() {
+                    let content = String::from_utf8_lossy(&line).trim().to_owned();
+                    if sender.send(AppServerLine::Line(content)).is_err() {
+                        return;
+                    }
+                }
                 let _ = sender.send(AppServerLine::Eof);
                 return;
             }
             Ok(count) => {
-                total = total.saturating_add(count);
-                if total > MAX_STDOUT {
+                if total.saturating_add(count) > MAX_STDOUT {
                     let _ = sender.send(AppServerLine::Error(
                         "Codex model discovery exceeded 1 MiB".to_owned(),
                     ));
                     return;
                 }
-                let content = String::from_utf8_lossy(&line).trim().to_owned();
-                if sender.send(AppServerLine::Line(content)).is_err() {
-                    return;
+                total += count;
+
+                let mut start = 0;
+                while let Some(offset) = chunk[start..count].iter().position(|byte| *byte == b'\n')
+                {
+                    let end = start + offset + 1;
+                    line.extend_from_slice(&chunk[start..end]);
+                    let content = String::from_utf8_lossy(&line).trim().to_owned();
+                    if sender.send(AppServerLine::Line(content)).is_err() {
+                        return;
+                    }
+                    line.clear();
+                    start = end;
+                }
+                if start < count {
+                    line.extend_from_slice(&chunk[start..count]);
                 }
             }
             Err(error) => {
@@ -491,10 +510,13 @@ fn write_message(stdin: &mut impl Write, message: &Value) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        EffortCapabilities, EffortModelCapability, assignment_effort_rejection, catalog_digest,
-        success_report, verify_effort,
+        AppServerLine, EffortCapabilities, EffortModelCapability, MAX_STDOUT,
+        assignment_effort_rejection, catalog_digest, read_lines_bounded, success_report,
+        verify_effort,
     };
     use crate::protocol::{RunReference, RunnerAssignment, RunnerAssignmentEffort};
+    use std::io::{self, Read};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     fn capabilities() -> EffortCapabilities {
@@ -665,6 +687,39 @@ mod tests {
         assert!(report.refresh_due(None, now));
         assert!(!report.refresh_due(Some(now), now + Duration::from_secs(599)));
         assert!(report.refresh_due(Some(now), now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn oversized_unterminated_app_server_line_stops_at_stdout_bound() {
+        struct RepeatingReader {
+            remaining: usize,
+            bytes_read: usize,
+        }
+
+        impl Read for RepeatingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = buffer.len().min(self.remaining);
+                buffer[..count].fill(b'x');
+                self.remaining -= count;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let mut reader = RepeatingReader {
+            remaining: 16 * MAX_STDOUT,
+            bytes_read: 0,
+        };
+        let (sender, receiver) = mpsc::channel();
+        read_lines_bounded(&mut reader, sender);
+
+        assert_eq!(reader.bytes_read, MAX_STDOUT + 1);
+        assert!(matches!(
+            receiver.recv(),
+            Ok(AppServerLine::Error(message))
+                if message == "Codex model discovery exceeded 1 MiB"
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(unix)]
