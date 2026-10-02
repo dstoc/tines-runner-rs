@@ -16,7 +16,14 @@
             "title": "Define protocol types"
           },
           "state_at_start_name": "Implement",
+          "model": "gpt-5.1-codex",
           "future_run_field": "ignored"
+        },
+        "effort": {
+          "version": 1,
+          "value": "high",
+          "source": { "kind": "runner_tier" },
+          "capability_digest": "fixture-capability-digest"
         },
         "prompt": "Implement the assigned issue.",
         "bundle": {
