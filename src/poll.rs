@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::assignment::PreparedAssignment;
 use crate::config::Config;
+use crate::effort::EffortCapabilities;
 use crate::protocol::client::ErrorCategory;
 use crate::protocol::{
     RunnerCancellationAck, RunnerConcurrencyApplied, RunnerConcurrencyReport, RunnerPollRequest,
@@ -33,6 +35,8 @@ pub struct PollState {
     effective_concurrency: u32,
     applied_concurrency: Option<RunnerConcurrencyApplied>,
     draining: bool,
+    effort_capabilities: Option<EffortCapabilities>,
+    effort_capabilities_refreshed_at: Option<Instant>,
 }
 
 impl PollState {
@@ -49,6 +53,8 @@ impl PollState {
             effective_concurrency: config.max_concurrent as u32,
             applied_concurrency: None,
             draining: false,
+            effort_capabilities: None,
+            effort_capabilities_refreshed_at: None,
         }
     }
 
@@ -88,6 +94,25 @@ impl PollState {
     /// Set the flag used by later graceful-shutdown integration.
     pub fn set_draining(&mut self, draining: bool) {
         self.draining = draining;
+    }
+
+    /// Refresh the local Codex capability report when it expires, or before an
+    /// effort-bearing assignment when `force` is true.
+    pub fn refresh_effort_capabilities(&mut self, force: bool) -> &EffortCapabilities {
+        let now = Instant::now();
+        let expired = self
+            .effort_capabilities
+            .as_ref()
+            .is_none_or(|capabilities| {
+                capabilities.refresh_due(self.effort_capabilities_refreshed_at, now)
+            });
+        if force || expired {
+            self.effort_capabilities = Some(EffortCapabilities::discover(crate::VERSION));
+            self.effort_capabilities_refreshed_at = Some(now);
+        }
+        self.effort_capabilities
+            .as_ref()
+            .expect("effort capabilities are discovered before use")
     }
 
     /// The local concurrency cap after applying the latest server instruction.
@@ -155,6 +180,7 @@ impl PollState {
             declined_assignments,
             draining: Some(self.draining),
             env_delivery: Some(1),
+            effort_capabilities: self.effort_capabilities.clone(),
         }
     }
 
@@ -234,6 +260,7 @@ impl PollLoop {
     {
         let mut consecutive_failures = 0u32;
         while should_continue() {
+            self.state.refresh_effort_capabilities(false);
             let request = self.state.request();
             match self.connection.poll(&request) {
                 Ok(response) => {
@@ -329,6 +356,7 @@ mod tests {
     use super::{PollLoop, PollState, retry_delay};
     use crate::config::Config;
     use crate::credentials::{CredentialStore, RunnerCredentials};
+    use crate::effort::{EffortCapabilities, EffortModelCapability};
     use crate::runner::RunnerConnection;
     use serde_json::Value;
     use std::cell::Cell;
@@ -338,7 +366,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -465,6 +493,51 @@ mod tests {
         assert_eq!(requests[0]["draining"], false);
         assert_eq!(requests[0]["env_delivery"], 1);
         assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn fake_server_receives_the_cached_codex_effort_catalog_on_polls() {
+        let directory = TestDirectory::new();
+        let (url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
+        let mut poller = poller(&directory, &url, false);
+        poller.state_mut().effort_capabilities = Some(EffortCapabilities {
+            version: 1,
+            daemon_version: "0.1.0".to_owned(),
+            harness: "codex".to_owned(),
+            harness_version: "codex-cli 0.153.4".to_owned(),
+            catalog_digest: "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a"
+                .to_owned(),
+            models: vec![EffortModelCapability {
+                model: "gpt-5.6".to_owned(),
+                efforts: vec!["low".to_owned(), "high".to_owned()],
+            }],
+            accepts_asserted_effort: Some(true),
+            discovery_error: None,
+        });
+        poller.state_mut().effort_capabilities_refreshed_at = Some(Instant::now());
+        let polls = Cell::new(0);
+
+        poller
+            .run_with(
+                |_, _| polls.set(polls.get() + 1),
+                || polls.get() == 0,
+                |_| panic!("one poll should finish without sleeping"),
+            )
+            .expect("poll with effort capability report");
+
+        let requests = server.join().expect("fake server request");
+        assert_eq!(
+            requests[0]["effort_capabilities"],
+            serde_json::json!({
+                "version": 1,
+                "daemon_version": "0.1.0",
+                "harness": "codex",
+                "harness_version": "codex-cli 0.153.4",
+                "catalog_digest": "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a",
+                "models": [{ "model": "gpt-5.6", "efforts": ["low", "high"] }],
+                "accepts_asserted_effort": true
+            })
+        );
     }
 
     #[test]

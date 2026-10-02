@@ -764,6 +764,7 @@ mod tests {
                     declined_assignments: None,
                     draining: None,
                     env_delivery: Some(1),
+                    effort_capabilities: None,
                 },
             )
             .expect("poll runner");

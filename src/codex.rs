@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::assignment::PreparedAssignment;
+use crate::effort::{EffortCapabilities, assignment_effort_rejection};
 use crate::workspace::LaunchEnvironment;
 
 /// The native-equivalent Codex executable and argv.
@@ -76,22 +77,15 @@ pub struct CodexLaunch {
 
 impl CodexLaunch {
     /// Prepare a direct Codex or wrapper command for a resolved assignment.
-    pub fn for_assignment(assignment: &PreparedAssignment) -> Result<Self, CodexLaunchError> {
-        let payload = assignment.assignment();
-        let effort = match payload.effort.as_ref() {
-            Some(effort) if effort.version != 1 => {
-                return Err(CodexLaunchError::UnsupportedEffortVersion(effort.version));
-            }
-            Some(effort) => Some(effort.value.as_str()),
-            None => None,
-        };
-        let invocation = build_invocation(
-            &payload.prompt,
-            payload.run.model.as_deref(),
-            effort,
+    pub fn for_assignment(
+        assignment: &PreparedAssignment,
+        capabilities: &EffortCapabilities,
+    ) -> Result<Self, CodexLaunchError> {
+        let invocation = build_assignment_invocation(
+            assignment.assignment(),
+            capabilities,
             &assignment.resolution().config.wrapper,
-        )
-        .map_err(CodexLaunchError::SerializeEffort)?;
+        )?;
 
         Ok(Self::new(
             invocation,
@@ -167,6 +161,30 @@ impl CodexLaunch {
     }
 }
 
+fn build_assignment_invocation(
+    assignment: &crate::protocol::RunnerAssignment,
+    capabilities: &EffortCapabilities,
+    wrapper: &[String],
+) -> Result<CodexInvocation, CodexLaunchError> {
+    if let Some(reason) = assignment_effort_rejection(assignment, capabilities) {
+        return Err(CodexLaunchError::UnsupportedEffort(reason));
+    }
+    let effort = match assignment.effort.as_ref() {
+        Some(effort) if effort.version != 1 => {
+            return Err(CodexLaunchError::UnsupportedEffortVersion(effort.version));
+        }
+        Some(effort) => Some(effort.value.as_str()),
+        None => None,
+    };
+    build_invocation(
+        &assignment.prompt,
+        assignment.run.model.as_deref(),
+        effort,
+        wrapper,
+    )
+    .map_err(CodexLaunchError::SerializeEffort)
+}
+
 impl fmt::Debug for CodexLaunch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("CodexLaunch")
@@ -185,6 +203,7 @@ impl fmt::Display for CodexLaunch {
 #[derive(Debug)]
 pub enum CodexLaunchError {
     UnsupportedEffortVersion(u8),
+    UnsupportedEffort(String),
     SerializeEffort(serde_json::Error),
 }
 
@@ -194,6 +213,7 @@ impl fmt::Display for CodexLaunchError {
             Self::UnsupportedEffortVersion(version) => {
                 write!(f, "unsupported assignment effort version {version}")
             }
+            Self::UnsupportedEffort(reason) => f.write_str(reason),
             Self::SerializeEffort(error) => write!(f, "could not encode Codex effort: {error}"),
         }
     }
@@ -203,7 +223,7 @@ impl Error for CodexLaunchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SerializeEffort(error) => Some(error),
-            Self::UnsupportedEffortVersion(_) => None,
+            Self::UnsupportedEffortVersion(_) | Self::UnsupportedEffort(_) => None,
         }
     }
 }
@@ -216,7 +236,8 @@ impl From<serde_json::Error> for CodexLaunchError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexLaunch, build_invocation};
+    use super::{CodexLaunch, build_assignment_invocation, build_invocation};
+    use crate::effort::{EffortCapabilities, EffortModelCapability};
     use crate::workspace::MaterializedWorkspace;
     use serde_json::json;
     use url::Url;
@@ -300,6 +321,79 @@ mod tests {
                 "model_reasoning_effort=\"high\"",
                 "prompt"
             ]
+        );
+    }
+
+    #[test]
+    fn unsupported_effort_cannot_produce_a_codex_launch_invocation() {
+        let assignment: crate::protocol::RunnerAssignment = serde_json::from_value(json!({
+            "run": { "id": "arun_launch", "issue_id": "iss_launch", "model": "gpt-5.6" },
+            "effort": { "version": 1, "value": "ultra", "capability_digest": "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a" },
+            "prompt": "work",
+            "bundle": {},
+            "run_key": "run-key",
+            "timeout_minutes": 30
+        }))
+        .expect("valid effort assignment");
+        let capabilities = EffortCapabilities {
+            version: 1,
+            daemon_version: "0.1.0".to_owned(),
+            harness: "codex".to_owned(),
+            harness_version: "codex-cli 0.153.4".to_owned(),
+            catalog_digest: "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a"
+                .to_owned(),
+            models: vec![EffortModelCapability {
+                model: "gpt-5.6".to_owned(),
+                efforts: vec!["low".to_owned(), "high".to_owned()],
+            }],
+            accepts_asserted_effort: None,
+            discovery_error: None,
+        };
+
+        let error = build_assignment_invocation(&assignment, &capabilities, &[])
+            .expect_err("unsupported effort must not create an invocation");
+
+        assert!(error.to_string().contains("does not support effort ultra"));
+    }
+
+    #[test]
+    fn verified_assignment_effort_is_forwarded_without_substitution() {
+        let assignment: crate::protocol::RunnerAssignment = serde_json::from_value(json!({
+            "run": { "id": "arun_launch", "issue_id": "iss_launch", "model": "gpt-5.6" },
+            "effort": { "version": 1, "value": "high", "capability_digest": "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a" },
+            "prompt": "work",
+            "bundle": {},
+            "run_key": "run-key",
+            "timeout_minutes": 30
+        }))
+        .expect("valid effort assignment");
+        let capabilities = EffortCapabilities {
+            version: 1,
+            daemon_version: "0.1.0".to_owned(),
+            harness: "codex".to_owned(),
+            harness_version: "codex-cli 0.153.4".to_owned(),
+            catalog_digest: "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a"
+                .to_owned(),
+            models: vec![EffortModelCapability {
+                model: "gpt-5.6".to_owned(),
+                efforts: vec!["low".to_owned(), "high".to_owned()],
+            }],
+            accepts_asserted_effort: None,
+            discovery_error: None,
+        };
+
+        let invocation = build_assignment_invocation(&assignment, &capabilities, &[])
+            .expect("supported effort should create an invocation");
+
+        assert!(
+            invocation
+                .args()
+                .contains(&"model_reasoning_effort=\"high\"".to_owned())
+        );
+        assert!(
+            !invocation
+                .args()
+                .contains(&"model_reasoning_effort=\"low\"".to_owned())
         );
     }
 

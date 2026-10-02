@@ -5,6 +5,8 @@ pub mod client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::effort::EffortCapabilities;
+
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerHarness {
@@ -59,6 +61,9 @@ pub struct RunnerPollRequest {
     /// Capability: accept resolved assignment environment metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_delivery: Option<u8>,
+    /// Exact-model Codex effort catalog discovered by this daemon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_capabilities: Option<EffortCapabilities>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +134,12 @@ pub struct RunnerAssignment {
 pub struct RunnerAssignmentEffort {
     pub version: u8,
     pub value: String,
+    /// Digest of the capability catalog used when Tines delivered this effort.
+    #[serde(default)]
+    pub capability_digest: Option<String>,
+    /// Present when the exact model was not listed and support was asserted.
+    #[serde(default)]
+    pub verification: Option<String>,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]

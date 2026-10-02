@@ -5,6 +5,7 @@ pub mod codex;
 pub mod codex_stream;
 pub mod config;
 pub mod credentials;
+pub mod effort;
 pub mod logging;
 pub mod poll;
 pub mod process;
