@@ -112,6 +112,9 @@ pub struct RunnerConcurrencyInstruction {
 #[derive(Clone, Deserialize, PartialEq)]
 pub struct RunnerAssignment {
     pub run: RunReference,
+    /// Effort accepted for this assignment after runner capability negotiation.
+    #[serde(default)]
+    pub effort: Option<RunnerAssignmentEffort>,
     pub prompt: String,
     pub bundle: Value,
     pub run_key: String,
@@ -120,6 +123,12 @@ pub struct RunnerAssignment {
     #[serde(default)]
     pub env: Vec<RunnerAssignmentEnv>,
     pub timeout_minutes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RunnerAssignmentEffort {
+    pub version: u8,
+    pub value: String,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -134,6 +143,9 @@ pub struct RunnerAssignmentEnv {
 pub struct RunReference {
     pub id: String,
     pub issue_id: String,
+    /// Resolved launch model; null when the harness uses its provider default.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub issue_ref: Option<IssueReference>,
     #[serde(default)]
@@ -247,6 +259,15 @@ mod tests {
         assert_eq!(response.assignments.len(), 1);
         assert_eq!(response.assignments[0].run.id, "arun_456");
         assert_eq!(response.assignments[0].run.issue_id, "iss_789");
+        assert_eq!(
+            response.assignments[0].run.model.as_deref(),
+            Some("gpt-5.1-codex")
+        );
+        assert_eq!(response.assignments[0].effort.as_ref().unwrap().version, 1);
+        assert_eq!(
+            response.assignments[0].effort.as_ref().unwrap().value,
+            "high"
+        );
         assert_eq!(
             response.assignments[0]
                 .run
