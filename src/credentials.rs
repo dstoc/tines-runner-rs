@@ -365,36 +365,13 @@ impl Error for CredentialError {
 }
 
 fn default_credentials_path() -> Result<PathBuf, CredentialError> {
-    Ok(configuration_directory()?.join("tines-runner-rs/credentials.toml"))
-}
+    let config_path = crate::config::Config::default_path()
+        .map_err(|_| CredentialError::ConfigurationDirectoryUnavailable)?;
+    let config_dir = config_path
+        .parent()
+        .ok_or(CredentialError::ConfigurationDirectoryUnavailable)?;
 
-fn configuration_directory() -> Result<PathBuf, CredentialError> {
-    #[cfg(unix)]
-    {
-        if let Some(path) = env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
-            return Ok(PathBuf::from(path));
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        if let Some(path) = env::var_os("APPDATA").filter(|path| !path.is_empty()) {
-            return Ok(PathBuf::from(path));
-        }
-        if let Some(home) = env::var_os("USERPROFILE").filter(|path| !path.is_empty()) {
-            return Ok(PathBuf::from(home).join("AppData/Roaming"));
-        }
-    }
-
-    #[cfg(not(windows))]
-    let home_name = "HOME";
-    #[cfg(windows)]
-    let home_name = "USERPROFILE";
-
-    env::var_os(home_name)
-        .filter(|path| !path.is_empty())
-        .map(|home| PathBuf::from(home).join(".config"))
-        .ok_or(CredentialError::ConfigurationDirectoryUnavailable)
+    Ok(config_dir.join("credentials.toml"))
 }
 
 #[cfg(unix)]
@@ -470,6 +447,17 @@ mod tests {
         assert_eq!(actual.runner_id(), "rnr_test");
         assert_eq!(actual.runner_token(), "runner-token-test-secret");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn default_path_is_under_the_runner_configuration_directory() {
+        let config_path = crate::config::Config::default_path().unwrap();
+        let config_dir = config_path.parent().unwrap();
+
+        assert_eq!(
+            CredentialStore::default_path().unwrap(),
+            config_dir.join("credentials.toml")
+        );
     }
 
     #[cfg(unix)]
