@@ -75,6 +75,24 @@ pub fn prune_retained(parent: &Path, retention: &WorkspaceRetention) -> Result<(
     prune_retained_at(parent, retention, unix_now())
 }
 
+/// Prune retained workspaces below each configured workspace parent.
+pub fn prune_retained_roots(
+    parents: impl IntoIterator<Item = impl AsRef<Path>>,
+    retention: &WorkspaceRetention,
+) -> Result<(), RetentionError> {
+    let now = unix_now();
+    let mut visited = Vec::new();
+    for parent in parents {
+        let parent = parent.as_ref();
+        if visited.iter().any(|visited| visited == parent) {
+            continue;
+        }
+        visited.push(parent.to_path_buf());
+        prune_retained_at(parent, retention, now)?;
+    }
+    Ok(())
+}
+
 fn prune_retained_at(
     parent: &Path,
     retention: &WorkspaceRetention,
@@ -387,6 +405,43 @@ mod tests {
         assert!(unmarked.exists());
         assert!(invalid.exists());
         assert!(!expired.exists());
+    }
+
+    #[test]
+    fn startup_pruning_covers_override_roots_and_keeps_unmarked_directories() {
+        let directory = TestDirectory::new();
+        let default_root = directory.0.join("default");
+        let override_root = directory.0.join("override");
+        fs::create_dir_all(&default_root).expect("create default workspace root");
+        fs::create_dir_all(&override_root).expect("create override workspace root");
+        let expired = override_root.join("expired");
+        fs::create_dir(&expired).expect("create expired workspace");
+        write_marker(
+            &expired,
+            &RetainedWorkspaceMarker {
+                run_id: "run_old".to_owned(),
+                issue_ref: Some("Tines/19".to_owned()),
+                terminal_status: FinishStatus::Failed,
+                error: Some("old failure".to_owned()),
+                retained_at: 1,
+            },
+        )
+        .expect("write expired marker");
+        let unmarked = override_root.join("unmarked");
+        fs::create_dir(&unmarked).expect("create unmarked workspace");
+
+        prune_retained_roots(
+            [&default_root, &override_root, &override_root],
+            &WorkspaceRetention {
+                mode: RetentionMode::Always,
+                max_age: Duration::from_secs(10),
+                max_count: 20,
+            },
+        )
+        .expect("prune all configured workspace roots");
+
+        assert!(!expired.exists());
+        assert!(unmarked.exists());
     }
 
     #[test]

@@ -34,9 +34,10 @@ keep_workspaces_max = 20
 The runner writes a `.tines-runner-retained.json` marker after it reports the
 terminal status. The marker records the run ID, issue reference when known,
 terminal status, failure reason when applicable, and retention time. The age
-and count limits prune on startup and after each settled run. Pruning only
-deletes workspace directories with a valid marker. The runner leaves unmarked
-directories untouched during pruning.
+and count limits prune on startup and after each settled run. Startup pruning
+checks the default workspace parent and every workspace parent set by an
+override. Pruning only deletes workspace directories with a valid marker. The
+runner leaves unmarked directories untouched during pruning.
 
 ## Development checks
 

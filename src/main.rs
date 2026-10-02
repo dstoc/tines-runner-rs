@@ -56,6 +56,10 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    tines_runner_rs::retention::prune_retained_roots(
+        config.workspace_parents(),
+        &config.workspace_retention,
+    )?;
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
     let execution_connection = connection.clone();
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
