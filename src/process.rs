@@ -127,6 +127,25 @@ pub enum ProcessStream {
     Stderr,
 }
 
+impl ProcessOutput {
+    /// Format a closing run-log line. The line contains only process status
+    /// and elapsed time, so it cannot expose command or environment secrets.
+    pub fn format_exit_diagnostic(&self, duration: Duration) -> String {
+        let exit = match self.exit {
+            ProcessExit::Code(code) => format!("code={code}"),
+            ProcessExit::Signal(signal) => format!("signal={signal}"),
+            ProcessExit::Unknown => "code=?".to_owned(),
+        };
+        let seconds = duration.as_secs();
+        let timeout = if self.timed_out { " (timed out)" } else { "" };
+        format!(
+            "# tines runner: exit {exit}{timeout} after {}m{}s\n",
+            seconds / 60,
+            seconds % 60
+        )
+    }
+}
+
 /// A portable description of how the direct child ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessExit {
@@ -875,7 +894,8 @@ fn windows_generate_console_ctrl_break(process_group_id: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{ProcessExit, SupervisedProcess};
+    use super::SupervisedProcess;
+    use super::{ProcessExit, ProcessOutput};
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -886,6 +906,20 @@ mod tests {
     use std::thread;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exit_diagnostic_reports_status_timeout_and_duration() {
+        let output = ProcessOutput {
+            exit: ProcessExit::Signal(9),
+            timed_out: true,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            output.format_exit_diagnostic(Duration::from_secs(61)),
+            "# tines runner: exit signal=9 (timed out) after 1m1s\n"
+        );
+    }
 
     #[cfg(unix)]
     struct TestDirectory(PathBuf);

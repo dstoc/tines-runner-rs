@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::assignment::PreparedAssignment;
 use crate::config::Config;
 use crate::effort::EffortCapabilities;
-use crate::protocol::client::ErrorCategory;
+use crate::protocol::client::{ErrorCategory, RunLogBuffer};
 use crate::protocol::{
     RunnerCancellationAck, RunnerConcurrencyApplied, RunnerConcurrencyReport, RunnerPollRequest,
     RunnerPollResponse,
@@ -29,6 +29,7 @@ pub struct PollState {
     cancellation_acks: BTreeMap<String, String>,
     declined_assignments: BTreeSet<String>,
     pending_assignments: BTreeMap<String, PreparedAssignment>,
+    active_log_streams: BTreeMap<String, RunLogBuffer>,
     assignment_failures: BTreeMap<String, String>,
     allow_remote_concurrency: bool,
     local_ceiling: u32,
@@ -58,6 +59,7 @@ impl PollState {
             cancellation_acks: BTreeMap::new(),
             declined_assignments: BTreeSet::new(),
             pending_assignments: BTreeMap::new(),
+            active_log_streams: BTreeMap::new(),
             assignment_failures: BTreeMap::new(),
             allow_remote_concurrency: config.allow_remote_concurrency,
             local_ceiling: config.max_concurrent as u32,
@@ -98,9 +100,19 @@ impl PollState {
         self.owned_runs.len()
     }
 
+    /// Mark a run active and keep its shared log stream available for cancel handling.
+    pub fn own_run_with_logs(&mut self, run_id: impl Into<String>, logs: RunLogBuffer) {
+        let run_id = run_id.into();
+        self.owned_runs.insert(run_id.clone());
+        self.active_log_streams.insert(run_id, logs);
+    }
+
     /// Remove a run after its child process and local resources are cleaned up.
     pub fn release_run(&mut self, run_id: &str) {
         self.owned_runs.remove(run_id);
+        if let Some(logs) = self.active_log_streams.remove(run_id) {
+            logs.stop_sending();
+        }
     }
 
     /// Queue a cancellation acknowledgement after the executor has completed
@@ -230,13 +242,21 @@ impl PollState {
         }
         for released in &response.released_assignments {
             self.declined_assignments.remove(released);
-            self.pending_assignments.remove(released);
+            self.release_run(released);
+            if let Some(assignment) = self.pending_assignments.remove(released) {
+                assignment.stop_log_delivery();
+            }
             self.assignment_failures.remove(released);
-            self.owned_runs.remove(released);
         }
         for canceled in &response.cancels {
             self.pending_assignments.remove(canceled);
             self.assignment_failures.remove(canceled);
+            if let Some(logs) = self.active_log_streams.get(canceled) {
+                logs.stop_sending();
+            }
+            if let Some(assignment) = self.pending_assignments.remove(canceled) {
+                assignment.stop_log_delivery();
+            }
         }
         if let Some(control) = &response.concurrency_control {
             if control.available {
@@ -393,6 +413,8 @@ mod tests {
     use crate::config::Config;
     use crate::credentials::{CredentialStore, RunnerCredentials};
     use crate::effort::{EffortCapabilities, EffortModelCapability};
+    use crate::protocol::RunnerPollResponse;
+    use crate::protocol::client::RunLogBuffer;
     use crate::runner::RunnerConnection;
     use serde_json::Value;
     use std::cell::Cell;
@@ -548,6 +570,33 @@ mod tests {
         assert_eq!(requests[0]["draining"], false);
         assert_eq!(requests[0]["env_delivery"], 1);
         assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn settled_cancellation_stops_the_active_run_log_stream() {
+        let directory = TestDirectory::new();
+        let mut state = PollState::new(&config(
+            "http://127.0.0.1:1",
+            &directory.credentials_path(),
+            true,
+        ));
+        let logs = RunLogBuffer::new();
+        state.own_run_with_logs("arun_live", logs.clone());
+
+        state
+            .observe(&RunnerPollResponse {
+                assignments: Vec::new(),
+                cancels: vec!["arun_live".to_owned()],
+                cancel_requests: Vec::new(),
+                cancellation_acks: Vec::new(),
+                released_assignments: Vec::new(),
+                concurrency_control: None,
+            })
+            .expect("valid cancellation response");
+
+        assert!(logs.is_stopped());
+        state.release_run("arun_live");
+        assert!(!state.owned_runs.contains("arun_live"));
     }
 
     #[test]

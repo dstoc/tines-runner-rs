@@ -9,7 +9,7 @@ use crate::config::{Config, RunnerType};
 use crate::credentials::{
     BootstrapKey, BootstrapKeyError, CredentialError, CredentialStore, RunnerCredentials,
 };
-use crate::protocol::client::{Client, ClientError, ErrorCategory};
+use crate::protocol::client::{Client, ClientError, ErrorCategory, RunLogBuffer};
 use crate::protocol::{
     FinishRunRequest, FinishRunResponse, FinishStatus, RegisterRunnerRequest, RunnerHarness,
     RunnerPollRequest, RunnerPollResponse,
@@ -144,6 +144,30 @@ impl RunnerConnection {
             .map_err(|error| self.protocol_error(error))
     }
 
+    /// Flush and close run logs before reporting an ordinary terminal status.
+    /// Callers handling supervisor cancellation must stop log delivery and
+    /// omit the finish request instead.
+    pub fn finish_run_with_logs(
+        &self,
+        run_id: &str,
+        logs: &RunLogBuffer,
+        status: FinishStatus,
+        error: Option<&str>,
+    ) -> Result<FinishRunResponse, RunnerError> {
+        logs.flush_before_finish(&self.client, run_id, self.credentials.runner_token())
+            .map_err(|error| self.protocol_error(error))?;
+        self.client
+            .finish_run(
+                run_id,
+                self.credentials.runner_token(),
+                &FinishRunRequest {
+                    status,
+                    error: error.map(str::to_owned),
+                },
+            )
+            .map_err(|error| self.protocol_error(error))
+    }
+
     fn protocol_error(&self, error: ClientError) -> RunnerError {
         if error.category() == ErrorCategory::Authentication {
             RunnerError::RejectedRunnerToken {
@@ -253,8 +277,8 @@ mod tests {
     use super::{RunnerConnection, RunnerError};
     use crate::config::Config;
     use crate::credentials::{BootstrapKey, CredentialStore, RunnerCredentials};
-    use crate::protocol::RunnerPollRequest;
-    use crate::protocol::client::Client;
+    use crate::protocol::client::{Client, RunLogBuffer};
+    use crate::protocol::{FinishStatus, RunnerPollRequest};
     use serde_json::Value;
     use std::fs;
     use std::io::{Read, Write};
@@ -431,6 +455,78 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer saved-runner-token")
         );
+    }
+
+    #[test]
+    fn ordinary_finish_flushes_the_last_log_batch_before_reporting_status() {
+        let directory = TestDirectory::new();
+        let store = CredentialStore::at(directory.credentials_path());
+        store
+            .save(&RunnerCredentials::new("rnr_saved", "saved-runner-token"))
+            .expect("write saved credentials");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Tines server");
+        let address = listener.local_addr().expect("read mock address");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (response_body, reason) in [
+                (
+                    r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
+                    "OK",
+                ),
+                (r#"{"id":"arun_1","status":"completed"}"#, "OK"),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept Tines request");
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = stream.read(&mut chunk).expect("read Tines request");
+                    assert_ne!(count, 0, "client closed before sending the request");
+                    request.extend_from_slice(&chunk[..count]);
+                    if request_complete(&request) {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).expect("request should be UTF-8"));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                )
+                .expect("write Tines response");
+            }
+            requests
+        });
+
+        let url = format!("http://{address}");
+        let config = config(&url, store.path());
+        let connection = RunnerConnection::connect_with_key_provider(
+            &config,
+            Client::new(&url).expect("Tines client"),
+            || panic!("saved credentials do not need a bootstrap key"),
+        )
+        .expect("load saved runner credentials");
+        let logs = RunLogBuffer::new();
+        assert!(
+            logs.append_harness_output(
+                &Client::new(&url).expect("log client"),
+                "arun_1",
+                "saved-runner-token",
+                "final output\n",
+            )
+            .expect("buffer final harness output")
+            .is_none()
+        );
+
+        connection
+            .finish_run_with_logs("arun_1", &logs, FinishStatus::Completed, None)
+            .expect("flush logs and finish run");
+        let requests = server.join().expect("join mock Tines server");
+        assert!(requests[0].contains("POST /api/v1/runs/arun_1/logs HTTP/1.1"));
+        assert_eq!(request_json(&requests[0])["chunk"], "final output\n");
+        assert_eq!(request_json(&requests[0])["seq"], 1);
+        assert!(requests[1].contains("POST /api/v1/runs/arun_1/finish HTTP/1.1"));
+        assert_eq!(request_json(&requests[1])["status"], "completed");
+        assert!(logs.is_stopped());
     }
 
     #[test]
