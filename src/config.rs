@@ -137,16 +137,24 @@ impl Config {
     /// The returned value owns its fields and does not borrow from or retain
     /// the parsed configuration.
     pub fn resolve(&self, context: MatchContext<'_>) -> ResolvedRunConfig {
+        self.resolve_with_matches(context).config
+    }
+
+    /// Resolve all matching overrides and return their zero-based declaration
+    /// indexes for diagnostics.
+    pub fn resolve_with_matches(&self, context: MatchContext<'_>) -> ConfigResolution {
         let mut resolved = ResolvedRunConfig {
             runner_type: self.runner_type,
             workspace_parent: self.workspace_parent.clone(),
             wrapper: self.wrapper.clone(),
         };
+        let mut matching_overrides = Vec::new();
 
-        for rule in &self.overrides {
+        for (index, rule) in self.overrides.iter().enumerate() {
             if !rule.matches(context) {
                 continue;
             }
+            matching_overrides.push(index);
             if let Some(runner_type) = rule.runner_type {
                 resolved.runner_type = runner_type;
             }
@@ -158,7 +166,10 @@ impl Config {
             }
         }
 
-        resolved
+        ConfigResolution {
+            config: resolved,
+            matching_overrides,
+        }
     }
 
     fn from_toml_str_with_defaults(
@@ -264,6 +275,20 @@ impl Config {
             },
             overrides,
         })
+    }
+}
+
+/// Effective settings and the override entries that matched one assignment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigResolution {
+    pub config: ResolvedRunConfig,
+    matching_overrides: Vec<usize>,
+}
+
+impl ConfigResolution {
+    /// Zero-based positions in the `[[override]]` list, in declaration order.
+    pub fn matching_overrides(&self) -> &[usize] {
+        &self.matching_overrides
     }
 }
 

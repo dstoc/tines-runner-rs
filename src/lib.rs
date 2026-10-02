@@ -1,5 +1,6 @@
 //! Building blocks for the independent Tines runner.
 
+pub mod assignment;
 pub mod codex;
 pub mod config;
 pub mod credentials;
