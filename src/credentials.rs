@@ -225,6 +225,9 @@ impl CredentialStore {
             })?;
         }
 
+        #[cfg(unix)]
+        secure_existing_file_permissions(&self.path)?;
+
         let mut options = OpenOptions::new();
         options.create(true).write(true);
         #[cfg(unix)]
@@ -407,6 +410,19 @@ fn secure_path_permissions(path: &Path) -> Result<(), CredentialError> {
 }
 
 #[cfg(unix)]
+fn secure_existing_file_permissions(path: &Path) -> Result<(), CredentialError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => secure_path_permissions(path),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CredentialError::Open {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
 fn secure_file_permissions(file: &File, path: &Path) -> Result<(), CredentialError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -471,6 +487,27 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         store.load().unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_over_read_only_credentials_after_repairing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temporary_file();
+        let store = CredentialStore::at(&path);
+        store.save(&credentials()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let replacement = RunnerCredentials::new("rnr_replacement", "replacement-token-secret");
+        store.save(&replacement).unwrap();
+
+        assert_eq!(store.load().unwrap(), replacement);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
