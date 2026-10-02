@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +30,16 @@ impl MaterializedWorkspace {
         assignment: &RunnerAssignment,
         api_url: &Url,
     ) -> Result<Self, WorkspaceError> {
+        Self::create_with_git_log(parent, assignment, api_url, |_| {})
+    }
+
+    /// Create a workspace and send Git output to `on_git_output` as it arrives.
+    pub fn create_with_git_log(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        mut on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
         let environment = LaunchEnvironment::new(
             assignment.run_key.clone(),
             api_url.as_str().trim_end_matches('/').to_owned(),
@@ -40,7 +51,7 @@ impl MaterializedWorkspace {
             source,
         })?;
         let path = create_unique_workspace(parent)?;
-        let result = materialize_contents(&path, assignment);
+        let result = materialize_contents(&path, assignment, &mut on_git_output);
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&path);
             return Err(error);
@@ -163,7 +174,17 @@ pub enum WorkspaceError {
     DuplicateSkillName,
     DuplicateSkillFile,
     InvalidRepositoryDirectory,
+    InvalidRepository,
+    InvalidRepositoryUrl,
+    InvalidRepositoryBranch,
+    ConflictingRepositoryDirectories,
     RepositoryOverlapsSkills,
+    RepositoryPathIsNotDirectory,
+    UnsafeRepositoryDirectory,
+    GitCloneFailed {
+        directory: String,
+        status: String,
+    },
     UnsafeWorkspaceDirectory,
     InvalidEnvironment,
     DuplicateEnvironmentName,
@@ -184,8 +205,30 @@ impl fmt::Display for WorkspaceError {
             Self::InvalidRepositoryDirectory => {
                 f.write_str("assignment contains an unsafe repository directory")
             }
+            Self::InvalidRepository => f.write_str("assignment contains invalid repository data"),
+            Self::InvalidRepositoryUrl => {
+                f.write_str("assignment contains a repository with an empty URL")
+            }
+            Self::InvalidRepositoryBranch => {
+                f.write_str("assignment contains a repository with an empty branch")
+            }
+            Self::ConflictingRepositoryDirectories => {
+                f.write_str("assignment contains duplicate or overlapping repository directories")
+            }
             Self::RepositoryOverlapsSkills => {
                 f.write_str("repository directory overlaps the generated skills directory")
+            }
+            Self::RepositoryPathIsNotDirectory => {
+                f.write_str("repository destination has a non-directory parent")
+            }
+            Self::UnsafeRepositoryDirectory => {
+                f.write_str("repository destination contains a symbolic link")
+            }
+            Self::GitCloneFailed { directory, status } => {
+                write!(
+                    f,
+                    "git clone failed for repository directory {directory:?}: {status}"
+                )
             }
             Self::UnsafeWorkspaceDirectory => {
                 f.write_str("generated skills path is not a safe workspace directory")
@@ -219,6 +262,16 @@ struct BundleFiles {
 }
 
 #[derive(Deserialize)]
+struct Repository {
+    #[serde(default)]
+    name: String,
+    dir: String,
+    url: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct Skill {
     name: String,
     files: Vec<SkillFile>,
@@ -247,10 +300,14 @@ fn create_unique_workspace(parent: &Path) -> Result<PathBuf, WorkspaceError> {
     Err(WorkspaceError::WorkspaceNameCollision)
 }
 
-fn materialize_contents(root: &Path, assignment: &RunnerAssignment) -> Result<(), WorkspaceError> {
+fn materialize_contents(
+    root: &Path,
+    assignment: &RunnerAssignment,
+    on_git_output: &mut impl FnMut(&str),
+) -> Result<(), WorkspaceError> {
     let bundle: BundleFiles = serde_json::from_value(assignment.bundle.clone())
         .map_err(|_| WorkspaceError::InvalidBundle("skills or repositories"))?;
-    validate_repositories(&bundle.repos)?;
+    let repositories = validate_repositories(&bundle.repos)?;
     validate_skills(&bundle.skills)?;
 
     fs::write(root.join("prompt.md"), format!("{}\n", assignment.prompt)).map_err(|source| {
@@ -267,7 +324,8 @@ fn materialize_contents(root: &Path, assignment: &RunnerAssignment) -> Result<()
             source,
         }
     })?;
-    materialize_skills(root, &bundle.skills)
+    materialize_skills(root, &bundle.skills)?;
+    clone_repositories(root, &repositories, on_git_output)
 }
 
 fn validate_skills(skills: &[Skill]) -> Result<(), WorkspaceError> {
@@ -295,20 +353,198 @@ fn validate_skills(skills: &[Skill]) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
-fn validate_repositories(repositories: &[Value]) -> Result<(), WorkspaceError> {
+fn validate_repositories(repositories: &[Value]) -> Result<Vec<Repository>, WorkspaceError> {
     let skill_segments = path_segments(SKILLS_PATH).expect("constant skill path is safe");
+    let mut validated = Vec::with_capacity(repositories.len());
+    let mut destinations: Vec<Vec<String>> = Vec::with_capacity(repositories.len());
     for repository in repositories {
-        let dir = repository
-            .get("dir")
-            .and_then(Value::as_str)
-            .ok_or(WorkspaceError::InvalidRepositoryDirectory)?;
-        let segments =
-            validate_relative_path(dir).map_err(|()| WorkspaceError::InvalidRepositoryDirectory)?;
+        let repository: Repository = serde_json::from_value(repository.clone())
+            .map_err(|_| WorkspaceError::InvalidRepository)?;
+        if repository.url.trim().is_empty() {
+            return Err(WorkspaceError::InvalidRepositoryUrl);
+        }
+        if repository
+            .branch
+            .as_deref()
+            .is_some_and(|branch| branch.trim().is_empty())
+        {
+            return Err(WorkspaceError::InvalidRepositoryBranch);
+        }
+        let segments = validate_relative_path(&repository.dir)
+            .map_err(|()| WorkspaceError::InvalidRepositoryDirectory)?
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         if is_prefix(&segments, &skill_segments) || is_prefix(&skill_segments, &segments) {
             return Err(WorkspaceError::RepositoryOverlapsSkills);
         }
+        if destinations
+            .iter()
+            .any(|existing| is_prefix(existing, &segments) || is_prefix(&segments, existing))
+        {
+            return Err(WorkspaceError::ConflictingRepositoryDirectories);
+        }
+        destinations.push(segments);
+        validated.push(repository);
+    }
+    Ok(validated)
+}
+
+fn clone_repositories(
+    root: &Path,
+    repositories: &[Repository],
+    on_git_output: &mut impl FnMut(&str),
+) -> Result<(), WorkspaceError> {
+    for repository in repositories {
+        let destination = root.join(&repository.dir);
+        ensure_safe_repository_parent(root, &repository.dir)?;
+
+        let mut command = Command::new("git");
+        command
+            .arg("clone")
+            .arg("--progress")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(branch) = repository.branch.as_deref() {
+            command
+                .arg(format!("--branch={branch}"))
+                .arg("--single-branch");
+        }
+        command
+            .arg("--")
+            .arg(&repository.url)
+            .arg(&destination)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|source| WorkspaceError::Io {
+            operation: "start git clone",
+            source,
+        })?;
+        if let Some(mut stderr) = child.stderr.take() {
+            stream_git_output(
+                &mut stderr,
+                &repository.url,
+                &repository.name,
+                &repository.dir,
+                on_git_output,
+            )
+            .map_err(|source| WorkspaceError::Io {
+                operation: "read git clone output",
+                source,
+            })?;
+        }
+        let status = child.wait().map_err(|source| WorkspaceError::Io {
+            operation: "wait for git clone",
+            source,
+        })?;
+        if !status.success() {
+            return Err(WorkspaceError::GitCloneFailed {
+                directory: repository.dir.clone(),
+                status: status.to_string(),
+            });
+        }
     }
     Ok(())
+}
+
+fn ensure_safe_repository_parent(root: &Path, directory: &str) -> Result<(), WorkspaceError> {
+    let segments = validate_relative_path(directory)
+        .map_err(|()| WorkspaceError::InvalidRepositoryDirectory)?;
+    let mut current = root.to_path_buf();
+    for segment in &segments[..segments.len().saturating_sub(1)] {
+        current.push(segment);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(WorkspaceError::UnsafeRepositoryDirectory);
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(WorkspaceError::RepositoryPathIsNotDirectory);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|source| WorkspaceError::Io {
+                    operation: "create repository parent directory",
+                    source,
+                })?;
+            }
+            Err(source) => {
+                return Err(WorkspaceError::Io {
+                    operation: "inspect repository parent directory",
+                    source,
+                });
+            }
+        }
+    }
+    match fs::symlink_metadata(root.join(directory)) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(WorkspaceError::UnsafeRepositoryDirectory)
+        }
+        Ok(_) => Err(WorkspaceError::ConflictingRepositoryDirectories),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(WorkspaceError::Io {
+            operation: "inspect repository destination",
+            source,
+        }),
+    }
+}
+
+fn stream_git_output(
+    stderr: &mut impl Read,
+    repository_url: &str,
+    repository_name: &str,
+    directory: &str,
+    on_git_output: &mut impl FnMut(&str),
+) -> io::Result<()> {
+    const MAX_LINE_BYTES: usize = 8192;
+    let mut line = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = stderr.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        for byte in &buffer[..count] {
+            if *byte == b'\n' || *byte == b'\r' {
+                emit_git_line(
+                    &mut line,
+                    repository_url,
+                    repository_name,
+                    directory,
+                    on_git_output,
+                );
+            } else if line.len() < MAX_LINE_BYTES {
+                line.push(*byte);
+            }
+        }
+    }
+    emit_git_line(
+        &mut line,
+        repository_url,
+        repository_name,
+        directory,
+        on_git_output,
+    );
+    Ok(())
+}
+
+fn emit_git_line(
+    line: &mut Vec<u8>,
+    repository_url: &str,
+    repository_name: &str,
+    directory: &str,
+    on_git_output: &mut impl FnMut(&str),
+) {
+    if line.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(line).replace(repository_url, "<repository URL>");
+    let name = if repository_name.is_empty() {
+        directory
+    } else {
+        repository_name
+    };
+    on_git_output(&format!("git [{name}]: {text}\n"));
+    line.clear();
 }
 
 fn validate_relative_path(value: &str) -> Result<Vec<&str>, ()> {
@@ -332,12 +568,12 @@ fn path_segments(value: &str) -> Result<Vec<&str>, ()> {
     validate_relative_path(value)
 }
 
-fn is_prefix(left: &[&str], right: &[&str]) -> bool {
+fn is_prefix<L: AsRef<str>, R: AsRef<str>>(left: &[L], right: &[R]) -> bool {
     left.len() <= right.len()
         && left
             .iter()
             .zip(right)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+            .all(|(left, right)| left.as_ref().eq_ignore_ascii_case(right.as_ref()))
 }
 
 fn materialize_skills(root: &Path, skills: &[Skill]) -> Result<(), WorkspaceError> {
@@ -464,7 +700,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use url::Url;
 
@@ -503,11 +739,49 @@ mod tests {
                 "name": skill_name,
                 "files": [{ "path": file_path, "content": "skill content" }]
             }],
+            "repos": []
+        })
+    }
+
+    fn run_git(directory: Option<&Path>, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        if let Some(directory) = directory {
+            command.arg("-C").arg(directory);
+        }
+        let output = command
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn source_repository(directory: &Path) {
+        fs::create_dir_all(directory).expect("create source repository");
+        run_git(None, &["init", directory.to_str().expect("UTF-8 path")]);
+        run_git(Some(directory), &["config", "user.name", "Workspace Test"]);
+        run_git(
+            Some(directory),
+            &["config", "user.email", "workspace-test@example.test"],
+        );
+        fs::write(directory.join("README.md"), "default branch\n").expect("write source file");
+        run_git(Some(directory), &["add", "README.md"]);
+        run_git(Some(directory), &["commit", "-m", "initial source"]);
+    }
+
+    fn repository_bundle(url: &Path, directory: &str, branch: Option<&str>) -> serde_json::Value {
+        json!({
+            "skills": [],
             "repos": [{
                 "name": "fixture",
-                "dir": "fixture-repo",
-                "url": "https://example.test/fixture.git",
-                "branch": "main"
+                "dir": directory,
+                "url": url.to_string_lossy().to_string(),
+                "branch": branch
             }]
         })
     }
@@ -544,7 +818,7 @@ mod tests {
             "skill content"
         );
         let repos = fs::read_to_string(first.path().join("repos.json")).expect("read repos");
-        assert!(repos.contains("fixture-repo"));
+        assert_eq!(repos, "[]\n");
         assert!(repos.ends_with('\n'));
         for content in [
             fs::read_to_string(first.path().join("prompt.md")).unwrap(),
@@ -671,7 +945,12 @@ mod tests {
         let assignment = assignment(
             json!({
                 "skills": [],
-                "repos": [{ "dir": ".agents/skills/repo" }]
+                "repos": [{
+                    "name": "fixture",
+                    "url": "https://example.test/repo.git",
+                    "branch": null,
+                    "dir": ".agents/skills/repo"
+                }]
             }),
             json!([]),
         );
@@ -681,6 +960,127 @@ mod tests {
             MaterializedWorkspace::create(&directory.0, &assignment, &api_url),
             Err(WorkspaceError::RepositoryOverlapsSkills)
         ));
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn clones_repository_into_assignment_workspace_and_streams_git_output() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("source");
+        source_repository(&source);
+        let assignment = assignment(
+            repository_bundle(&source, "checkouts/fixture", None),
+            json!([]),
+        );
+        let api_url = Url::parse("https://tines.example.test").unwrap();
+        let mut output = Vec::new();
+
+        let workspace = MaterializedWorkspace::create_with_git_log(
+            directory.0.join("workspaces"),
+            &assignment,
+            &api_url,
+            |chunk| output.push(chunk.to_owned()),
+        )
+        .expect("clone local repository");
+
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("checkouts/fixture/README.md")).unwrap(),
+            "default branch\n"
+        );
+        let repos = fs::read_to_string(workspace.path().join("repos.json")).unwrap();
+        assert!(repos.contains("checkouts/fixture"));
+        assert!(output.iter().any(|chunk| chunk.contains("git [fixture]:")));
+    }
+
+    #[test]
+    fn checks_out_the_requested_repository_branch() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("source");
+        source_repository(&source);
+        run_git(Some(&source), &["checkout", "-b", "requested-branch"]);
+        fs::write(source.join("branch.txt"), "requested branch\n").unwrap();
+        run_git(Some(&source), &["add", "branch.txt"]);
+        run_git(Some(&source), &["commit", "-m", "requested branch"]);
+        let assignment = assignment(
+            repository_bundle(&source, "fixture", Some("requested-branch")),
+            json!([]),
+        );
+        let api_url = Url::parse("https://tines.example.test").unwrap();
+
+        let workspace = MaterializedWorkspace::create(&directory.0, &assignment, &api_url)
+            .expect("clone requested branch");
+
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("fixture/branch.txt")).unwrap(),
+            "requested branch\n"
+        );
+        assert_eq!(
+            run_git(
+                None,
+                &[
+                    "-C",
+                    workspace.path().join("fixture").to_str().unwrap(),
+                    "branch",
+                    "--show-current",
+                ]
+            ),
+            "requested-branch"
+        );
+    }
+
+    #[test]
+    fn reports_invalid_repository_and_cleans_the_workspace() {
+        let directory = TestDirectory::new();
+        let missing = directory.0.join("missing-repository");
+        let assignment = assignment(repository_bundle(&missing, "fixture", None), json!([]));
+        let api_url = Url::parse("https://tines.example.test").unwrap();
+        let mut output = Vec::new();
+
+        let error = MaterializedWorkspace::create_with_git_log(
+            directory.0.join("workspaces"),
+            &assignment,
+            &api_url,
+            |chunk| output.push(chunk.to_owned()),
+        )
+        .expect_err("missing source repository must fail the run preparation");
+
+        assert!(matches!(error, WorkspaceError::GitCloneFailed { .. }));
+        assert!(output.iter().any(|chunk| chunk.contains("fatal")));
+        assert_eq!(
+            fs::read_dir(directory.0.join("workspaces"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_overlapping_repository_destinations_before_cloning() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("missing-repository");
+        let source_url = source.to_string_lossy().to_string();
+        let api_url = Url::parse("https://tines.example.test").unwrap();
+        for paths in [
+            ["fixture", "fixture"],
+            ["fixture", "fixture/nested"],
+            ["fixture/nested", "fixture"],
+        ] {
+            let assignment = assignment(
+                json!({
+                    "skills": [],
+                    "repos": paths
+                        .iter()
+                        .map(|path| json!({ "name": "fixture", "url": source_url, "dir": path }))
+                        .collect::<Vec<_>>()
+                }),
+                json!([]),
+            );
+
+            assert!(matches!(
+                MaterializedWorkspace::create(&directory.0, &assignment, &api_url),
+                Err(WorkspaceError::ConflictingRepositoryDirectories)
+            ));
+        }
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
     }
 

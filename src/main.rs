@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::error::Error;
 use std::process::ExitCode;
+use tines_runner_rs::protocol::AppendRunLogRequest;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,6 +47,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     }
 
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
+    let runner_token = connection.credentials().runner_token().to_owned();
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
@@ -58,10 +60,39 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     assignment,
                 ) {
                     Ok(resolved) => {
-                        let workspace = match tines_runner_rs::workspace::MaterializedWorkspace::create(
+                        let mut log_seq = 1;
+                        let workspace = match tines_runner_rs::workspace::MaterializedWorkspace::create_with_git_log(
                             &resolved.resolution().config.workspace_parent,
                             resolved.assignment(),
                             &config.server_url,
+                            |chunk| {
+                                tracing::info!(
+                                    run_id = %assignment.run.id,
+                                    git_output = %chunk.trim_end(),
+                                    "repository checkout progress"
+                                );
+                                let request = AppendRunLogRequest {
+                                    chunk: chunk.to_owned(),
+                                    seq: Some(log_seq),
+                                };
+                                match issue_client.append_run_log(
+                                    &assignment.run.id,
+                                    &runner_token,
+                                    &request,
+                                ) {
+                                    Ok(response) => {
+                                        log_seq = response.log_seq.saturating_add(1);
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            run_id = %assignment.run.id,
+                                            error = %error,
+                                            "could not append repository checkout output to the run log"
+                                        );
+                                        log_seq = log_seq.saturating_add(1);
+                                    }
+                                }
+                            },
                         ) {
                             Ok(workspace) => workspace,
                             Err(error) => {
