@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::time::Instant;
 
 use crate::config::{Config, ConfigResolution, MatchContext};
 use crate::protocol::AppendRunLogResponse;
@@ -54,6 +55,18 @@ impl PreparedAssignment {
     ) -> Result<AppendRunLogResponse, ClientError> {
         let run_id = self.assignment().run.id.clone();
         self.run_logs.harness_started(client, &run_id, runner_token)
+    }
+
+    /// Flush workspace logs after launch without extending the run deadline.
+    pub fn harness_started_until(
+        &mut self,
+        client: &Client,
+        runner_token: &str,
+        deadline: Instant,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .harness_started_until(client, &run_id, runner_token, deadline)
     }
 
     /// Append harness output and flush buffered workspace output first.

@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::assignment::PreparedAssignment;
 use crate::codex::CodexLaunch;
@@ -39,7 +39,8 @@ pub fn execute_assignment(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let mut report = CodexRunReport::new(assignment.assignment().run.model.as_deref());
-    let run_output = run_harness(&mut assignment, client, runner_token, capabilities);
+    let timeout = Duration::from_secs(assignment.assignment().timeout_minutes.saturating_mul(60));
+    let run_output = run_harness(&mut assignment, client, runner_token, capabilities, timeout);
 
     let (status, error, output) = match run_output {
         Ok(output) if !output.timed_out && output.exit == ProcessExit::Code(0) => {
@@ -77,6 +78,7 @@ fn run_harness(
     client: &Client,
     runner_token: &str,
     capabilities: &EffortCapabilities,
+    timeout: Duration,
 ) -> Result<ProcessOutput, String> {
     let launch = CodexLaunch::for_assignment(assignment, capabilities)
         .map_err(|error| format!("could not prepare Codex command: {error}"))?;
@@ -88,8 +90,11 @@ fn run_harness(
     let mut command = launch.command();
     let process = SupervisedProcess::spawn(&mut command)
         .map_err(|error| format!("could not start Codex harness: {error}"))?;
+    let deadline = Instant::now() + timeout;
 
-    if let Err(error) = retry_protocol(|| assignment.harness_started(client, runner_token)) {
+    if let Err(error) = retry_protocol_until(deadline, || {
+        assignment.harness_started_until(client, runner_token, deadline)
+    }) {
         tracing::warn!(
             run_id = %assignment.assignment().run.id,
             error = %error,
@@ -97,9 +102,11 @@ fn run_harness(
         );
     }
 
-    let timeout = Duration::from_secs(assignment.assignment().timeout_minutes.saturating_mul(60));
     process
-        .wait_timeout(timeout, TERMINATION_GRACE)
+        .wait_timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            TERMINATION_GRACE,
+        )
         .map_err(|error| format!("could not wait for Codex harness: {error}"))
 }
 
@@ -215,6 +222,33 @@ fn retry_protocol<T>(
     }
 }
 
+fn retry_protocol_until<T>(
+    deadline: Instant,
+    mut request: impl FnMut() -> Result<T, ClientError>,
+) -> Result<T, ClientError> {
+    let mut failures = 0u32;
+    loop {
+        match request() {
+            Ok(response) => return Ok(response),
+            Err(error) if error.category() == ErrorCategory::Retryable => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                let delay = retry_delay(failures).min(remaining);
+                failures = failures.saturating_add(1);
+                tracing::warn!(
+                    error = %error,
+                    backoff_seconds = delay.as_secs_f64(),
+                    "harness-start log request failed; retrying before the run deadline"
+                );
+                thread::sleep(delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs(1u64 << failures.min(6)).min(MAX_BACKOFF)
 }
@@ -246,5 +280,176 @@ impl Error for ExecutionError {
             Self::FinishReport(error) => Some(error),
             Self::WorkspaceCleanup(error) => Some(error),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::run_harness;
+    use crate::assignment::{PreparedAssignment, resolve_assignment};
+    use crate::config::Config;
+    use crate::effort::EffortCapabilities;
+    use crate::protocol::RunnerAssignment;
+    use crate::protocol::client::Client;
+    use crate::workspace::MaterializedWorkspace;
+    use serde_json::json;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tines-runner-execution-timeout-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let count = stream.read(&mut chunk).expect("read fake Tines request");
+            assert_ne!(count, 0, "client closed before completing its request");
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).expect("request headers");
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return String::from_utf8(request).expect("request is UTF-8");
+            }
+        }
+    }
+
+    fn respond(stream: &mut TcpStream, status: u16, body: &str) {
+        let label = if status == 200 { "OK" } else { "Unavailable" };
+        write!(
+            stream,
+            "HTTP/1.1 {status} {label}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write fake Tines response");
+    }
+
+    #[test]
+    fn retrying_harness_start_log_does_not_extend_the_process_timeout() {
+        let directory = TestDirectory::new();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Tines server");
+        let address = listener.local_addr().expect("read fake Tines address");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept fake Tines request");
+                let request = read_request(&mut stream);
+                if request.starts_with("GET /api/v1/issues/iss_timeout ") {
+                    respond(
+                        &mut stream,
+                        200,
+                        r#"{"id":"iss_timeout","workflow":{"name":"Implementation"}}"#,
+                    );
+                } else if request.starts_with("POST /api/v1/runs/arun_timeout/logs ") {
+                    respond(
+                        &mut stream,
+                        503,
+                        r#"{"error":{"code":"unavailable","message":"retry"}}"#,
+                    );
+                } else {
+                    panic!("unexpected fake Tines request: {request}");
+                }
+                requests.push(request);
+            }
+            requests
+        });
+        let server_url = format!("http://{address}");
+        let wrapper_path = directory.0.join("slow-codex-wrapper");
+        fs::write(&wrapper_path, "#!/bin/sh\nexec sleep 30\n").expect("write wrapper");
+        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
+            .expect("make wrapper executable");
+        let workspace_parent = directory.0.join("workspaces");
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"timeout-test\"\nwrapper = [{}]\nworkspace_parent = {:?}\n",
+            serde_json::to_string(&wrapper_path.to_string_lossy().as_ref())
+                .expect("encode wrapper path"),
+            workspace_parent
+        ))
+        .expect("parse runner config");
+        let client = Client::with_timeout(&server_url, Duration::from_secs(5))
+            .expect("create protocol client");
+        let protocol_assignment: RunnerAssignment = serde_json::from_value(json!({
+            "run": {
+                "id": "arun_timeout",
+                "issue_id": "iss_timeout",
+                "issue_ref": {"project_name": "Tines", "number": 14, "title": "Timeout"},
+                "state_at_start_name": "Implement"
+            },
+            "prompt": "work",
+            "bundle": {"skills": [], "repos": []},
+            "run_key": "issue-key",
+            "timeout_minutes": 1,
+            "env": []
+        }))
+        .expect("decode assignment");
+        let resolved =
+            resolve_assignment(&config, &client, &protocol_assignment).expect("resolve assignment");
+        let workspace = MaterializedWorkspace::create(
+            &resolved.resolution().config.workspace_parent,
+            resolved.assignment(),
+            &config.server_url,
+        )
+        .expect("create assignment workspace");
+        let mut prepared = PreparedAssignment::new(resolved, workspace);
+        let capabilities = EffortCapabilities {
+            version: 1,
+            daemon_version: "test-runner".to_owned(),
+            harness: "codex".to_owned(),
+            harness_version: "stub".to_owned(),
+            catalog_digest: "empty".to_owned(),
+            models: Vec::new(),
+            accepts_asserted_effort: Some(false),
+            discovery_error: None,
+        };
+
+        let started = Instant::now();
+        let output = run_harness(
+            &mut prepared,
+            &client,
+            "runner-token",
+            &capabilities,
+            Duration::from_millis(200),
+        )
+        .expect("supervise harness after start-log outage");
+
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let requests = server.join().expect("join fake Tines server");
+        assert!(requests[0].starts_with("GET /api/v1/issues/iss_timeout "));
+        assert!(requests[1].starts_with("POST /api/v1/runs/arun_timeout/logs "));
     }
 }
