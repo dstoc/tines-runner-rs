@@ -297,9 +297,125 @@ impl Client {
     }
 }
 
+/// Buffered workspace logs that are sent after the harness starts.
+///
+/// The first run-log append is also the server's harness-start signal. Keep
+/// workspace preparation output here until the process launcher confirms that
+/// the harness has started.
+#[derive(Clone)]
+pub struct RunLogBuffer {
+    preparation_chunks: std::collections::VecDeque<String>,
+    next_seq: u64,
+}
+
+impl RunLogBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Keep workspace output for delivery with the first harness output.
+    pub fn buffer_preparation_output(&mut self, chunk: &str) {
+        if !chunk.is_empty() {
+            self.preparation_chunks.push_back(chunk.to_owned());
+        }
+    }
+
+    /// Return buffered preparation output for a failed-run diagnostic.
+    pub fn preparation_output(&self) -> String {
+        self.preparation_chunks.iter().cloned().collect()
+    }
+
+    /// Flush preparation logs after the process launcher confirms a successful
+    /// harness start. An empty append marks a quiet harness as running when
+    /// workspace preparation produced no output.
+    pub fn harness_started(
+        &mut self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        if let Some(response) = self.flush_preparation_output(client, run_id, runner_token)? {
+            return Ok(response);
+        }
+
+        let response = client.append_run_log(
+            run_id,
+            runner_token,
+            &AppendRunLogRequest {
+                chunk: String::new(),
+                seq: Some(self.next_seq),
+            },
+        )?;
+        self.next_seq = response.log_seq.saturating_add(1);
+        Ok(response)
+    }
+
+    /// Append harness output, flushing any preparation output first.
+    pub fn append_harness_output(
+        &mut self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        chunk: &str,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        self.flush_preparation_output(client, run_id, runner_token)?;
+
+        let response = client.append_run_log(
+            run_id,
+            runner_token,
+            &AppendRunLogRequest {
+                chunk: chunk.to_owned(),
+                seq: Some(self.next_seq),
+            },
+        )?;
+        self.next_seq = response.log_seq.saturating_add(1);
+        Ok(response)
+    }
+
+    fn flush_preparation_output(
+        &mut self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let mut last_response = None;
+        while let Some(preparation_chunk) = self.preparation_chunks.front() {
+            let response = client.append_run_log(
+                run_id,
+                runner_token,
+                &AppendRunLogRequest {
+                    chunk: preparation_chunk.clone(),
+                    seq: Some(self.next_seq),
+                },
+            )?;
+            self.preparation_chunks.pop_front();
+            self.next_seq = response.log_seq.saturating_add(1);
+            last_response = Some(response);
+        }
+        Ok(last_response)
+    }
+}
+
+impl Default for RunLogBuffer {
+    fn default() -> Self {
+        Self {
+            preparation_chunks: std::collections::VecDeque::new(),
+            next_seq: 1,
+        }
+    }
+}
+
+impl fmt::Debug for RunLogBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunLogBuffer")
+            .field("pending_preparation_chunks", &self.preparation_chunks.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Client, ErrorCategory, classify_http_status};
+    use super::{Client, ErrorCategory, RunLogBuffer, classify_http_status};
     use crate::protocol::{
         AppendRunLogRequest, FinishRunRequest, FinishStatus, RegisterRunnerRequest, RunnerHarness,
         RunnerPollRequest,
@@ -307,6 +423,7 @@ mod tests {
     use reqwest::StatusCode;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -377,6 +494,183 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::Retryable);
         assert_eq!(error.status(), None);
         assert!(!error.to_string().contains("run-secret-token"));
+    }
+
+    #[test]
+    fn preparation_logs_wait_for_the_first_harness_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("read listener address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for seq in 1..=3 {
+                let (mut stream, _) = listener.accept().expect("accept log request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request header");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().expect("content length");
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).expect("read request body");
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("parse log request");
+                request_tx.send(request).expect("send captured request");
+
+                let response_body =
+                    format!("{{\"status\":\"running\",\"log_bytes_dropped\":0,\"log_seq\":{seq}}}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .expect("write log response");
+            }
+        });
+
+        let client = Client::with_timeout(&format!("http://{address}"), Duration::from_secs(5))
+            .expect("create client");
+        let mut logs = RunLogBuffer::new();
+        logs.buffer_preparation_output("git [repo]: receiving objects\n");
+        logs.buffer_preparation_output("git [repo]: checking out branch\n");
+
+        assert!(request_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let response = logs
+            .append_harness_output(&client, "arun_1", "runner-token", "codex started\n")
+            .expect("append the first harness output");
+        assert_eq!(response.status, "running");
+        assert_eq!(response.log_seq, 3);
+
+        let requests: Vec<_> = (0..3)
+            .map(|_| request_rx.recv().expect("receive log request"))
+            .collect();
+        assert_eq!(requests[0]["chunk"], "git [repo]: receiving objects\n");
+        assert_eq!(requests[0]["seq"], 1);
+        assert_eq!(requests[1]["chunk"], "git [repo]: checking out branch\n");
+        assert_eq!(requests[1]["seq"], 2);
+        assert_eq!(requests[2]["chunk"], "codex started\n");
+        assert_eq!(requests[2]["seq"], 3);
+        server.join().expect("join test server");
+    }
+
+    #[test]
+    fn harness_start_flushes_preparation_logs_without_waiting_for_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("read listener address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for seq in 1..=2 {
+                let (mut stream, _) = listener.accept().expect("accept log request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request header");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().expect("content length");
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).expect("read request body");
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("parse log request");
+                request_tx.send(request).expect("send captured request");
+
+                let response_body =
+                    format!("{{\"status\":\"running\",\"log_bytes_dropped\":0,\"log_seq\":{seq}}}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .expect("write log response");
+            }
+        });
+
+        let client = Client::with_timeout(&format!("http://{address}"), Duration::from_secs(5))
+            .expect("create client");
+        let mut logs = RunLogBuffer::new();
+        logs.buffer_preparation_output("git [repo]: receiving objects\n");
+        logs.buffer_preparation_output("git [repo]: checking out branch\n");
+
+        assert!(request_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let response = logs
+            .harness_started(&client, "arun_1", "runner-token")
+            .expect("flush checkout logs when the harness starts");
+        assert_eq!(response.status, "running");
+        assert_eq!(response.log_seq, 2);
+
+        let requests: Vec<_> = (0..2)
+            .map(|_| request_rx.recv().expect("receive log request"))
+            .collect();
+        assert_eq!(requests[0]["chunk"], "git [repo]: receiving objects\n");
+        assert_eq!(requests[0]["seq"], 1);
+        assert_eq!(requests[1]["chunk"], "git [repo]: checking out branch\n");
+        assert_eq!(requests[1]["seq"], 2);
+        assert!(request_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        server.join().expect("join test server");
+    }
+
+    #[test]
+    fn quiet_harness_start_sends_an_empty_start_marker_without_preparation_logs() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("read listener address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept start marker");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request header");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().expect("content length");
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).expect("read request body");
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse start marker");
+            request_tx.send(request).expect("send captured request");
+
+            let response_body = "{\"status\":\"running\",\"log_bytes_dropped\":0,\"log_seq\":1}";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write log response");
+        });
+
+        let client = Client::with_timeout(&format!("http://{address}"), Duration::from_secs(5))
+            .expect("create client");
+        let mut logs = RunLogBuffer::new();
+        let response = logs
+            .harness_started(&client, "arun_1", "runner-token")
+            .expect("mark quiet harness as started");
+
+        assert_eq!(response.status, "running");
+        assert_eq!(response.log_seq, 1);
+        let request = request_rx.recv().expect("receive start marker");
+        assert_eq!(request["chunk"], "");
+        assert_eq!(request["seq"], 1);
+        server.join().expect("join test server");
     }
 
     #[test]

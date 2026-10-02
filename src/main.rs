@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::error::Error;
 use std::process::ExitCode;
+use tines_runner_rs::protocol::client::RunLogBuffer;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,10 +59,19 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     assignment,
                 ) {
                     Ok(resolved) => {
-                        let workspace = match tines_runner_rs::workspace::MaterializedWorkspace::create(
+                        let mut run_logs = RunLogBuffer::new();
+                        let workspace = match tines_runner_rs::workspace::MaterializedWorkspace::create_with_git_log(
                             &resolved.resolution().config.workspace_parent,
                             resolved.assignment(),
                             &config.server_url,
+                            |chunk| {
+                                tracing::info!(
+                                    run_id = %assignment.run.id,
+                                    git_output = %chunk.trim_end(),
+                                    "repository checkout progress"
+                                );
+                                run_logs.buffer_preparation_output(chunk);
+                            },
                         ) {
                             Ok(workspace) => workspace,
                             Err(error) => {
@@ -70,7 +80,13 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                                     error = %error,
                                     "assignment failed during workspace materialization"
                                 );
-                                state.fail_assignment(assignment.run.id.clone(), error.to_string());
+                                let output = run_logs.preparation_output();
+                                let failure = if output.is_empty() {
+                                    error.to_string()
+                                } else {
+                                    format!("{error}\nRepository checkout output:\n{output}")
+                                };
+                                state.fail_assignment(assignment.run.id.clone(), failure);
                                 continue;
                             }
                         };
@@ -83,9 +99,12 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                             workspace = %workspace.path().display(),
                             "assignment workspace materialized and queued"
                         );
-                        state.queue_assignment(tines_runner_rs::assignment::PreparedAssignment::new(
-                            resolved, workspace,
-                        ));
+                        state.queue_assignment(
+                            tines_runner_rs::assignment::PreparedAssignment::new(
+                                resolved, workspace,
+                            )
+                            .with_run_log_buffer(run_logs),
+                        );
                     }
                     Err(error) => {
                         state.decline_assignment(assignment.run.id.clone());
