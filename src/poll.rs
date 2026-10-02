@@ -39,6 +39,17 @@ pub struct PollState {
     effort_capabilities_refreshed_at: Option<Instant>,
 }
 
+/// Result of reserving one server-delivered assignment in the local run set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentAdmission {
+    /// This assignment is new and now consumes one local concurrency slot.
+    Accepted,
+    /// This run is already tracked locally and must not be materialized again.
+    AlreadyOwned,
+    /// All slots under the effective local cap are in use.
+    AtCapacity,
+}
+
 impl PollState {
     fn new(config: &Config) -> Self {
         Self {
@@ -68,6 +79,25 @@ impl PollState {
         self.owned_runs.insert(run_id.into());
     }
 
+    /// Reserve a delivered run before resolving metadata or materializing its
+    /// workspace. The reservation is included in the next `owned_runs` poll.
+    pub fn admit_assignment(&mut self, run_id: impl Into<String>) -> AssignmentAdmission {
+        let run_id = run_id.into();
+        if self.owned_runs.contains(&run_id) {
+            return AssignmentAdmission::AlreadyOwned;
+        }
+        if self.owned_runs.len() >= self.effective_concurrency as usize {
+            return AssignmentAdmission::AtCapacity;
+        }
+        self.owned_runs.insert(run_id);
+        AssignmentAdmission::Accepted
+    }
+
+    /// Number of runs that currently consume local concurrency slots.
+    pub fn active_run_count(&self) -> usize {
+        self.owned_runs.len()
+    }
+
     /// Remove a run after its child process and local resources are cleaned up.
     pub fn release_run(&mut self, run_id: &str) {
         self.owned_runs.remove(run_id);
@@ -87,6 +117,7 @@ impl PollState {
     /// return its ID in `released_assignments` once it is safe to forget.
     pub fn decline_assignment(&mut self, run_id: impl Into<String>) {
         let run_id = run_id.into();
+        self.owned_runs.remove(&run_id);
         self.pending_assignments.remove(&run_id);
         self.declined_assignments.insert(run_id);
     }
@@ -152,6 +183,7 @@ impl PollState {
 
     fn acknowledge_assignment_failure(&mut self, run_id: &str) {
         self.assignment_failures.remove(run_id);
+        self.owned_runs.remove(run_id);
     }
 
     fn request(&self) -> RunnerPollRequest {
@@ -199,6 +231,8 @@ impl PollState {
         for released in &response.released_assignments {
             self.declined_assignments.remove(released);
             self.pending_assignments.remove(released);
+            self.assignment_failures.remove(released);
+            self.owned_runs.remove(released);
         }
         for canceled in &response.cancels {
             self.pending_assignments.remove(canceled);
@@ -397,9 +431,18 @@ mod tests {
         credentials_file: &std::path::Path,
         allow_remote_concurrency: bool,
     ) -> Config {
+        config_with_concurrency(server_url, credentials_file, allow_remote_concurrency, 3)
+    }
+
+    fn config_with_concurrency(
+        server_url: &str,
+        credentials_file: &std::path::Path,
+        allow_remote_concurrency: bool,
+        max_concurrent: usize,
+    ) -> Config {
         Config::from_toml_str(&format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"poll-test\"\nmax_concurrent = 3\nallow_remote_concurrency = {allow_remote_concurrency}\n[storage]\ncredentials_file = {:?}\n",
-            credentials_file,
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"poll-test\"\nmax_concurrent = {max_concurrent}\nallow_remote_concurrency = {allow_remote_concurrency}\n[storage]\ncredentials_file = {:?}\n",
+            credentials_file
         ))
         .expect("valid poll config")
     }
@@ -453,11 +496,21 @@ mod tests {
     }
 
     fn poller(directory: &TestDirectory, url: &str, allow_remote_concurrency: bool) -> PollLoop {
+        poller_with_concurrency(directory, url, allow_remote_concurrency, 3)
+    }
+
+    fn poller_with_concurrency(
+        directory: &TestDirectory,
+        url: &str,
+        allow_remote_concurrency: bool,
+        max_concurrent: usize,
+    ) -> PollLoop {
         let store = CredentialStore::at(directory.credentials_path());
         store
             .save(&RunnerCredentials::new("rnr_poll", "poll-token"))
             .expect("store runner token");
-        let config = config(url, store.path(), allow_remote_concurrency);
+        let config =
+            config_with_concurrency(url, store.path(), allow_remote_concurrency, max_concurrent);
         let connection = RunnerConnection::connect(&config).expect("load runner connection");
         PollLoop::new(connection, &config)
     }
@@ -568,6 +621,107 @@ mod tests {
     }
 
     #[test]
+    fn outage_reconciliation_keeps_reservations_and_does_not_admit_duplicates() {
+        let directory = TestDirectory::new();
+        let first_delivery = r#"{"assignments":[{"run":{"id":"arun_a","issue_id":"iss_a"},"prompt":"a","bundle":{},"run_key":"key-a","timeout_minutes":30},{"run":{"id":"arun_b","issue_id":"iss_b"},"prompt":"b","bundle":{},"run_key":"key-b","timeout_minutes":30}],"cancels":[]}"#;
+        let redelivered = r#"{"assignments":[{"run":{"id":"arun_a","issue_id":"iss_a"},"prompt":"a","bundle":{},"run_key":"key-a","timeout_minutes":30},{"run":{"id":"arun_b","issue_id":"iss_b"},"prompt":"b","bundle":{},"run_key":"key-b","timeout_minutes":30},{"run":{"id":"arun_c","issue_id":"iss_c"},"prompt":"c","bundle":{},"run_key":"key-c","timeout_minutes":30}],"cancels":[]}"#;
+        let empty = r#"{"assignments":[],"cancels":[]}"#;
+        let (url, server) = mock_server(vec![
+            (200, first_delivery),
+            (503, r#"{"error":{"code":"unavailable","message":"retry"}}"#),
+            (200, redelivered),
+            (200, empty),
+        ]);
+        let mut poller = poller_with_concurrency(&directory, &url, false, 2);
+        let successful_polls = Cell::new(0);
+        let accepted = Cell::new(0);
+        let duplicates = Cell::new(0);
+        let declined = Cell::new(0);
+        poller
+            .run_with(
+                |response, state| {
+                    for assignment in &response.assignments {
+                        match state.admit_assignment(assignment.run.id.clone()) {
+                            super::AssignmentAdmission::Accepted => {
+                                accepted.set(accepted.get() + 1);
+                            }
+                            super::AssignmentAdmission::AlreadyOwned => {
+                                duplicates.set(duplicates.get() + 1);
+                            }
+                            super::AssignmentAdmission::AtCapacity => {
+                                declined.set(declined.get() + 1);
+                                state.decline_assignment(assignment.run.id.clone());
+                            }
+                        }
+                    }
+                    successful_polls.set(successful_polls.get() + 1);
+                },
+                || successful_polls.get() < 3,
+                |_| {},
+            )
+            .expect("recover and reconcile repeated assignment delivery");
+
+        let requests = server.join().expect("mock server requests");
+        assert_eq!(accepted.get(), 2);
+        assert_eq!(duplicates.get(), 2);
+        assert_eq!(declined.get(), 1);
+        assert_eq!(poller.state().active_run_count(), 2);
+        assert_eq!(
+            requests[1]["owned_runs"],
+            serde_json::json!(["arun_a", "arun_b"])
+        );
+        assert_eq!(
+            requests[2]["owned_runs"],
+            serde_json::json!(["arun_a", "arun_b"])
+        );
+        assert_eq!(
+            requests[3]["owned_runs"],
+            serde_json::json!(["arun_a", "arun_b"])
+        );
+        assert_eq!(
+            requests[3]["declined_assignments"],
+            serde_json::json!(["arun_c"])
+        );
+    }
+
+    #[test]
+    fn released_assignment_in_same_response_is_not_admitted() {
+        let directory = TestDirectory::new();
+        let delivered = r#"{"assignments":[{"run":{"id":"arun_released","issue_id":"iss_released"},"prompt":"work","bundle":{},"run_key":"run-key","timeout_minutes":30}],"cancels":[]}"#;
+        let released = r#"{"assignments":[{"run":{"id":"arun_released","issue_id":"iss_released"},"prompt":"work","bundle":{},"run_key":"run-key","timeout_minutes":30}],"cancels":[],"released_assignments":["arun_released"]}"#;
+        let (url, server) = mock_server(vec![(200, delivered), (200, released)]);
+        let mut poller = poller(&directory, &url, false);
+        let successful_polls = Cell::new(0);
+        let accepted = Cell::new(0);
+        poller
+            .run_with(
+                |response, state| {
+                    for assignment in &response.assignments {
+                        if response.released_assignments.contains(&assignment.run.id) {
+                            continue;
+                        }
+                        if state.admit_assignment(assignment.run.id.clone())
+                            == super::AssignmentAdmission::Accepted
+                        {
+                            accepted.set(accepted.get() + 1);
+                        }
+                    }
+                    successful_polls.set(successful_polls.get() + 1);
+                },
+                || successful_polls.get() < 2,
+                |_| {},
+            )
+            .expect("process released assignment response");
+        let requests = server.join().expect("mock server requests");
+        assert_eq!(accepted.get(), 1);
+        assert_eq!(
+            requests[1]["owned_runs"],
+            serde_json::json!(["arun_released"])
+        );
+        assert_eq!(poller.state().active_run_count(), 0);
+    }
+
+    #[test]
     fn queued_assignment_failures_retry_and_report_each_run() {
         let directory = TestDirectory::new();
         let poll_response = r#"{"assignments":[],"cancels":[]}"#;
@@ -672,6 +826,74 @@ mod tests {
             requests[1]["concurrency_control"]["applied"],
             serde_json::json!({"revision": 4, "cap": 2})
         );
+    }
+
+    #[test]
+    fn remote_cap_limits_admission_and_cannot_exceed_the_local_ceiling() {
+        let directory = TestDirectory::new();
+        let assignments = r#"{"assignments":[{"run":{"id":"arun_a","issue_id":"iss_a"},"prompt":"a","bundle":{},"run_key":"key-a","timeout_minutes":30},{"run":{"id":"arun_b","issue_id":"iss_b"},"prompt":"b","bundle":{},"run_key":"key-b","timeout_minutes":30}],"cancels":[],"concurrency_control":{"version":1,"available":true,"revision":2,"cap":1,"ceiling":2}}"#;
+        let empty = r#"{"assignments":[],"cancels":[],"concurrency_control":{"version":1,"available":true,"revision":2,"cap":1,"ceiling":2}}"#;
+        let (url, server) = mock_server(vec![(200, assignments), (200, empty)]);
+        let mut poller = poller_with_concurrency(&directory, &url, true, 2);
+        let successful_polls = Cell::new(0);
+        let accepted = Cell::new(0);
+        let declined = Cell::new(0);
+        poller
+            .run_with(
+                |response, state| {
+                    for assignment in &response.assignments {
+                        match state.admit_assignment(assignment.run.id.clone()) {
+                            super::AssignmentAdmission::Accepted => {
+                                accepted.set(accepted.get() + 1);
+                            }
+                            super::AssignmentAdmission::AlreadyOwned => {}
+                            super::AssignmentAdmission::AtCapacity => {
+                                declined.set(declined.get() + 1);
+                                state.decline_assignment(assignment.run.id.clone());
+                            }
+                        }
+                    }
+                    successful_polls.set(successful_polls.get() + 1);
+                },
+                || successful_polls.get() < 2,
+                |_| {},
+            )
+            .expect("apply remote cap under local ceiling");
+
+        let requests = server.join().expect("mock server requests");
+        assert_eq!(accepted.get(), 1);
+        assert_eq!(declined.get(), 1);
+        assert_eq!(poller.state().effective_concurrency(), 1);
+        assert_eq!(poller.state().active_run_count(), 1);
+        assert_eq!(requests[0]["max_concurrent"], 2);
+        assert_eq!(requests[1]["max_concurrent"], 2);
+        assert_eq!(requests[1]["owned_runs"], serde_json::json!(["arun_a"]));
+        assert_eq!(
+            requests[1]["declined_assignments"],
+            serde_json::json!(["arun_b"])
+        );
+        assert_eq!(
+            requests[1]["concurrency_control"]["applied"],
+            serde_json::json!({"revision": 2, "cap": 1})
+        );
+    }
+
+    #[test]
+    fn remote_cap_above_local_ceiling_is_rejected() {
+        let directory = TestDirectory::new();
+        let response = r#"{"assignments":[],"cancels":[],"concurrency_control":{"version":1,"available":true,"revision":3,"cap":3,"ceiling":4}}"#;
+        let (url, server) = mock_server(vec![(200, response)]);
+        let mut poller = poller_with_concurrency(&directory, &url, true, 2);
+        let error = poller
+            .run_with(
+                |_, _| panic!("invalid remote cap must not reach assignment handling"),
+                || true,
+                |_| panic!("invalid remote cap must not retry"),
+            )
+            .expect_err("remote cap must not exceed the local ceiling");
+        assert!(error.to_string().contains("invalid concurrency-control"));
+        assert_eq!(server.join().expect("mock server request").len(), 1);
+        assert_eq!(poller.state().effective_concurrency(), 2);
     }
 
     #[test]

@@ -55,9 +55,43 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
             let fresh_capabilities = response
                 .assignments
                 .iter()
-                .any(|assignment| assignment.effort.is_some())
+                .any(|assignment| {
+                    assignment.effort.is_some()
+                        && !response
+                            .released_assignments
+                            .contains(&assignment.run.id)
+                })
                 .then(|| state.refresh_effort_capabilities(true).clone());
             for assignment in &response.assignments {
+                if response
+                    .released_assignments
+                    .contains(&assignment.run.id)
+                {
+                    tracing::info!(
+                        run_id = %assignment.run.id,
+                        "assignment was released by Tines and will not be launched"
+                    );
+                    continue;
+                }
+                match state.admit_assignment(assignment.run.id.clone()) {
+                    tines_runner_rs::poll::AssignmentAdmission::Accepted => {}
+                    tines_runner_rs::poll::AssignmentAdmission::AlreadyOwned => {
+                        tracing::info!(
+                            run_id = %assignment.run.id,
+                            "duplicate assignment delivery ignored because the run is already owned"
+                        );
+                        continue;
+                    }
+                    tines_runner_rs::poll::AssignmentAdmission::AtCapacity => {
+                        tracing::warn!(
+                            run_id = %assignment.run.id,
+                            concurrency = state.effective_concurrency(),
+                            "assignment declined because all local concurrency slots are in use"
+                        );
+                        state.decline_assignment(assignment.run.id.clone());
+                        continue;
+                    }
+                }
                 if assignment.effort.is_some() {
                     let capabilities = fresh_capabilities
                         .as_ref()
