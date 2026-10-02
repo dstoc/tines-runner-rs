@@ -4,6 +4,7 @@ pub mod codex;
 pub mod config;
 pub mod credentials;
 pub mod logging;
+pub mod poll;
 pub mod process;
 pub mod protocol;
 pub mod runner;

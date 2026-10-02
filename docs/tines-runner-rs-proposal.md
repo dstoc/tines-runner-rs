@@ -119,6 +119,7 @@ workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
 wrapper = ["some-wrapper", "--"]
 max_concurrent = 1
 poll_interval_seconds = 15
+allow_remote_concurrency = false
 
 [storage]
 credentials_file = "~/.config/tines-runner-rs/credentials.toml"

@@ -49,7 +49,34 @@ pub struct RunnerPollRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_control: Option<RunnerConcurrencyReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_acks: Option<Vec<RunnerCancellationAck>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declined_assignments: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub draining: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerConcurrencyReport {
+    pub version: u8,
+    pub allow_remote: bool,
+    pub ceiling: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<RunnerConcurrencyApplied>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerConcurrencyApplied {
+    pub revision: u64,
+    pub cap: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerCancellationAck {
+    pub run_id: String,
+    pub token: String,
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
@@ -58,6 +85,25 @@ pub struct RunnerPollResponse {
     pub assignments: Vec<RunnerAssignment>,
     #[serde(default)]
     pub cancels: Vec<String>,
+    #[serde(default)]
+    pub cancel_requests: Vec<RunnerCancellationAck>,
+    #[serde(default)]
+    pub cancellation_acks: Vec<RunnerCancellationAck>,
+    #[serde(default)]
+    pub released_assignments: Vec<String>,
+    #[serde(default)]
+    pub concurrency_control: Option<RunnerConcurrencyInstruction>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RunnerConcurrencyInstruction {
+    pub version: u8,
+    pub available: bool,
+    pub revision: u64,
+    pub cap: u32,
+    pub ceiling: Option<u32>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Deserialize, PartialEq)]

@@ -175,6 +175,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     .expect("write runner config");
 
     let mut first_start = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    first_start.arg("--check");
     directory.configure_command(&mut first_start);
     let first_start = first_start
         .env("TINES_API_KEY", "bootstrap-key-test")
@@ -235,6 +236,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     )
     .expect("update runner config for restart");
     let mut second_start = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    second_start.arg("--check");
     directory.configure_command(&mut second_start);
     let second_start = second_start
         .env_remove("TINES_API_KEY")
@@ -286,6 +288,7 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
     .expect("write runner config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command.arg("--check");
     directory.configure_command(&mut command);
     let output = command
         .env("TINES_API_KEY", "must-not-be-used")
@@ -342,6 +345,7 @@ fn startup_fails_when_tines_is_unavailable() {
     .expect("write runner config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command.arg("--check");
     directory.configure_command(&mut command);
     let output = command
         .env_remove("TINES_API_KEY")

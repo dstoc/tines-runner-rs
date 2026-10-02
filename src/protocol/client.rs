@@ -66,6 +66,24 @@ impl ClientError {
         }
     }
 
+    fn http_response(status: StatusCode, body: &serde_json::Value) -> Self {
+        // The current server uses 409 for both takeover fencing and a
+        // retryable policy-reconciliation race. The message is the only
+        // distinction in that protocol response.
+        let retryable_policy_race = status == StatusCode::CONFLICT
+            && body["error"]["message"].as_str().is_some_and(|message| {
+                message == "runner policy changed during poll reconciliation; retry the poll"
+            });
+        Self {
+            category: if retryable_policy_race {
+                ErrorCategory::Retryable
+            } else {
+                classify_http_status(status)
+            },
+            status: Some(status),
+        }
+    }
+
     pub fn category(self) -> ErrorCategory {
         self.category
     }
@@ -242,7 +260,9 @@ impl Client {
     ) -> Result<T, ClientError> {
         let response = self.send(request, bearer_token)?;
         if !response.status().is_success() {
-            return Err(ClientError::http_status(response.status()));
+            let status = response.status();
+            let body = response.json::<serde_json::Value>().unwrap_or_default();
+            return Err(ClientError::http_response(status, &body));
         }
         response
             .json::<T>()
@@ -315,6 +335,31 @@ mod tests {
         ] {
             assert_eq!(classify_http_status(status), ErrorCategory::Protocol);
         }
+    }
+
+    #[test]
+    fn retries_the_server_policy_race_but_treats_daemon_conflict_as_fencing() {
+        let retry = super::ClientError::http_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({
+                "error": {
+                    "code": "runner_conflict",
+                    "message": "runner policy changed during poll reconciliation; retry the poll"
+                }
+            }),
+        );
+        assert_eq!(retry.category(), ErrorCategory::Retryable);
+
+        let fenced = super::ClientError::http_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({
+                "error": {
+                    "code": "runner_conflict",
+                    "message": "another daemon instance is serving this runner; this one has been superseded"
+                }
+            }),
+        );
+        assert_eq!(fenced.category(), ErrorCategory::Fencing);
     }
 
     #[test]
@@ -420,6 +465,9 @@ mod tests {
                     instance_id: Some("boot-1".into()),
                     owned_runs: Vec::new(),
                     max_concurrent: None,
+                    concurrency_control: None,
+                    cancellation_acks: None,
+                    declined_assignments: None,
                     draining: None,
                 },
             )

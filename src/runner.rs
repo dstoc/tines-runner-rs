@@ -116,6 +116,10 @@ impl RunnerConnection {
             RunnerError::RejectedRunnerToken {
                 runner_id: self.credentials.runner_id().to_owned(),
             }
+        } else if error.category() == ErrorCategory::Fencing {
+            RunnerError::Superseded {
+                runner_id: self.credentials.runner_id().to_owned(),
+            }
         } else {
             RunnerError::Protocol(error)
         }
@@ -162,6 +166,7 @@ pub enum RunnerError {
     InvalidConcurrency(usize),
     InvalidRegistrationResponse,
     RejectedRunnerToken { runner_id: String },
+    Superseded { runner_id: String },
     Protocol(ClientError),
 }
 
@@ -185,6 +190,10 @@ impl fmt::Display for RunnerError {
                 f,
                 "Tines rejected the runner token for runner {runner_id}; stopped without falling back to TINES_API_KEY. Verify the credentials file and register the runner again if needed."
             ),
+            Self::Superseded { runner_id } => write!(
+                f,
+                "Tines superseded this daemon for runner {runner_id}; exiting"
+            ),
             Self::Protocol(error) => write!(f, "Tines runner protocol request failed: {error}"),
         }
     }
@@ -201,6 +210,7 @@ impl Error for RunnerError {
             Self::InvalidConcurrency(_)
             | Self::InvalidRegistrationResponse
             | Self::RejectedRunnerToken { .. } => None,
+            Self::Superseded { .. } => None,
         }
     }
 }
