@@ -5,11 +5,12 @@ use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
+use crate::assignment::ResolvedAssignment;
 use crate::config::Config;
 use crate::protocol::client::ErrorCategory;
 use crate::protocol::{
-    RunnerAssignment, RunnerCancellationAck, RunnerConcurrencyApplied, RunnerConcurrencyReport,
-    RunnerPollRequest, RunnerPollResponse,
+    RunnerCancellationAck, RunnerConcurrencyApplied, RunnerConcurrencyReport, RunnerPollRequest,
+    RunnerPollResponse,
 };
 use crate::runner::{RunnerConnection, RunnerError};
 
@@ -25,7 +26,7 @@ pub struct PollState {
     owned_runs: BTreeSet<String>,
     cancellation_acks: BTreeMap<String, String>,
     declined_assignments: BTreeSet<String>,
-    pending_assignments: BTreeMap<String, RunnerAssignment>,
+    pending_assignments: BTreeMap<String, ResolvedAssignment>,
     allow_remote_concurrency: bool,
     local_ceiling: u32,
     effective_concurrency: u32,
@@ -77,7 +78,9 @@ impl PollState {
     /// Decline an assignment that the executor cannot launch. Tines will
     /// return its ID in `released_assignments` once it is safe to forget.
     pub fn decline_assignment(&mut self, run_id: impl Into<String>) {
-        self.declined_assignments.insert(run_id.into());
+        let run_id = run_id.into();
+        self.pending_assignments.remove(&run_id);
+        self.declined_assignments.insert(run_id);
     }
 
     /// Set the flag used by later graceful-shutdown integration.
@@ -90,13 +93,19 @@ impl PollState {
         self.effective_concurrency
     }
 
-    /// Assignments delivered by Tines and not yet claimed by an executor.
-    pub fn pending_assignments(&self) -> impl Iterator<Item = &RunnerAssignment> {
+    /// Resolved assignments delivered by Tines and not yet claimed by an executor.
+    pub fn pending_assignments(&self) -> impl Iterator<Item = &ResolvedAssignment> {
         self.pending_assignments.values()
     }
 
-    /// Remove an assignment from the pending queue when an executor claims it.
-    pub fn take_assignment(&mut self, run_id: &str) -> Option<RunnerAssignment> {
+    /// Queue an assignment after its match context and config have resolved.
+    pub fn queue_assignment(&mut self, assignment: ResolvedAssignment) {
+        self.pending_assignments
+            .insert(assignment.assignment().run.id.clone(), assignment);
+    }
+
+    /// Remove a resolved assignment from the pending queue when an executor claims it.
+    pub fn take_assignment(&mut self, run_id: &str) -> Option<ResolvedAssignment> {
         self.pending_assignments.remove(run_id)
     }
 
@@ -147,10 +156,6 @@ impl PollState {
         for canceled in &response.cancels {
             self.pending_assignments.remove(canceled);
         }
-        for assignment in &response.assignments {
-            self.pending_assignments
-                .insert(assignment.run.id.clone(), assignment.clone());
-        }
         if let Some(control) = &response.concurrency_control {
             if control.available {
                 self.effective_concurrency = control.cap;
@@ -192,9 +197,9 @@ impl PollLoop {
     }
 
     /// Poll until `should_continue` returns false. The handler receives every
-    /// successful response and can update local ownership after launching or
-    /// cleaning up child processes. Retryable failures use exponential
-    /// backoff and leave that ownership state untouched.
+    /// successful response and can queue resolved assignments or update local
+    /// ownership after launching or cleaning up child processes. Retryable
+    /// failures use exponential backoff and leave that ownership state untouched.
     pub fn run_with<H, C, S>(
         &mut self,
         mut handle_response: H,
@@ -401,7 +406,6 @@ mod tests {
             .expect("poll assignment");
         let requests = server.join().expect("mock server");
         assert_eq!(assignment_count.get(), 1);
-        assert_eq!(poller.state().pending_assignments().count(), 1);
         assert_eq!(poller.state().effective_concurrency(), 2);
         assert_eq!(requests[0]["instance_id"], boot);
         assert_eq!(requests[0]["owned_runs"], serde_json::json!([]));

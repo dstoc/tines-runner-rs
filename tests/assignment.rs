@@ -1,12 +1,43 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tines_runner_rs::assignment::resolve_assignment;
 use tines_runner_rs::config::Config;
+use tines_runner_rs::credentials::{CredentialStore, RunnerCredentials};
+use tines_runner_rs::poll::PollLoop;
 use tines_runner_rs::protocol::RunnerAssignment;
 use tines_runner_rs::protocol::client::Client;
+use tines_runner_rs::runner::RunnerConnection;
+
+static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "tines-runner-assignment-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn credentials_path(&self) -> PathBuf {
+        self.0.join("credentials.toml")
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn assignment() -> RunnerAssignment {
     serde_json::from_value(serde_json::json!({
@@ -49,7 +80,17 @@ fn read_request(stream: &mut TcpStream) -> String {
         let count = stream.read(&mut chunk).expect("read request");
         assert_ne!(count, 0, "client closed before completing request");
         request.extend_from_slice(&chunk[..count]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).expect("request headers");
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if request.len() >= header_end + 4 + content_length {
             return String::from_utf8(request).expect("request is UTF-8");
         }
     }
@@ -86,6 +127,116 @@ fn issue_server(count: usize) -> (String, JoinHandle<Vec<String>>) {
         200,
         r#"{"id":"iss_assignment_test","workflow":{"name":"Implementation"}}"#,
     )
+}
+
+fn assignment_poll_server() -> (String, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Tines server");
+    let address = listener.local_addr().expect("read mock address");
+    let server = thread::spawn(move || {
+        let (mut poll_stream, _) = listener.accept().expect("accept runner poll");
+        let poll_request = read_request(&mut poll_stream);
+        let poll_response = r#"{"assignments":[{"run":{"id":"arun_queued_assignment","issue_id":"iss_assignment_test","issue_ref":{"project_name":"Tines","number":7,"title":"Resolve assignment config"},"state_at_start_name":"Implement"},"prompt":"queued prompt","bundle":{"source":"test"},"run_key":"ephemeral-run-key","timeout_minutes":30}],"cancels":[]}"#;
+        write!(
+            poll_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{poll_response}",
+            poll_response.len()
+        )
+        .expect("write poll response");
+
+        let (mut issue_stream, _) = listener.accept().expect("accept issue detail request");
+        let issue_request = read_request(&mut issue_stream);
+        let issue_response = r#"{"id":"iss_assignment_test","workflow":{"name":"Implementation"}}"#;
+        write!(
+            issue_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{issue_response}",
+            issue_response.len()
+        )
+        .expect("write issue detail response");
+        vec![poll_request, issue_request]
+    });
+    (format!("http://{address}"), server)
+}
+
+#[test]
+fn poll_queue_retains_resolved_context_config_and_original_assignment() {
+    let directory = TestDirectory::new();
+    let store = CredentialStore::at(directory.credentials_path());
+    store
+        .save(&RunnerCredentials::new(
+            "rnr_assignment_test",
+            "runner-token",
+        ))
+        .expect("store runner token");
+    let (server_url, server) = assignment_poll_server();
+    let config = Config::from_toml_str(&format!(
+        r#"
+            [server]
+            url = "{server_url}"
+            [runner]
+            name = "assignment-test"
+            wrapper = ["base-wrapper"]
+            [[override]]
+            project = "TINES"
+            workflow = "IMPLEMENTATION"
+            state = "IMPLEMENT"
+            wrapper = ["combined-wrapper"]
+            [storage]
+            credentials_file = {:?}
+        "#,
+        store.path()
+    ))
+    .expect("parse runner config");
+    let connection = RunnerConnection::connect(&config).expect("load runner connection");
+    let issue_client =
+        Client::with_timeout(&server_url, Duration::from_secs(5)).expect("create issue client");
+    let mut poller = PollLoop::new(connection, &config);
+    let polls = std::cell::Cell::new(0);
+    poller
+        .run_with(
+            |response, state| {
+                for assignment in &response.assignments {
+                    let resolved = resolve_assignment(&config, &issue_client, assignment)
+                        .expect("resolve assignment before queueing");
+                    state.queue_assignment(resolved);
+                }
+                polls.set(polls.get() + 1);
+            },
+            || polls.get() == 0,
+            |_| panic!("one poll should finish without sleeping"),
+        )
+        .expect("poll and resolve assignment");
+
+    let requests = server.join().expect("join mock Tines server");
+    assert!(requests[0].starts_with("POST /api/v1/runners/rnr_assignment_test/poll HTTP/1.1"));
+    assert!(requests[1].starts_with("GET /api/v1/issues/iss_assignment_test HTTP/1.1"));
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer ephemeral-run-key")
+    );
+
+    let queued = poller
+        .state()
+        .pending_assignments()
+        .next()
+        .cloned()
+        .expect("resolved assignment remains queued");
+    assert_eq!(queued.assignment().run.id, "arun_queued_assignment");
+    assert_eq!(queued.assignment().prompt, "queued prompt");
+    assert_eq!(queued.context().project(), "Tines");
+    assert_eq!(queued.context().workflow(), "Implementation");
+    assert_eq!(queued.context().state(), "Implement");
+    assert_eq!(queued.resolution().config.wrapper, ["combined-wrapper"]);
+    assert_eq!(queued.resolution().matching_overrides(), [0]);
+    assert!(!format!("{queued:?}").contains("ephemeral-run-key"));
+
+    let claimed = poller
+        .state_mut()
+        .take_assignment("arun_queued_assignment")
+        .expect("executor can take resolved assignment");
+    assert_eq!(claimed.context(), queued.context());
+    assert_eq!(claimed.resolution(), queued.resolution());
+    assert_eq!(claimed.assignment().run_key, "ephemeral-run-key");
 }
 
 #[test]

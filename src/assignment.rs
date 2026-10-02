@@ -40,14 +40,20 @@ impl AssignmentMatchContext {
     }
 }
 
-/// Assignment match metadata and the effective config resolved from it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The original protocol assignment, match metadata, and effective config.
+#[derive(Clone, PartialEq)]
 pub struct ResolvedAssignment {
+    assignment: RunnerAssignment,
     context: AssignmentMatchContext,
     resolution: ConfigResolution,
 }
 
 impl ResolvedAssignment {
+    /// The original protocol assignment, including its run payload.
+    pub fn assignment(&self) -> &RunnerAssignment {
+        &self.assignment
+    }
+
     pub fn context(&self) -> &AssignmentMatchContext {
         &self.context
     }
@@ -56,6 +62,18 @@ impl ResolvedAssignment {
         &self.resolution
     }
 }
+
+impl fmt::Debug for ResolvedAssignment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedAssignment")
+            .field("run_id", &self.assignment.run.id)
+            .field("context", &self.context)
+            .field("resolution", &self.resolution)
+            .finish()
+    }
+}
+
+impl Eq for ResolvedAssignment {}
 
 /// An error while building match metadata or resolving assignment config.
 #[derive(Debug)]
@@ -160,6 +178,7 @@ pub fn resolve_assignment(
     };
     let resolution = config.resolve_with_matches(context.as_config_context());
     Ok(ResolvedAssignment {
+        assignment: assignment.clone(),
         context,
         resolution,
     })

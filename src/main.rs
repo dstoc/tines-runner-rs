@@ -57,14 +57,17 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     &issue_client,
                     assignment,
                 ) {
-                    Ok(resolved) => tracing::info!(
-                        run_id = %assignment.run.id,
-                        project = resolved.context().project(),
-                        workflow = resolved.context().workflow(),
-                        state = resolved.context().state(),
-                        matched_overrides = ?resolved.resolution().matching_overrides(),
-                        "assignment configuration resolved and queued"
-                    ),
+                    Ok(resolved) => {
+                        tracing::info!(
+                            run_id = %assignment.run.id,
+                            project = resolved.context().project(),
+                            workflow = resolved.context().workflow(),
+                            state = resolved.context().state(),
+                            matched_overrides = ?resolved.resolution().matching_overrides(),
+                            "assignment configuration resolved and queued"
+                        );
+                        state.queue_assignment(resolved);
+                    }
                     Err(error) => {
                         state.decline_assignment(assignment.run.id.clone());
                         tracing::error!(
