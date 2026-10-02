@@ -22,6 +22,7 @@ const MAX_REGISTERED_CONCURRENCY: usize = 100;
 /// The session holds the runner token in memory and uses it for runner
 /// protocol requests. The bootstrap user API key is used only during first
 /// registration and is never retained by this type.
+#[derive(Clone)]
 pub struct RunnerConnection {
     client: Client,
     credentials: RunnerCredentials,

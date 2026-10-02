@@ -126,6 +126,7 @@ pub fn classify_http_status(status: StatusCode) -> ErrorCategory {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     base_url: Url,
     http: HttpClient,

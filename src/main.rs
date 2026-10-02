@@ -1,6 +1,9 @@
 use clap::Parser;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use tines_runner_rs::protocol::client::RunLogBuffer;
 
 #[derive(Debug, Parser)]
@@ -47,10 +50,14 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     }
 
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
+    let execution_connection = connection.clone();
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
-    poller.run_with(
+    let mut workers: BTreeMap<String, JoinHandle<Result<(), String>>> = BTreeMap::new();
+    let fatal_error = Arc::new(Mutex::new(None::<String>));
+    let loop_fatal_error = Arc::clone(&fatal_error);
+    let poll_result = poller.run_with(
         |response, state| {
             let fresh_capabilities = response
                 .assignments
@@ -155,12 +162,58 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                             workspace = %workspace.path().display(),
                             "assignment workspace materialized and queued"
                         );
+                        let run_id = assignment.run.id.clone();
                         state.queue_assignment(
                             tines_runner_rs::assignment::PreparedAssignment::new(
                                 resolved, workspace,
                             )
                             .with_run_log_buffer(run_logs),
                         );
+                        let Some(prepared) = state.take_assignment(&run_id) else {
+                            continue;
+                        };
+                        let capabilities = state.refresh_effort_capabilities(false).clone();
+                        let worker_capabilities = capabilities.clone();
+                        let worker_assignment = prepared.clone();
+                        let worker_connection = execution_connection.clone();
+                        let worker_client = issue_client.clone();
+                        match thread::Builder::new()
+                            .name(format!("runner-run-{}", run_id))
+                            .spawn(move || {
+                                tines_runner_rs::execution::execute_assignment(
+                                    worker_assignment,
+                                    &worker_connection,
+                                    &worker_client,
+                                    &worker_capabilities,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                        {
+                            Ok(worker) => {
+                                workers.insert(run_id, worker);
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    run_id,
+                                    error = %error,
+                                    "could not start assignment executor thread; executing on poll thread"
+                                );
+                                match tines_runner_rs::execution::execute_assignment(
+                                    prepared,
+                                    &execution_connection,
+                                    &issue_client,
+                                    &capabilities,
+                                ) {
+                                    Ok(()) => state.release_run(&run_id),
+                                    Err(error) => {
+                                        *fatal_error
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some(error.to_string());
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
                         state.decline_assignment(assignment.run.id.clone());
@@ -188,10 +241,69 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     "runner concurrency policy updated"
                 );
             }
+
+            let completed = workers
+                .iter()
+                .filter(|(_, worker)| worker.is_finished())
+                .map(|(run_id, _)| run_id.clone())
+                .collect::<Vec<_>>();
+            for run_id in completed {
+                let Some(worker) = workers.remove(&run_id) else {
+                    continue;
+                };
+                match worker.join() {
+                    Ok(Ok(())) => state.release_run(&run_id),
+                    Ok(Err(error)) => {
+                        tracing::error!(run_id, error, "assignment execution did not settle");
+                        *fatal_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                    }
+                    Err(_) => {
+                        let error = "assignment executor thread panicked".to_owned();
+                        tracing::error!(run_id, error, "assignment execution did not settle");
+                        *fatal_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                    }
+                }
+            }
         },
-        || true,
+        || {
+            loop_fatal_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        },
         std::thread::sleep,
-    )?;
+    );
+
+    for (run_id, worker) in workers {
+        match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(run_id, error, "assignment execution did not settle");
+                *fatal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+            }
+            Err(_) => {
+                let error = "assignment executor thread panicked".to_owned();
+                tracing::error!(run_id, error, "assignment execution did not settle");
+                *fatal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+            }
+        }
+    }
+    poll_result?;
+    if let Some(error) = fatal_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Err(std::io::Error::other(error).into());
+    }
 
     Ok(())
 }
