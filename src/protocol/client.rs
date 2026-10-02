@@ -365,6 +365,7 @@ struct RunLogShared {
     state: Mutex<RunLogState>,
     send_lock: Mutex<()>,
     stopped: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 struct RunLogState {
@@ -397,6 +398,7 @@ impl RunLogBuffer {
                 }),
                 send_lock: Mutex::new(()),
                 stopped: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
             }),
         }
     }
@@ -566,12 +568,18 @@ impl RunLogBuffer {
 
     /// Stop delivery after supervisor cancellation or settlement.
     pub fn stop_sending(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
         self.shared.stopped.store(true, Ordering::Release);
     }
 
     /// Whether this run's log stream has been stopped.
     pub fn is_stopped(&self) -> bool {
         self.shared.stopped.load(Ordering::Acquire)
+    }
+
+    /// Whether Tines canceled or settled this run's log stream.
+    pub fn is_cancelled(&self) -> bool {
+        self.shared.cancelled.load(Ordering::Acquire)
     }
 
     fn drain(
@@ -642,8 +650,8 @@ impl RunLogBuffer {
                     consecutive_failures = 0;
                 }
                 Err(error) if error.category() == ErrorCategory::Retryable => {
-                    let remaining = deadline
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                    let remaining =
+                        deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
                     if remaining.is_some_and(|remaining| remaining.is_zero()) {
                         return Err(error);
                     }
@@ -664,31 +672,6 @@ impl RunLogBuffer {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    fn flush_preparation_output_until(
-        &mut self,
-        client: &Client,
-        run_id: &str,
-        runner_token: &str,
-        deadline: std::time::Instant,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let mut last_response = None;
-        while let Some(preparation_chunk) = self.preparation_chunks.front() {
-            let response = client.append_run_log_until(
-                run_id,
-                runner_token,
-                &AppendRunLogRequest {
-                    chunk: preparation_chunk.clone(),
-                    seq: Some(self.next_seq),
-                },
-                deadline,
-            )?;
-            self.preparation_chunks.pop_front();
-            self.next_seq = response.log_seq.saturating_add(1);
-            last_response = Some(response);
-        }
-        Ok(last_response)
     }
 }
 

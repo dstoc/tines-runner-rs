@@ -131,6 +131,9 @@ impl PollState {
         let run_id = run_id.into();
         self.owned_runs.remove(&run_id);
         self.pending_assignments.remove(&run_id);
+        if let Some(logs) = self.active_log_streams.remove(&run_id) {
+            logs.stop_sending();
+        }
         self.declined_assignments.insert(run_id);
     }
 
@@ -255,6 +258,14 @@ impl PollState {
                 logs.stop_sending();
             }
             if let Some(assignment) = self.pending_assignments.remove(canceled) {
+                assignment.stop_log_delivery();
+            }
+        }
+        for request in &response.cancel_requests {
+            if let Some(logs) = self.active_log_streams.get(&request.run_id) {
+                logs.stop_sending();
+            }
+            if let Some(assignment) = self.pending_assignments.remove(&request.run_id) {
                 assignment.stop_log_delivery();
             }
         }
@@ -413,8 +424,8 @@ mod tests {
     use crate::config::Config;
     use crate::credentials::{CredentialStore, RunnerCredentials};
     use crate::effort::{EffortCapabilities, EffortModelCapability};
-    use crate::protocol::RunnerPollResponse;
     use crate::protocol::client::RunLogBuffer;
+    use crate::protocol::{RunnerCancellationAck, RunnerPollResponse};
     use crate::runner::RunnerConnection;
     use serde_json::Value;
     use std::cell::Cell;
@@ -573,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_cancellation_stops_the_active_run_log_stream() {
+    fn supervisor_cancellation_stops_active_run_log_streams() {
         let directory = TestDirectory::new();
         let mut state = PollState::new(&config(
             "http://127.0.0.1:1",
@@ -581,13 +592,18 @@ mod tests {
             true,
         ));
         let logs = RunLogBuffer::new();
+        let requested_logs = RunLogBuffer::new();
         state.own_run_with_logs("arun_live", logs.clone());
+        state.own_run_with_logs("arun_cancel_requested", requested_logs.clone());
 
         state
             .observe(&RunnerPollResponse {
                 assignments: Vec::new(),
                 cancels: vec!["arun_live".to_owned()],
-                cancel_requests: Vec::new(),
+                cancel_requests: vec![RunnerCancellationAck {
+                    run_id: "arun_cancel_requested".to_owned(),
+                    token: "cancel-token".to_owned(),
+                }],
                 cancellation_acks: Vec::new(),
                 released_assignments: Vec::new(),
                 concurrency_control: None,
@@ -595,6 +611,9 @@ mod tests {
             .expect("valid cancellation response");
 
         assert!(logs.is_stopped());
+        assert!(logs.is_cancelled());
+        assert!(requested_logs.is_stopped());
+        assert!(requested_logs.is_cancelled());
         state.release_run("arun_live");
         assert!(!state.owned_runs.contains("arun_live"));
     }

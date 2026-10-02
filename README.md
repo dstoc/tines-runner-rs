@@ -6,7 +6,8 @@ The crate has no dependency on the Tines monorepo or `@tines/shared`.
 The executable loads the runner configuration, registers or loads saved runner
 credentials, and polls Tines for assignments until it is stopped. Use
 `--check` to validate configuration and credentials without entering the poll
-loop. The runner executes assignments in isolated workspaces using Codex.
+loop. The runner executes assignments in isolated workspaces using Codex and
+reports Codex output and run status to Tines.
 
 ## Build and run
 

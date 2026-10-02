@@ -25,6 +25,7 @@ pub fn run_assignment(
     connection: &RunnerConnection,
     issue_client: &Client,
     assignment: RunnerAssignment,
+    run_logs: crate::protocol::client::RunLogBuffer,
     advertised_capabilities: &EffortCapabilities,
     cancellation: &CancellationToken,
 ) -> Result<AssignmentTaskOutcome, String> {
@@ -53,7 +54,6 @@ pub fn run_assignment(
         return Ok(AssignmentTaskOutcome::Cancelled);
     }
 
-    let mut run_logs = crate::protocol::client::RunLogBuffer::new();
     let workspace = match MaterializedWorkspace::create_cancellable_with_git_log(
         &resolved.resolution().config.workspace_parent,
         resolved.assignment(),
@@ -84,6 +84,7 @@ pub fn run_assignment(
             return execution::report_preparation_failure(
                 connection,
                 &assignment.run.id,
+                &run_logs,
                 &failure,
                 cancellation,
             )

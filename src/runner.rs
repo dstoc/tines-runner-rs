@@ -156,16 +156,31 @@ impl RunnerConnection {
     ) -> Result<FinishRunResponse, RunnerError> {
         logs.flush_before_finish(&self.client, run_id, self.credentials.runner_token())
             .map_err(|error| self.protocol_error(error))?;
-        self.client
-            .finish_run(
-                run_id,
-                self.credentials.runner_token(),
-                &FinishRunRequest {
-                    status,
-                    error: error.map(str::to_owned),
-                },
-            )
-            .map_err(|error| self.protocol_error(error))
+        self.finish_assignment(
+            run_id,
+            &FinishRunRequest {
+                status,
+                error: error.map(str::to_owned),
+                provider_session_id: None,
+                usage: None,
+                pricing_evidence: None,
+            },
+        )
+    }
+
+    /// Flush logs before reporting a finish request with provider evidence.
+    pub fn finish_assignment_with_logs(
+        &self,
+        run_id: &str,
+        logs: &RunLogBuffer,
+        request: &FinishRunRequest,
+    ) -> Result<Option<FinishRunResponse>, RunnerError> {
+        logs.flush_before_finish(&self.client, run_id, self.credentials.runner_token())
+            .map_err(|error| self.protocol_error(error))?;
+        if logs.is_cancelled() {
+            return Ok(None);
+        }
+        self.finish_assignment(run_id, request).map(Some)
     }
 
     fn protocol_error(&self, error: ClientError) -> RunnerError {

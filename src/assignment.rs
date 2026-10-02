@@ -56,6 +56,15 @@ impl PreparedAssignment {
         self.resolved.assignment()
     }
 
+    /// Return the shared log stream for execution and supervisor coordination.
+    pub fn run_log_buffer(&self) -> RunLogBuffer {
+        self.run_logs.clone()
+    }
+
+    pub fn log_delivery_cancelled(&self) -> bool {
+        self.run_logs.is_cancelled()
+    }
+
     /// Flush workspace logs after the process launcher confirms a successful
     /// harness start. Call this before waiting for output so quiet processes
     /// leave `launching` even when checkout produced no logs.
@@ -74,7 +83,7 @@ impl PreparedAssignment {
         client: &Client,
         runner_token: &str,
         deadline: Instant,
-    ) -> Result<AppendRunLogResponse, ClientError> {
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         let run_id = self.assignment().run.id.clone();
         self.run_logs
             .harness_started_until(client, &run_id, runner_token, deadline)
