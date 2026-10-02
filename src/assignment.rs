@@ -44,6 +44,18 @@ impl PreparedAssignment {
         self.resolved.assignment()
     }
 
+    /// Flush workspace logs after the process launcher confirms a successful
+    /// harness start. Call this before waiting for output so quiet processes
+    /// leave `launching` even when checkout produced no logs.
+    pub fn harness_started(
+        &mut self,
+        client: &Client,
+        runner_token: &str,
+    ) -> Result<AppendRunLogResponse, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs.harness_started(client, &run_id, runner_token)
+    }
+
     /// Append harness output and flush buffered workspace output first.
     pub fn append_harness_output(
         &mut self,
