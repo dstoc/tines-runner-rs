@@ -234,6 +234,8 @@ MatchContext {
 
 The state-at-start name is preferred over the issue's current state because it identifies the stage that caused the run to be launched.
 
+At runtime, the runner validates these required names and stores them in an owned match context before resolving overrides. It logs the project, workflow, state, and indexes of matching override entries. It does not log the run key or resolved execution values. If required metadata is missing or the issue-detail request fails, the runner logs the reason and declines the assignment.
+
 There is a small race in the workaround: the issue-detail response contains the issue's current workflow, while the state name comes from the immutable run-start snapshot. If a human changes the issue workflow between dispatch and the lookup, the two names could describe different moments. This is acceptable for the initial implementation.
 
 A future additive Tines protocol change could place an immutable `{ workflow_name, state_name }` launch-stage snapshot directly on `RunnerAssignment`, removing both the extra request and the race. That change is not required for this proposal.

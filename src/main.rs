@@ -45,13 +45,38 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
     poller.run_with(
         |response, state| {
             for assignment in &response.assignments {
-                tracing::info!(run_id = %assignment.run.id, "assignment received and queued");
+                match tines_runner_rs::assignment::resolve_assignment(
+                    &config,
+                    &issue_client,
+                    assignment,
+                ) {
+                    Ok(resolved) => {
+                        tracing::info!(
+                            run_id = %assignment.run.id,
+                            project = resolved.context().project(),
+                            workflow = resolved.context().workflow(),
+                            state = resolved.context().state(),
+                            matched_overrides = ?resolved.resolution().matching_overrides(),
+                            "assignment configuration resolved and queued"
+                        );
+                        state.queue_assignment(resolved);
+                    }
+                    Err(error) => {
+                        state.decline_assignment(assignment.run.id.clone());
+                        tracing::error!(
+                            run_id = %assignment.run.id,
+                            error = %error,
+                            "assignment declined because required configuration metadata is unavailable"
+                        );
+                    }
+                }
             }
             for run_id in &response.cancels {
                 tracing::warn!(
