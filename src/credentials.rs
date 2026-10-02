@@ -65,6 +65,11 @@ impl BootstrapKey {
         let key = value
             .into_string()
             .map_err(|_| BootstrapKeyError::NotUnicode)?;
+        Self::from_value(key)
+    }
+
+    pub(crate) fn from_value(value: impl Into<String>) -> Result<Self, BootstrapKeyError> {
+        let key = value.into();
         if key.is_empty() {
             return Err(BootstrapKeyError::Empty);
         }
