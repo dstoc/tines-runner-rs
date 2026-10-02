@@ -1,0 +1,12 @@
+{
+  "request": {
+    "status": "failed",
+    "error": "harness exited with code 1"
+  },
+  "response": {
+    "id": "arun_456",
+    "issue_id": "iss_789",
+    "status": "failed",
+    "future_run_field": true
+  }
+}

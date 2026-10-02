@@ -1,0 +1,16 @@
+{
+  "request": {
+    "name": "workstation-codex",
+    "harness": "codex",
+    "max_concurrent": 1
+  },
+  "response": {
+    "runner": {
+      "id": "rnr_123",
+      "name": "workstation-codex",
+      "future_runner_field": true
+    },
+    "runner_token": "fixture-runner-token",
+    "future_response_field": true
+  }
+}
