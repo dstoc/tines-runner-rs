@@ -9,6 +9,9 @@ credentials, and polls Tines for assignments until it is stopped. Use
 loop. The runner executes assignments in isolated workspaces using Codex and
 reports Codex output and run status to Tines.
 
+For installation, configuration, first-run registration, service examples, and
+troubleshooting, see the [operator guide](docs/operation.md).
+
 ## Build and run
 
 ```sh
