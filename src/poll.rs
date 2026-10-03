@@ -36,6 +36,7 @@ pub struct PollState {
     effective_concurrency: u32,
     applied_concurrency: Option<RunnerConcurrencyApplied>,
     draining: bool,
+    draining_poll_reported: bool,
     effort_capabilities: Option<EffortCapabilities>,
     effort_capabilities_refreshed_at: Option<Instant>,
 }
@@ -66,6 +67,7 @@ impl PollState {
             effective_concurrency: config.max_concurrent as u32,
             applied_concurrency: None,
             draining: false,
+            draining_poll_reported: false,
             effort_capabilities: None,
             effort_capabilities_refreshed_at: None,
         }
@@ -79,6 +81,11 @@ impl PollState {
     /// Mark a run as locally active after its child process starts.
     pub fn own_run(&mut self, run_id: impl Into<String>) {
         self.owned_runs.insert(run_id.into());
+    }
+
+    /// Whether a run is already reserved or running on the local daemon.
+    pub fn owns_run(&self, run_id: &str) -> bool {
+        self.owned_runs.contains(run_id)
     }
 
     /// Reserve a delivered run before resolving metadata or materializing its
@@ -137,9 +144,27 @@ impl PollState {
         self.declined_assignments.insert(run_id);
     }
 
-    /// Set the flag used by later graceful-shutdown integration.
+    /// Set whether the daemon is draining and should receive no new assignments.
     pub fn set_draining(&mut self, draining: bool) {
         self.draining = draining;
+        if !draining {
+            self.draining_poll_reported = false;
+        }
+    }
+
+    /// Whether a successful poll has told Tines that this daemon is draining.
+    pub fn draining_poll_reported(&self) -> bool {
+        self.draining_poll_reported
+    }
+
+    /// Whether Tines still needs to acknowledge a declined assignment.
+    pub fn has_pending_declines(&self) -> bool {
+        !self.declined_assignments.is_empty()
+    }
+
+    /// Whether Tines still needs to accept a cancellation acknowledgement.
+    pub fn has_pending_cancellation_acks(&self) -> bool {
+        !self.cancellation_acks.is_empty()
     }
 
     /// Refresh the local Codex capability report when it expires, or before an
@@ -281,6 +306,7 @@ impl PollState {
                 self.applied_concurrency = None;
             }
         }
+        // Set by PollLoop after a successful request that included draining=true.
         Ok(())
     }
 }
@@ -315,21 +341,47 @@ impl PollLoop {
     /// failures use exponential backoff and leave that ownership state untouched.
     pub fn run_with<H, C, S>(
         &mut self,
-        mut handle_response: H,
+        handle_response: H,
         mut should_continue: C,
-        mut sleep: S,
+        sleep: S,
     ) -> Result<(), PollError>
     where
         H: FnMut(&RunnerPollResponse, &mut PollState),
         C: FnMut() -> bool,
         S: FnMut(Duration),
     {
+        self.run_controlled(|_| {}, handle_response, |_| should_continue(), sleep)
+    }
+
+    /// Poll with a state update before every request and a state-aware stop condition.
+    /// This lets shutdown report draining and continue until local ownership and
+    /// pending decline acknowledgements have been settled.
+    pub fn run_controlled<B, H, C, S>(
+        &mut self,
+        mut before_poll: B,
+        mut handle_response: H,
+        mut should_continue: C,
+        mut sleep: S,
+    ) -> Result<(), PollError>
+    where
+        B: FnMut(&mut PollState),
+        H: FnMut(&RunnerPollResponse, &mut PollState),
+        C: FnMut(&PollState) -> bool,
+        S: FnMut(Duration),
+    {
         let mut consecutive_failures = 0u32;
-        while should_continue() {
+        loop {
+            before_poll(&mut self.state);
+            if !should_continue(&self.state) {
+                break;
+            }
             self.state.refresh_effort_capabilities(false);
             let request = self.state.request();
             match self.connection.poll(&request) {
                 Ok(response) => {
+                    if request.draining == Some(true) {
+                        self.state.draining_poll_reported = true;
+                    }
                     self.state.observe(&response)?;
                     handle_response(&response, &mut self.state);
                     for (run_id, error) in self.state.assignment_failures() {
@@ -362,8 +414,15 @@ impl PollLoop {
                         }
                     }
                     consecutive_failures = 0;
-                    if should_continue() {
-                        sleep(self.interval);
+                    before_poll(&mut self.state);
+                    if should_continue(&self.state) {
+                        wait_poll_interval(
+                            self.interval,
+                            &mut before_poll,
+                            &mut should_continue,
+                            &mut sleep,
+                            &mut self.state,
+                        );
                     }
                 }
                 Err(error) if is_retryable(&error) => {
@@ -374,12 +433,71 @@ impl PollLoop {
                         backoff_seconds = delay.as_secs(),
                         "runner poll failed; retrying"
                     );
-                    sleep(delay);
+                    let delay = if self.state.draining {
+                        delay.min(Duration::from_secs(1))
+                    } else {
+                        delay
+                    };
+                    wait_retry_delay(
+                        delay,
+                        &mut before_poll,
+                        &mut should_continue,
+                        &mut sleep,
+                        &mut self.state,
+                    );
                 }
                 Err(error) => return Err(PollError::Runner(error)),
             }
         }
         Ok(())
+    }
+}
+
+fn wait_poll_interval<B, C, S>(
+    duration: Duration,
+    before_poll: &mut B,
+    should_continue: &mut C,
+    sleep: &mut S,
+    state: &mut PollState,
+) where
+    B: FnMut(&mut PollState),
+    C: FnMut(&PollState) -> bool,
+    S: FnMut(Duration),
+{
+    let was_draining = state.draining;
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        let interval = remaining.min(Duration::from_millis(100));
+        sleep(interval);
+        remaining = remaining.saturating_sub(interval);
+        before_poll(state);
+        if !should_continue(state) || (!was_draining && state.draining) {
+            break;
+        }
+    }
+}
+
+fn wait_retry_delay<B, C, S>(
+    duration: Duration,
+    before_poll: &mut B,
+    should_continue: &mut C,
+    sleep: &mut S,
+    state: &mut PollState,
+) where
+    B: FnMut(&mut PollState),
+    C: FnMut(&PollState) -> bool,
+    S: FnMut(Duration),
+{
+    let was_draining = state.draining;
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        let interval = remaining.min(Duration::from_millis(100));
+        sleep(interval);
+        remaining = remaining.saturating_sub(interval);
+        before_poll(state);
+        if !should_continue(state) || (!was_draining && state.draining) {
+            break;
+        }
     }
 }
 
@@ -619,6 +737,57 @@ mod tests {
     }
 
     #[test]
+    fn draining_waits_for_tines_to_confirm_declined_assignments() {
+        let directory = TestDirectory::new();
+        let assignment = r#"{"assignments":[{"run":{"id":"arun_declined_on_shutdown","issue_id":"iss_shutdown"},"prompt":"work","bundle":{},"run_key":"run-key","timeout_minutes":30}],"cancels":[]}"#;
+        let not_yet_released = r#"{"assignments":[],"cancels":[]}"#;
+        let released = r#"{"assignments":[],"cancels":[],"released_assignments":["arun_declined_on_shutdown"]}"#;
+        let (url, server) = mock_server(vec![
+            (200, assignment),
+            (200, not_yet_released),
+            (200, released),
+        ]);
+        let mut poller = poller(&directory, &url, false);
+        let shutdown = Cell::new(false);
+        let handled = Cell::new(0);
+
+        poller
+            .run_controlled(
+                |state| state.set_draining(shutdown.get()),
+                |response, state| {
+                    if handled.get() == 0 {
+                        assert_eq!(response.assignments.len(), 1);
+                        state.decline_assignment("arun_declined_on_shutdown");
+                        shutdown.set(true);
+                    }
+                    handled.set(handled.get() + 1);
+                },
+                |state| {
+                    !shutdown.get()
+                        || state.active_run_count() > 0
+                        || state.has_pending_declines()
+                        || !state.draining_poll_reported()
+                },
+                |_| {},
+            )
+            .expect("poll until Tines releases the declined assignment");
+
+        let requests = server.join().expect("mock server requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["draining"], false);
+        assert_eq!(requests[1]["draining"], true);
+        assert_eq!(requests[2]["draining"], true);
+        for request in &requests[1..] {
+            assert_eq!(
+                request["declined_assignments"],
+                serde_json::json!(["arun_declined_on_shutdown"])
+            );
+        }
+        assert!(!poller.state().has_pending_declines());
+        assert_eq!(handled.get(), 3);
+    }
+
+    #[test]
     fn fake_server_receives_the_cached_codex_effort_catalog_on_polls() {
         let directory = TestDirectory::new();
         let (url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
@@ -687,7 +856,7 @@ mod tests {
         assert_eq!(requests[0]["owned_runs"], serde_json::json!(["arun_live"]));
         assert_eq!(requests[1]["owned_runs"], serde_json::json!(["arun_live"]));
         assert_eq!(requests[0]["instance_id"], requests[1]["instance_id"]);
-        assert_eq!(sleeps, [Duration::from_secs(1)]);
+        assert_eq!(sleeps.iter().sum::<Duration>(), Duration::from_secs(1));
     }
 
     #[test]

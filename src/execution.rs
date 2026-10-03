@@ -14,15 +14,32 @@ use crate::effort::EffortCapabilities;
 use crate::finish::CodexRunReport;
 use crate::process::{ProcessExit, ProcessOutput, ProcessStream, SupervisedProcess};
 use crate::protocol::client::{Client, ClientError, ErrorCategory};
-use crate::protocol::{FinishRunRequest, FinishStatus};
+use crate::protocol::{FinishJudgment, FinishRunRequest, FinishStatus};
 use crate::recovery::ActiveRunStore;
 use crate::retention::{self, RetentionError};
 use crate::runner::{RunnerConnection, RunnerError};
+use crate::shutdown::ShutdownSignal;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 const LIVE_LOG_RETRY_WINDOW: Duration = Duration::from_millis(500);
+
+/// Shared shutdown signal and durable run inventory for an assignment worker.
+#[derive(Clone, Copy)]
+pub struct ExecutionContext<'a> {
+    pub shutdown: &'a ShutdownSignal,
+    pub active_runs: &'a ActiveRunStore,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub fn new(shutdown: &'a ShutdownSignal, active_runs: &'a ActiveRunStore) -> Self {
+        Self {
+            shutdown,
+            active_runs,
+        }
+    }
+}
 
 /// Execute one assignment, report its outcome, then remove its workspace.
 ///
@@ -34,6 +51,7 @@ pub fn execute_assignment(
     client: &Client,
     capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
+    context: &ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
     execute_assignment_cancellable(
         assignment,
@@ -42,6 +60,7 @@ pub fn execute_assignment(
         capabilities,
         retention,
         &CancellationToken::default(),
+        context,
     )
     .map(|_| ())
 }
@@ -55,6 +74,7 @@ pub fn execute_assignment_cancellable(
     capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
+    context: &ExecutionContext<'_>,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     execute_assignment_cancellable_inner(
         assignment,
@@ -63,28 +83,7 @@ pub fn execute_assignment_cancellable(
         capabilities,
         retention,
         cancellation,
-        None,
-    )
-}
-
-/// Execute an assignment and update its durable active-run record.
-pub fn execute_assignment_cancellable_with_active_runs(
-    assignment: PreparedAssignment,
-    connection: &RunnerConnection,
-    client: &Client,
-    capabilities: &EffortCapabilities,
-    retention: &WorkspaceRetention,
-    cancellation: &CancellationToken,
-    active_runs: &ActiveRunStore,
-) -> Result<ExecutionOutcome, ExecutionError> {
-    execute_assignment_cancellable_inner(
-        assignment,
-        connection,
-        client,
-        capabilities,
-        retention,
-        cancellation,
-        Some(active_runs),
+        context,
     )
 }
 
@@ -95,10 +94,10 @@ fn execute_assignment_cancellable_inner(
     capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
-    active_runs: Option<&ActiveRunStore>,
+    context: &ExecutionContext<'_>,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     if cancellation.is_cancelled() {
-        return settle_canceled_assignment(&assignment, active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs);
     }
     let run_id = assignment.assignment().run.id.clone();
     let runner_token = connection.credentials().runner_token();
@@ -121,7 +120,8 @@ fn execute_assignment_cancellable_inner(
         &mut assignment,
         &log_context,
         capabilities,
-        active_runs,
+        context.active_runs,
+        context.shutdown,
         timeout,
         &mut report,
     );
@@ -130,19 +130,35 @@ fn execute_assignment_cancellable_inner(
         || assignment.log_delivery_cancelled()
         || run_output.as_ref().is_ok_and(|output| output.cancelled)
     {
-        return settle_canceled_assignment(&assignment, active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs);
     }
 
-    let (mut status, mut error) = match run_output {
+    let (mut status, mut error, judgment) = match run_output {
+        Ok(output) if output.interrupted => (
+            FinishStatus::Failed,
+            Some(format!(
+                "runner shutdown interrupted the run: {}",
+                process_error(&output, assignment.assignment().timeout_minutes)
+            )),
+            Some(FinishJudgment::Interrupted),
+        ),
         Ok(output) if !output.timed_out && output.exit == ProcessExit::Code(0) => {
-            (FinishStatus::Completed, None)
+            (FinishStatus::Completed, None, None)
         }
         Ok(output) => {
             let error = process_error(&output, assignment.assignment().timeout_minutes);
-            (FinishStatus::Failed, Some(error))
+            (FinishStatus::Failed, Some(error), None)
         }
-        Err(error) => (FinishStatus::Failed, Some(error)),
+        Err(error) if context.shutdown.is_requested() => (
+            FinishStatus::Failed,
+            Some(format!("runner shutdown interrupted the run: {error}")),
+            Some(FinishJudgment::Interrupted),
+        ),
+        Err(error) => (FinishStatus::Failed, Some(error), None),
     };
+    if cancellation.is_cancelled() {
+        return settle_canceled_assignment(&assignment, context.active_runs);
+    }
     if report.is_rate_limited() {
         status = FinishStatus::Failed;
         if error.is_none() {
@@ -156,7 +172,8 @@ fn execute_assignment_cancellable_inner(
     }
     let error = error.map(|error| redact(&error, &secrets));
 
-    let finish_request = report.into_finish_request(status, error);
+    let mut finish_request = report.into_finish_request(status, error);
+    finish_request.judgment = judgment.or(finish_request.judgment);
     if !finish_with_retry(
         connection,
         &run_id,
@@ -164,7 +181,7 @@ fn execute_assignment_cancellable_inner(
         &finish_request,
         cancellation,
     )? {
-        return settle_canceled_assignment(&assignment, active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs);
     }
     let issue_ref = assignment
         .assignment()
@@ -181,29 +198,26 @@ fn execute_assignment_cancellable_inner(
         finish_request.error.as_deref(),
     )
     .map_err(ExecutionError::WorkspaceRetention)?;
-    remove_active_run(active_runs, &run_id).map_err(ExecutionError::ActiveStateCleanup)?;
+    context
+        .active_runs
+        .remove(&run_id)
+        .map_err(ExecutionError::ActiveStateCleanup)?;
     Ok(ExecutionOutcome::Finished)
 }
 
 fn settle_canceled_assignment(
     assignment: &PreparedAssignment,
-    active_runs: Option<&ActiveRunStore>,
+    active_runs: &ActiveRunStore,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     assignment.stop_log_delivery();
     assignment
         .workspace()
         .cleanup()
         .map_err(ExecutionError::WorkspaceCleanup)?;
-    remove_active_run(active_runs, &assignment.assignment().run.id)
+    active_runs
+        .remove(&assignment.assignment().run.id)
         .map_err(ExecutionError::ActiveStateCleanup)?;
     Ok(ExecutionOutcome::Cancelled)
-}
-
-fn remove_active_run(active_runs: Option<&ActiveRunStore>, run_id: &str) -> io::Result<()> {
-    if let Some(active_runs) = active_runs {
-        active_runs.remove(run_id)?;
-    }
-    Ok(())
 }
 
 /// The terminal action taken for one assignment.
@@ -221,6 +235,7 @@ pub fn report_preparation_failure(
     logs: &crate::protocol::client::RunLogBuffer,
     error: &str,
     cancellation: &CancellationToken,
+    context: &ExecutionContext<'_>,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     let request = FinishRunRequest {
         status: FinishStatus::Failed,
@@ -228,7 +243,10 @@ pub fn report_preparation_failure(
         provider_session_id: None,
         usage: None,
         pricing_evidence: None,
-        judgment: None,
+        judgment: context
+            .shutdown
+            .is_requested()
+            .then_some(FinishJudgment::Interrupted),
         resume_at: None,
     };
     if finish_with_retry(connection, run_id, logs, &request, cancellation)? {
@@ -249,7 +267,8 @@ fn run_harness(
     assignment: &mut PreparedAssignment,
     context: &RunLogContext<'_>,
     capabilities: &EffortCapabilities,
-    active_runs: Option<&ActiveRunStore>,
+    active_runs: &ActiveRunStore,
+    shutdown: &ShutdownSignal,
     timeout: Duration,
     report: &mut CodexRunReport,
 ) -> Result<ProcessOutput, String> {
@@ -262,6 +281,9 @@ fn run_harness(
     if cancellation.is_cancelled() {
         assignment.stop_log_delivery();
         return Err("assignment was canceled before process launch".to_owned());
+    }
+    if shutdown.is_requested() {
+        return Err("runner shutdown started before process launch".to_owned());
     }
     let launch = CodexLaunch::for_assignment(assignment, capabilities)
         .map_err(|error| format!("could not prepare Codex command: {error}"))?;
@@ -276,17 +298,18 @@ fn run_harness(
         assignment.stop_log_delivery();
         return Err("assignment was canceled before process launch".to_owned());
     }
+    if shutdown.is_requested() {
+        return Err("runner shutdown started before process launch".to_owned());
+    }
     let process = SupervisedProcess::spawn_with_output(&mut command)
         .map_err(|error| format!("could not start Codex harness: {error}"))?;
     let deadline = Instant::now() + timeout;
 
-    if let Some(active_runs) = active_runs
-        && let Err(error) = active_runs.record(
-            assignment.assignment().run.id.clone(),
-            process.identity().clone(),
-            assignment.workspace().path(),
-        )
-    {
+    if let Err(error) = active_runs.record(
+        assignment.assignment().run.id.clone(),
+        process.identity().clone(),
+        assignment.workspace().path(),
+    ) {
         return Err(match process.terminate(TERMINATION_GRACE) {
             Ok(_) => format!("could not persist harness identity; harness was stopped: {error}"),
             Err(stop_error) => format!(
@@ -295,7 +318,7 @@ fn run_harness(
         });
     }
 
-    if let Some(Err(error)) = retry_protocol_until(deadline, cancellation, || {
+    if let Some(Err(error)) = retry_protocol_until(deadline, cancellation, shutdown, || {
         assignment.harness_started_until(client, runner_token, deadline)
     }) {
         tracing::warn!(
@@ -313,7 +336,7 @@ fn run_harness(
     let mut stderr_truncated = false;
     let mut last_flush = Instant::now();
     let mut output = process
-        .wait_timeout_with_output(
+        .wait_timeout_with_output_or_shutdown(
             deadline.saturating_duration_since(Instant::now()),
             TERMINATION_GRACE,
             || {
@@ -322,6 +345,7 @@ fn run_harness(
                 }
                 cancellation.is_cancelled() || assignment.log_delivery_cancelled()
             },
+            || shutdown.is_requested(),
             |chunk| {
                 if cancellation.is_cancelled() || assignment.log_delivery_cancelled() {
                     assignment.stop_log_delivery();
@@ -435,6 +459,7 @@ fn append_events(
         runner_token,
         cancellation,
         secrets,
+        ..
     } = context;
     if cancellation.is_cancelled() || assignment.log_delivery_cancelled() {
         assignment.stop_log_delivery();
@@ -583,11 +608,12 @@ fn finish_with_retry(
 fn retry_protocol_until<T>(
     deadline: Instant,
     cancellation: &CancellationToken,
+    shutdown: &ShutdownSignal,
     mut request: impl FnMut() -> Result<T, ClientError>,
 ) -> Option<Result<(), ClientError>> {
     let mut failures = 0u32;
     loop {
-        if cancellation.is_cancelled() {
+        if cancellation.is_cancelled() || shutdown.is_requested() {
             return None;
         }
         match request() {
@@ -669,6 +695,8 @@ mod tests {
     use crate::finish::CodexRunReport;
     use crate::protocol::RunnerAssignment;
     use crate::protocol::client::Client;
+    use crate::recovery::ActiveRunStore;
+    use crate::shutdown::ShutdownSignal;
     use crate::workspace::MaterializedWorkspace;
     use serde_json::json;
     use std::fs;
@@ -848,6 +876,9 @@ mod tests {
         let started = Instant::now();
         let mut report = CodexRunReport::new(None);
         let cancellation = CancellationToken::default();
+        let shutdown = ShutdownSignal::inactive();
+        let active_runs = ActiveRunStore::open(directory.0.join("active-runs.json"))
+            .expect("load active-run state");
         let log_context = RunLogContext {
             client: &client,
             runner_token: "runner-token",
@@ -858,7 +889,8 @@ mod tests {
             &mut prepared,
             &log_context,
             &capabilities,
-            None,
+            &active_runs,
+            &shutdown,
             Duration::from_millis(2_200),
             &mut report,
         )

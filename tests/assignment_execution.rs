@@ -17,7 +17,9 @@ use tines_runner_rs::effort::EffortCapabilities;
 use tines_runner_rs::execution::execute_assignment;
 use tines_runner_rs::protocol::RunnerAssignment;
 use tines_runner_rs::protocol::client::Client;
+use tines_runner_rs::recovery::ActiveRunStore;
 use tines_runner_rs::runner::RunnerConnection;
+use tines_runner_rs::shutdown::ShutdownSignal;
 use tines_runner_rs::workspace::MaterializedWorkspace;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -214,6 +216,11 @@ fn run_case(exit_code: i32, expected_status: &str) {
     .expect("create assignment workspace");
     let workspace_path = workspace.path().to_path_buf();
     let prepared = PreparedAssignment::new(resolved, workspace);
+    let active_runs =
+        ActiveRunStore::open(config.credentials_file.with_file_name("active-runs.json"))
+            .expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = tines_runner_rs::execution::ExecutionContext::new(&shutdown, &active_runs);
 
     execute_assignment(
         prepared,
@@ -221,8 +228,10 @@ fn run_case(exit_code: i32, expected_status: &str) {
         &client,
         &capabilities(),
         &config.workspace_retention,
+        &context,
     )
     .expect("execute and settle assignment");
+    assert!(active_runs.records().is_empty());
     assert!(
         !workspace_path.exists(),
         "workspace is removed after finish"

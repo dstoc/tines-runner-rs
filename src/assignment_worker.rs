@@ -7,7 +7,6 @@ use crate::effort::{EffortCapabilities, assignment_effort_rejection};
 use crate::execution::{self, ExecutionOutcome};
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::Client;
-use crate::recovery::ActiveRunStore;
 use crate::runner::RunnerConnection;
 use crate::workspace::{MaterializedWorkspace, WorkspaceError};
 
@@ -21,6 +20,7 @@ pub enum AssignmentTaskOutcome {
 
 /// Enrich metadata, materialize the workspace, and execute one assignment.
 /// The poll loop remains free to receive cancellation while these steps run.
+#[allow(clippy::too_many_arguments)]
 pub fn run_assignment(
     config: &Config,
     connection: &RunnerConnection,
@@ -29,6 +29,7 @@ pub fn run_assignment(
     run_logs: crate::protocol::client::RunLogBuffer,
     advertised_capabilities: &EffortCapabilities,
     cancellation: &CancellationToken,
+    context: &execution::ExecutionContext<'_>,
 ) -> Result<AssignmentTaskOutcome, String> {
     run_assignment_inner(
         AssignmentContext {
@@ -37,33 +38,7 @@ pub fn run_assignment(
             issue_client,
             advertised_capabilities,
             cancellation,
-            active_runs: None,
-        },
-        assignment,
-        run_logs,
-    )
-}
-
-/// Run an assignment while persisting its workspace and harness identity.
-#[allow(clippy::too_many_arguments)]
-pub fn run_assignment_with_active_runs(
-    config: &Config,
-    connection: &RunnerConnection,
-    issue_client: &Client,
-    assignment: RunnerAssignment,
-    run_logs: crate::protocol::client::RunLogBuffer,
-    advertised_capabilities: &EffortCapabilities,
-    cancellation: &CancellationToken,
-    active_runs: &ActiveRunStore,
-) -> Result<AssignmentTaskOutcome, String> {
-    run_assignment_inner(
-        AssignmentContext {
-            config,
-            connection,
-            issue_client,
-            advertised_capabilities,
-            cancellation,
-            active_runs: Some(active_runs),
+            context,
         },
         assignment,
         run_logs,
@@ -76,7 +51,7 @@ struct AssignmentContext<'a> {
     issue_client: &'a Client,
     advertised_capabilities: &'a EffortCapabilities,
     cancellation: &'a CancellationToken,
-    active_runs: Option<&'a ActiveRunStore>,
+    context: &'a execution::ExecutionContext<'a>,
 }
 
 fn run_assignment_inner(
@@ -90,10 +65,19 @@ fn run_assignment_inner(
         issue_client,
         advertised_capabilities,
         cancellation,
-        active_runs,
+        context,
     } = context;
     if cancellation.is_cancelled() {
         return Ok(AssignmentTaskOutcome::Cancelled);
+    }
+    if context.shutdown.is_requested() {
+        return report_interrupted_before_execution(
+            connection,
+            &assignment.run.id,
+            &run_logs,
+            cancellation,
+            context,
+        );
     }
 
     let capabilities = if assignment.effort.is_some() {
@@ -102,6 +86,15 @@ fn run_assignment_inner(
         advertised_capabilities.clone()
     };
     if let Some(reason) = assignment_effort_rejection(&assignment, &capabilities) {
+        if context.shutdown.is_requested() {
+            return report_interrupted_before_execution(
+                connection,
+                &assignment.run.id,
+                &run_logs,
+                cancellation,
+                context,
+            );
+        }
         return Ok(AssignmentTaskOutcome::Declined(reason));
     }
 
@@ -111,10 +104,28 @@ fn run_assignment_inner(
             let _ = error;
             return Ok(AssignmentTaskOutcome::Cancelled);
         }
+        Err(_error) if context.shutdown.is_requested() => {
+            return report_interrupted_before_execution(
+                connection,
+                &assignment.run.id,
+                &run_logs,
+                cancellation,
+                context,
+            );
+        }
         Err(error) => return Ok(AssignmentTaskOutcome::Declined(error.to_string())),
     };
     if cancellation.is_cancelled() {
         return Ok(AssignmentTaskOutcome::Cancelled);
+    }
+    if context.shutdown.is_requested() {
+        return report_interrupted_before_execution(
+            connection,
+            &assignment.run.id,
+            &run_logs,
+            cancellation,
+            context,
+        );
     }
 
     let run_id = assignment.run.id.clone();
@@ -123,10 +134,7 @@ fn run_assignment_inner(
         resolved.assignment(),
         &config.server_url,
         cancellation,
-        |path| match active_runs {
-            Some(active_runs) => active_runs.record_workspace(run_id.clone(), path),
-            None => Ok(()),
-        },
+        |path| context.active_runs.record_workspace(run_id.clone(), path),
         |chunk| {
             tracing::info!(
                 run_id = %assignment.run.id,
@@ -138,7 +146,10 @@ fn run_assignment_inner(
     ) {
         Ok(workspace) => workspace,
         Err(WorkspaceError::Cancelled) => {
-            remove_active_run(active_runs, &run_id)?;
+            context
+                .active_runs
+                .remove(&run_id)
+                .map_err(|error| error.to_string())?;
             return Ok(AssignmentTaskOutcome::Cancelled);
         }
         Err(error) if cancellation.is_cancelled() => {
@@ -147,7 +158,10 @@ fn run_assignment_inner(
                     "assignment was canceled, but workspace cleanup failed; active state was retained: {error}"
                 ));
             }
-            remove_active_run(active_runs, &run_id)?;
+            context
+                .active_runs
+                .remove(&run_id)
+                .map_err(|error| error.to_string())?;
             return Ok(AssignmentTaskOutcome::Cancelled);
         }
         Err(error) => {
@@ -163,6 +177,7 @@ fn run_assignment_inner(
                 &run_logs,
                 &failure,
                 cancellation,
+                context,
             )
             .map_err(|error| error.to_string())?;
             if error.workspace_cleanup_failed() {
@@ -170,7 +185,10 @@ fn run_assignment_inner(
                     "assignment finish was reported, but workspace cleanup failed; active state was retained: {error}"
                 ));
             }
-            remove_active_run(active_runs, &run_id)?;
+            context
+                .active_runs
+                .remove(&run_id)
+                .map_err(|error| error.to_string())?;
             return Ok(match outcome {
                 ExecutionOutcome::Finished => AssignmentTaskOutcome::Finished,
                 ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
@@ -181,7 +199,10 @@ fn run_assignment_inner(
         workspace
             .cleanup()
             .map_err(|error| format!("could not clean canceled workspace: {error}"))?;
-        remove_active_run(active_runs, &run_id)?;
+        context
+            .active_runs
+            .remove(&run_id)
+            .map_err(|error| error.to_string())?;
         return Ok(AssignmentTaskOutcome::Cancelled);
     }
 
@@ -196,38 +217,40 @@ fn run_assignment_inner(
     );
     let prepared = crate::assignment::PreparedAssignment::new(resolved, workspace)
         .with_run_log_buffer(run_logs);
-    let execution_result = match active_runs {
-        Some(active_runs) => execution::execute_assignment_cancellable_with_active_runs(
-            prepared,
-            connection,
-            issue_client,
-            &capabilities,
-            &config.workspace_retention,
-            cancellation,
-            active_runs,
-        ),
-        None => execution::execute_assignment_cancellable(
-            prepared,
-            connection,
-            issue_client,
-            &capabilities,
-            &config.workspace_retention,
-            cancellation,
-        ),
-    };
-    execution_result
-        .map(|outcome| match outcome {
-            ExecutionOutcome::Finished => AssignmentTaskOutcome::Finished,
-            ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
-        })
-        .map_err(|error| error.to_string())
+    execution::execute_assignment_cancellable(
+        prepared,
+        connection,
+        issue_client,
+        &capabilities,
+        &config.workspace_retention,
+        cancellation,
+        context,
+    )
+    .map(|outcome| match outcome {
+        ExecutionOutcome::Finished => AssignmentTaskOutcome::Finished,
+        ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
+    })
+    .map_err(|error| error.to_string())
 }
 
-fn remove_active_run(active_runs: Option<&ActiveRunStore>, run_id: &str) -> Result<(), String> {
-    if let Some(active_runs) = active_runs {
-        active_runs
-            .remove(run_id)
-            .map_err(|error| format!("could not clear settled active-run state: {error}"))?;
-    }
-    Ok(())
+fn report_interrupted_before_execution(
+    connection: &RunnerConnection,
+    run_id: &str,
+    logs: &crate::protocol::client::RunLogBuffer,
+    cancellation: &CancellationToken,
+    context: &execution::ExecutionContext<'_>,
+) -> Result<AssignmentTaskOutcome, String> {
+    execution::report_preparation_failure(
+        connection,
+        run_id,
+        logs,
+        "runner shutdown interrupted the run before execution",
+        cancellation,
+        context,
+    )
+    .map(|outcome| match outcome {
+        ExecutionOutcome::Finished => AssignmentTaskOutcome::Finished,
+        ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
+    })
+    .map_err(|error| error.to_string())
 }

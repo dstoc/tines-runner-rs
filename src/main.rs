@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::process::ExitCode;
@@ -40,6 +41,11 @@ fn main() -> ExitCode {
 
 fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     let config = tines_runner_rs::config::Config::load_default()?;
+    let shutdown = if check {
+        None
+    } else {
+        Some(tines_runner_rs::shutdown::ShutdownSignal::install()?)
+    };
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
     if check {
         connection.verify()?;
@@ -56,13 +62,16 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let state_directory = config
-        .credentials_file
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let active_runs =
-        tines_runner_rs::recovery::ActiveRunStore::open(state_directory.join("active-runs.json"))?;
+    tines_runner_rs::retention::prune_retained_roots(
+        config.workspace_parents(),
+        &config.workspace_retention,
+    )?;
+    let shutdown = shutdown.ok_or_else(|| {
+        std::io::Error::other("daemon shutdown handler was not installed before polling")
+    })?;
+    let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(
+        config.credentials_file.with_file_name("active-runs.json"),
+    )?;
     let recovered_runs = tines_runner_rs::recovery::recover_active_runs(
         &active_runs,
         &config.workspace_retention,
@@ -71,24 +80,25 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     for run_id in recovered_runs {
         tracing::info!(run_id, "recovered interrupted assignment before polling");
     }
-    tines_runner_rs::retention::prune_retained_roots(
-        config.workspace_parents(),
-        &config.workspace_retention,
-    )?;
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
     let execution_connection = connection.clone();
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
-    let mut workers: BTreeMap<String, AssignmentWorker> = BTreeMap::new();
+    let workers = RefCell::new(BTreeMap::<String, AssignmentWorker>::new());
     let fatal_error = Arc::new(Mutex::new(None::<String>));
     let loop_fatal_error = Arc::clone(&fatal_error);
-    let poll_result = poller.run_with(
+    let poll_shutdown = shutdown.clone();
+    let poll_result = poller.run_controlled(
+        |state| {
+            state.set_draining(shutdown.is_requested());
+            reap_completed_workers(&workers, state, &fatal_error);
+        },
         |response, state| {
             let mut canceled_ids = std::collections::BTreeSet::new();
             for request in &response.cancel_requests {
                 canceled_ids.insert(request.run_id.clone());
-                if let Some(worker) = workers.get_mut(&request.run_id) {
+                if let Some(worker) = workers.borrow_mut().get_mut(&request.run_id) {
                     worker.cancellation_ack = Some(request.token.clone());
                     worker.cancellation.cancel();
                 } else {
@@ -98,7 +108,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
             }
             for run_id in &response.cancels {
                 canceled_ids.insert(run_id.clone());
-                if let Some(worker) = workers.get(run_id) {
+                if let Some(worker) = workers.borrow().get(run_id) {
                     worker.cancellation.cancel();
                 }
                 tracing::warn!(run_id, "supervisor settled run; stopping local work without finish reporting");
@@ -112,6 +122,15 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     continue;
                 }
                 if canceled_ids.contains(&run_id) {
+                    continue;
+                }
+                if state.owns_run(&run_id) {
+                    tracing::info!(run_id, "duplicate assignment delivery ignored because the run is already owned");
+                    continue;
+                }
+                if shutdown.is_requested() {
+                    state.decline_assignment(run_id.clone());
+                    tracing::info!(run_id, "assignment declined because the runner is draining");
                     continue;
                 }
                 match state.admit_assignment(run_id.clone()) {
@@ -137,25 +156,29 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                 let worker_client = issue_client.clone();
                 let worker_capabilities = capabilities.clone();
                 let worker_assignment = assignment.clone();
-                let worker_run_logs = run_logs;
+                let worker_shutdown = shutdown.clone();
                 let worker_active_runs = active_runs.clone();
                 match thread::Builder::new()
                     .name(format!("runner-run-{run_id}"))
                     .spawn(move || {
-                        tines_runner_rs::assignment_worker::run_assignment_with_active_runs(
+                        let context = tines_runner_rs::execution::ExecutionContext::new(
+                            &worker_shutdown,
+                            &worker_active_runs,
+                        );
+                        tines_runner_rs::assignment_worker::run_assignment(
                             &worker_config,
                             &worker_connection,
                             &worker_client,
                             worker_assignment,
-                            worker_run_logs,
+                            run_logs,
                             &worker_capabilities,
                             &worker_cancellation,
-                            &worker_active_runs,
+                            &context,
                         )
                     })
                 {
                     Ok(handle) => {
-                        workers.insert(
+                        workers.borrow_mut().insert(
                             run_id,
                             AssignmentWorker {
                                 cancellation,
@@ -179,58 +202,28 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                 );
             }
 
-            let completed = workers
-                .iter()
-                .filter(|(_, worker)| worker.handle.is_finished())
-                .map(|(run_id, _)| run_id.clone())
-                .collect::<Vec<_>>();
-            for run_id in completed {
-                let Some(worker) = workers.remove(&run_id) else {
-                    continue;
-                };
-                match worker.handle.join() {
-                    Ok(Ok(outcome)) => {
-                        if let Some(token) = worker.cancellation_ack {
-                            state.acknowledge_cancellation(run_id.clone(), token);
-                        }
-                        match outcome {
-                            AssignmentTaskOutcome::Declined(error)
-                                if !worker.cancellation.is_cancelled() =>
-                            {
-                                tracing::error!(run_id, error, "assignment declined because required metadata or Codex capability is unavailable");
-                                state.decline_assignment(run_id);
-                            }
-                            _ => state.release_run(&run_id),
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        state.release_run(&run_id);
-                        tracing::error!(run_id, error, "assignment execution did not settle");
-                        *fatal_error
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
-                    }
-                    Err(_) => {
-                        state.release_run(&run_id);
-                        let error = "assignment executor thread panicked".to_owned();
-                        tracing::error!(run_id, error, "assignment execution did not settle");
-                        *fatal_error
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
-                    }
-                }
-            }
+            reap_completed_workers(&workers, state, &fatal_error);
         },
-        || {
-            loop_fatal_error
+        |state| {
+            if loop_fatal_error
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_none()
+                .is_some()
+            {
+                return false;
+            }
+            if poll_shutdown.is_requested() {
+                return state.active_run_count() > 0
+                    || state.has_pending_declines()
+                    || state.has_pending_cancellation_acks()
+                    || !state.draining_poll_reported();
+            }
+            true
         },
         std::thread::sleep,
     );
 
-    for (run_id, worker) in workers {
+    for (run_id, worker) in workers.into_inner() {
         match worker.handle.join() {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -258,4 +251,55 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn reap_completed_workers(
+    workers: &RefCell<BTreeMap<String, AssignmentWorker>>,
+    state: &mut tines_runner_rs::poll::PollState,
+    fatal_error: &Arc<Mutex<Option<String>>>,
+) {
+    let completed = workers
+        .borrow()
+        .iter()
+        .filter(|(_, worker)| worker.handle.is_finished())
+        .map(|(run_id, _)| run_id.clone())
+        .collect::<Vec<_>>();
+    for run_id in completed {
+        let Some(worker) = workers.borrow_mut().remove(&run_id) else {
+            continue;
+        };
+        match worker.handle.join() {
+            Ok(Ok(outcome)) => {
+                if let Some(token) = worker.cancellation_ack {
+                    state.acknowledge_cancellation(run_id.clone(), token);
+                }
+                match outcome {
+                    AssignmentTaskOutcome::Declined(error)
+                        if !worker.cancellation.is_cancelled() =>
+                    {
+                        tracing::error!(
+                            run_id,
+                            error,
+                            "assignment declined because required metadata or Codex capability is unavailable"
+                        );
+                        state.decline_assignment(run_id);
+                    }
+                    _ => state.release_run(&run_id),
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::error!(run_id, error, "assignment execution did not settle");
+                *fatal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+            }
+            Err(_) => {
+                let error = "assignment executor thread panicked".to_owned();
+                tracing::error!(run_id, error, "assignment execution did not settle");
+                *fatal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+            }
+        }
+    }
 }
