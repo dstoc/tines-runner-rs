@@ -39,9 +39,17 @@ struct TransientFailures {
     finishes: usize,
 }
 
+struct RoutedAssignment {
+    runner_name: String,
+    assignment: Value,
+}
+
 #[derive(Default)]
 struct State {
     requests: Vec<RecordedRequest>,
+    registered_runner_name: Option<String>,
+    routed_assignments: VecDeque<RoutedAssignment>,
+    unexpected_requests: Vec<String>,
     poll_responses: VecDeque<(u16, Value)>,
     failures: TransientFailures,
     accepted_logs: Vec<Value>,
@@ -92,6 +100,18 @@ impl FakeTines {
         changed.notify_all();
     }
 
+    /// Route one issue assignment to a registered runner by its configured name.
+    pub fn route_issue(&self, runner_name: impl Into<String>, assignment: Value) {
+        let (lock, changed) = &*self.state;
+        lock_state(lock)
+            .routed_assignments
+            .push_back(RoutedAssignment {
+                runner_name: runner_name.into(),
+                assignment,
+            });
+        changed.notify_all();
+    }
+
     pub fn fail_next_polls(&self, count: usize) {
         lock_state(&self.state.0).failures.polls = count;
     }
@@ -114,6 +134,10 @@ impl FakeTines {
 
     pub fn accepted_finishes(&self) -> Vec<Value> {
         lock_state(&self.state.0).accepted_finishes.clone()
+    }
+
+    pub fn unexpected_requests(&self) -> Vec<String> {
+        lock_state(&self.state.0).unexpected_requests.clone()
     }
 
     pub fn wait_for(
@@ -201,6 +225,7 @@ struct Response {
 
 fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
     if request.method == "POST" && request.target == "/api/v1/runners/register" {
+        state.registered_runner_name = request.json()["name"].as_str().map(str::to_owned);
         return response(
             201,
             json!({
@@ -220,6 +245,21 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         if state.failures.polls > 0 {
             state.failures.polls -= 1;
             return response(503, json!({"error": {"code": "unavailable"}}));
+        }
+        let registered_runner_name = state.registered_runner_name.as_deref();
+        if let Some(index) = state
+            .routed_assignments
+            .iter()
+            .position(|routed| registered_runner_name == Some(routed.runner_name.as_str()))
+        {
+            let routed = state
+                .routed_assignments
+                .remove(index)
+                .expect("matching routed assignment exists");
+            return response(
+                200,
+                json!({"assignments": [routed.assignment], "cancels": []}),
+            );
         }
         let (status, mut body) = state
             .poll_responses
@@ -246,6 +286,15 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
 
     if request.method == "GET" && request.target.starts_with("/api/v1/issues/") {
         let issue_id = request.target.trim_start_matches("/api/v1/issues/");
+        let expected_token = issue_id
+            .strip_prefix("iss_")
+            .map(|run_id| format!("Bearer issue-run-key-{run_id}"));
+        if request.header("authorization") != expected_token.as_deref() {
+            return response(
+                401,
+                json!({"error": {"code": "run_key_inactive", "message": "invalid issue run key"}}),
+            );
+        }
         return response(
             200,
             json!({"id": issue_id, "workflow": {"name": "Implementation"}}),
@@ -280,6 +329,9 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         }
     }
 
+    state
+        .unexpected_requests
+        .push(format!("{} {}", request.method, request.target));
     response(
         404,
         json!({"error": {"code": "unexpected_request", "target": request.target}}),
@@ -350,6 +402,7 @@ fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
         500 => "Internal Server Error",
