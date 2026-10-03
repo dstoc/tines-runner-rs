@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   rust:
@@ -19,3 +20,5 @@ jobs:
         run: cargo +stable test --all-targets
         env:
           RUST_TEST_THREADS: 2
+      - name: Test release packaging
+        run: bash scripts/package-release.test.sh
