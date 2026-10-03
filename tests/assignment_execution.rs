@@ -92,11 +92,12 @@ fn fake_server(workspace_parent: PathBuf) -> (String, JoinHandle<Vec<String>>) {
                     r#"{"id":"iss_finish_runtime","workflow":{"name":"Implementation"}}"#,
                 );
             } else if request.starts_with("POST /api/v1/runs/arun_finish_runtime/logs ") {
-                respond(
-                    &mut stream,
-                    200,
-                    r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
-                );
+                let (_, body) = request.split_once("\r\n\r\n").expect("log body");
+                let log: Value = serde_json::from_str(body).expect("decode log payload");
+                let seq = log["seq"].as_u64().expect("log sequence");
+                let response =
+                    format!("{{\"status\":\"running\",\"log_bytes_dropped\":0,\"log_seq\":{seq}}}");
+                respond(&mut stream, 200, &response);
             } else if request.starts_with("POST /api/v1/runs/arun_finish_runtime/finish ") {
                 finish_requests += 1;
                 let workspaces = fs::read_dir(&workspace_parent)
@@ -237,11 +238,24 @@ fn run_case(exit_code: i32, expected_status: &str) {
     );
     assert!(requests[1].starts_with("POST /api/v1/runs/arun_finish_runtime/logs "));
     assert!(requests[2].starts_with("POST /api/v1/runs/arun_finish_runtime/logs "));
+    let (_, first_log_body) = requests[1].split_once("\r\n\r\n").expect("first log body");
+    let first_log: Value = serde_json::from_str(first_log_body).expect("decode first log");
+    assert_eq!(first_log["seq"], 1);
+    assert!(
+        first_log["chunk"]
+            .as_str()
+            .unwrap()
+            .contains("# tines runner: version=")
+    );
     let (_, log_body) = requests[2].split_once("\r\n\r\n").expect("log body");
     let log: Value = serde_json::from_str(log_body).expect("decode log payload");
-    assert!(!log["chunk"].as_str().unwrap().contains("issue-run-key"));
+    let chunk = log["chunk"].as_str().unwrap();
+    assert_eq!(log["seq"], 2);
+    assert!(chunk.contains("[session] started"));
+    assert!(chunk.contains(&format!("# tines runner: exit code={exit_code}")));
+    assert!(!chunk.contains("issue-run-key"));
     if expected_status == "failed" {
-        assert!(log["chunk"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(chunk.contains("[REDACTED]"));
     }
     let finish_request = &requests[4];
     assert!(finish_request.starts_with("POST /api/v1/runs/arun_finish_runtime/finish "));

@@ -113,12 +113,16 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                 }
 
                 let cancellation = CancellationToken::default();
+                let run_logs =
+                    tines_runner_rs::protocol::client::RunLogBuffer::for_assignment(assignment);
+                state.own_run_with_logs(run_id.clone(), run_logs.clone());
                 let worker_cancellation = cancellation.clone();
                 let worker_config = config.clone();
                 let worker_connection = execution_connection.clone();
                 let worker_client = issue_client.clone();
                 let worker_capabilities = capabilities.clone();
                 let worker_assignment = assignment.clone();
+                let worker_run_logs = run_logs;
                 match thread::Builder::new()
                     .name(format!("runner-run-{run_id}"))
                     .spawn(move || {
@@ -127,6 +131,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                             &worker_connection,
                             &worker_client,
                             worker_assignment,
+                            worker_run_logs,
                             &worker_capabilities,
                             &worker_cancellation,
                         )
@@ -144,6 +149,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                     }
                     Err(error) => {
                         tracing::error!(run_id, error = %error, "could not start assignment worker; requesting safe release");
+                        state.release_run(&run_id);
                         state.decline_assignment(run_id);
                     }
                 }
@@ -181,12 +187,14 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Ok(Err(error)) => {
+                        state.release_run(&run_id);
                         tracing::error!(run_id, error, "assignment execution did not settle");
                         *fatal_error
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
                     }
                     Err(_) => {
+                        state.release_run(&run_id);
                         let error = "assignment executor thread panicked".to_owned();
                         tracing::error!(run_id, error, "assignment execution did not settle");
                         *fatal_error

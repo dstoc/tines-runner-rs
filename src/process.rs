@@ -8,7 +8,7 @@
 
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -127,6 +127,32 @@ pub enum ProcessStream {
     Stderr,
 }
 
+/// A live chunk read from one child output pipe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessChunk {
+    pub stream: ProcessStream,
+    pub bytes: Vec<u8>,
+}
+
+impl ProcessOutput {
+    /// Format a closing run-log line. The line contains only process status
+    /// and elapsed time, so it cannot expose command or environment secrets.
+    pub fn format_exit_diagnostic(&self, duration: Duration) -> String {
+        let exit = match self.exit {
+            ProcessExit::Code(code) => format!("code={code}"),
+            ProcessExit::Signal(signal) => format!("signal={signal}"),
+            ProcessExit::Unknown => "code=?".to_owned(),
+        };
+        let seconds = duration.as_secs();
+        let timeout = if self.timed_out { " (timed out)" } else { "" };
+        format!(
+            "# tines runner: exit {exit}{timeout} after {}m{}s\n",
+            seconds / 60,
+            seconds % 60
+        )
+    }
+}
+
 /// A portable description of how the direct child ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessExit {
@@ -144,6 +170,7 @@ pub struct SupervisedProcess {
     identity: ProcessIdentity,
     stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    output: Option<Receiver<(ProcessStream, Vec<u8>)>>,
     #[cfg(unix)]
     finished: bool,
     #[cfg(windows)]
@@ -169,6 +196,15 @@ impl SupervisedProcess {
         sender: SyncSender<(ProcessStream, Vec<u8>)>,
     ) -> io::Result<Self> {
         Self::spawn_inner(command, Some(sender), false)
+    }
+
+    /// Start a command and make stdout/stderr chunks available while it runs.
+    /// The bounded channel applies backpressure if the caller cannot keep up.
+    pub fn spawn_with_output(command: &mut Command) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(16);
+        let mut process = Self::spawn_inner(command, Some(sender), false)?;
+        process.output = Some(receiver);
+        Ok(process)
     }
 
     fn spawn_inner(
@@ -242,6 +278,7 @@ impl SupervisedProcess {
             identity,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            output: None,
             #[cfg(unix)]
             finished: false,
             #[cfg(windows)]
@@ -287,6 +324,42 @@ impl SupervisedProcess {
         cancellation: &CancellationToken,
     ) -> io::Result<ProcessOutput> {
         self.wait_control(None, grace, Some(cancellation))
+    }
+
+    /// Wait while forwarding live output and observing supervisor cancellation.
+    /// `on_tick` runs during quiet periods so callers can flush partial batches.
+    pub fn wait_timeout_with_output<F, C, T>(
+        mut self,
+        timeout: Duration,
+        grace: Duration,
+        mut is_cancelled: C,
+        mut on_output: F,
+        mut on_tick: T,
+    ) -> io::Result<ProcessOutput>
+    where
+        F: FnMut(ProcessChunk),
+        C: FnMut() -> bool,
+        T: FnMut(),
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.forward_available(&mut on_output);
+            on_tick();
+            if is_cancelled() {
+                let status = self.terminate_group(grace)?;
+                return self.collect_with(status, false, true, &mut on_output);
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.terminate_remaining_group(grace)?;
+                return self.collect_with(status, false, false, &mut on_output);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let status = self.terminate_group(grace)?;
+                return self.collect_with(status, true, false, &mut on_output);
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(10)));
+        }
     }
 
     fn wait_control(
@@ -403,14 +476,36 @@ impl SupervisedProcess {
     }
 
     fn collect(
-        mut self,
+        self,
         status: ExitStatus,
         timed_out: bool,
         cancelled: bool,
     ) -> io::Result<ProcessOutput> {
+        self.collect_with(status, timed_out, cancelled, &mut |_| {})
+    }
+
+    fn collect_with<F>(
+        mut self,
+        status: ExitStatus,
+        timed_out: bool,
+        cancelled: bool,
+        on_output: &mut F,
+    ) -> io::Result<ProcessOutput>
+    where
+        F: FnMut(ProcessChunk),
+    {
         #[cfg(unix)]
         {
             self.finished = true;
+        }
+        if let Some(output) = self.output.take() {
+            loop {
+                match output.recv_timeout(Duration::from_millis(10)) {
+                    Ok((stream, bytes)) => on_output(ProcessChunk { stream, bytes }),
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
         let stdout = join_reader(
             self.stdout
@@ -432,9 +527,24 @@ impl SupervisedProcess {
     }
 }
 
+impl SupervisedProcess {
+    fn forward_available<F>(&self, on_output: &mut F)
+    where
+        F: FnMut(ProcessChunk),
+    {
+        let Some(output) = &self.output else {
+            return;
+        };
+        while let Ok((stream, bytes)) = output.try_recv() {
+            on_output(ProcessChunk { stream, bytes });
+        }
+    }
+}
+
 #[cfg(unix)]
 impl Drop for SupervisedProcess {
     fn drop(&mut self) {
+        self.output.take();
         if !self.finished && self.terminate_group(Duration::from_secs(2)).is_err() {
             let process_group_id = self
                 .identity
@@ -875,7 +985,8 @@ fn windows_generate_console_ctrl_break(process_group_id: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{ProcessExit, SupervisedProcess};
+    use super::SupervisedProcess;
+    use super::{ProcessExit, ProcessOutput};
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -886,6 +997,21 @@ mod tests {
     use std::thread;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exit_diagnostic_reports_status_timeout_and_duration() {
+        let output = ProcessOutput {
+            exit: ProcessExit::Signal(9),
+            timed_out: true,
+            cancelled: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            output.format_exit_diagnostic(Duration::from_secs(61)),
+            "# tines runner: exit signal=9 (timed out) after 1m1s\n"
+        );
+    }
 
     #[cfg(unix)]
     struct TestDirectory(PathBuf);

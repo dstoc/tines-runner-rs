@@ -20,10 +20,11 @@ pub struct PreparedAssignment {
 
 impl PreparedAssignment {
     pub fn new(resolved: ResolvedAssignment, workspace: MaterializedWorkspace) -> Self {
+        let run_logs = RunLogBuffer::for_assignment(resolved.assignment());
         Self {
             resolved,
             workspace,
-            run_logs: RunLogBuffer::new(),
+            run_logs,
         }
     }
 
@@ -55,14 +56,23 @@ impl PreparedAssignment {
         self.resolved.assignment()
     }
 
+    /// Return the shared log stream for execution and supervisor coordination.
+    pub fn run_log_buffer(&self) -> RunLogBuffer {
+        self.run_logs.clone()
+    }
+
+    pub fn log_delivery_cancelled(&self) -> bool {
+        self.run_logs.is_cancelled()
+    }
+
     /// Flush workspace logs after the process launcher confirms a successful
     /// harness start. Call this before waiting for output so quiet processes
     /// leave `launching` even when checkout produced no logs.
     pub fn harness_started(
-        &mut self,
+        &self,
         client: &Client,
         runner_token: &str,
-    ) -> Result<AppendRunLogResponse, ClientError> {
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         let run_id = self.assignment().run.id.clone();
         self.run_logs.harness_started(client, &run_id, runner_token)
     }
@@ -73,7 +83,7 @@ impl PreparedAssignment {
         client: &Client,
         runner_token: &str,
         deadline: Instant,
-    ) -> Result<AppendRunLogResponse, ClientError> {
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         let run_id = self.assignment().run.id.clone();
         self.run_logs
             .harness_started_until(client, &run_id, runner_token, deadline)
@@ -81,14 +91,80 @@ impl PreparedAssignment {
 
     /// Append harness output and flush buffered workspace output first.
     pub fn append_harness_output(
-        &mut self,
+        &self,
         client: &Client,
         runner_token: &str,
         chunk: &str,
-    ) -> Result<AppendRunLogResponse, ClientError> {
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         let run_id = self.assignment().run.id.clone();
         self.run_logs
             .append_harness_output(client, &run_id, runner_token, chunk)
+    }
+
+    /// Append live harness output without retrying past the harness deadline.
+    pub fn append_harness_output_until(
+        &self,
+        client: &Client,
+        runner_token: &str,
+        chunk: &str,
+        deadline: Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .append_harness_output_until(client, &run_id, runner_token, chunk, deadline)
+    }
+
+    /// Add the safe launch banner to the preparation output queue.
+    pub fn buffer_launch_diagnostic(&self, diagnostic: &str) {
+        self.run_logs.buffer_preparation_output(diagnostic);
+    }
+
+    /// Add the safe exit line to the ordered harness output stream.
+    pub fn append_exit_diagnostic(
+        &self,
+        client: &Client,
+        runner_token: &str,
+        diagnostic: &str,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        self.append_harness_output(client, runner_token, diagnostic)
+    }
+
+    /// Flush a live partial batch, for use by the run-log timer.
+    pub fn flush_logs(
+        &self,
+        client: &Client,
+        runner_token: &str,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs.flush(client, &run_id, runner_token)
+    }
+
+    /// Flush live output without retrying past the harness deadline.
+    pub fn flush_logs_until(
+        &self,
+        client: &Client,
+        runner_token: &str,
+        deadline: Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .flush_until(client, &run_id, runner_token, deadline)
+    }
+
+    /// Flush and close logs before the ordinary run finish request.
+    pub fn flush_logs_before_finish(
+        &self,
+        client: &Client,
+        runner_token: &str,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .flush_before_finish(client, &run_id, runner_token)
+    }
+
+    /// Stop delivery when the supervisor has already canceled or settled the run.
+    pub fn stop_log_delivery(&self) {
+        self.run_logs.stop_sending();
     }
 }
 

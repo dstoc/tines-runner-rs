@@ -73,6 +73,9 @@ pub struct CodexLaunch {
     invocation: CodexInvocation,
     working_directory: PathBuf,
     environment: LaunchEnvironment,
+    model: Option<String>,
+    effort: Option<String>,
+    timeout_minutes: Option<u64>,
 }
 
 impl CodexLaunch {
@@ -87,11 +90,19 @@ impl CodexLaunch {
             &assignment.resolution().config.wrapper,
         )?;
 
-        Ok(Self::new(
+        let mut launch = Self::new(
             invocation,
             assignment.workspace().path(),
             assignment.workspace().environment().clone(),
-        ))
+        );
+        launch.model = assignment.assignment().run.model.clone();
+        launch.effort = assignment
+            .assignment()
+            .effort
+            .as_ref()
+            .map(|effort| effort.value.clone());
+        launch.timeout_minutes = Some(assignment.assignment().timeout_minutes);
+        Ok(launch)
     }
 
     /// Combine an invocation with a working directory and assignment environment.
@@ -104,6 +115,9 @@ impl CodexLaunch {
             invocation,
             working_directory: working_directory.as_ref().to_path_buf(),
             environment,
+            model: None,
+            effort: None,
+            timeout_minutes: None,
         }
     }
 
@@ -143,19 +157,37 @@ impl CodexLaunch {
                 environment_names.push(name.to_owned());
             }
         }
+        let model = self.model.as_deref().unwrap_or("(fixed)");
+        let effort = self.effort.as_deref().unwrap_or("(provider-default)");
+        let timeout = self
+            .timeout_minutes
+            .map(|minutes| format!("{minutes}m"))
+            .unwrap_or_else(|| "(unknown)".to_owned());
         let mut diagnostic = format!(
-            "argv={argv:?} cwd={:?} environment_names={environment_names:?}",
+            "$ {argv:?}\n# tines runner: version={} harness=codex model={model} effort={effort} timeout={timeout} workspace={:?} environment_names={environment_names:?}\n",
+            crate::VERSION,
             self.working_directory
         );
 
         // A secret accidentally repeated in a prompt or wrapper word must not
         // reappear through the argv portion of diagnostics.
-        for secret in self
+        let mut secret_forms = self
             .environment
             .secret_values()
             .filter(|value| !value.is_empty())
-        {
-            diagnostic = diagnostic.replace(secret, "[REDACTED]");
+            .flat_map(|secret| {
+                let json_escaped =
+                    serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
+                [
+                    secret.to_owned(),
+                    json_escaped[1..json_escaped.len() - 1].to_owned(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        secret_forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+        secret_forms.dedup();
+        for secret in secret_forms {
+            diagnostic = diagnostic.replace(&secret, "[REDACTED]");
         }
         diagnostic
     }
@@ -400,19 +432,27 @@ mod tests {
     #[test]
     fn command_uses_workspace_and_assignment_environment_without_logging_secrets() {
         let (_directory, workspace) = launch_environment();
-        let invocation = build_invocation("prompt", None, None, &["wrapper".to_owned()])
-            .expect("build invocation");
+        let invocation = build_invocation(
+            "sensitive-run-key",
+            Some("gpt-5.6-codex"),
+            Some("high"),
+            &["wrapper".to_owned()],
+        )
+        .expect("build invocation");
         assert!(
             invocation
                 .args()
                 .iter()
-                .all(|argument| !argument.contains("sensitive-run-key"))
+                .any(|argument| argument.contains("sensitive-run-key"))
         );
-        let launch = CodexLaunch::new(
+        let mut launch = CodexLaunch::new(
             invocation,
             workspace.path(),
             workspace.environment().clone(),
         );
+        launch.timeout_minutes = Some(30);
+        launch.model = Some("gpt-5.6-codex".to_owned());
+        launch.effort = Some("high".to_owned());
         let command = launch.command();
 
         assert_eq!(command.get_program(), "wrapper");
@@ -444,6 +484,13 @@ mod tests {
         assert!(!diagnostics.contains("sensitive-run-key"));
         assert!(!diagnostics.contains("sensitive-env-value"));
         assert!(diagnostics.contains("FIXTURE_SECRET"));
+        assert!(diagnostics.contains("harness=codex"));
+        assert!(diagnostics.contains("model=gpt-5.6-codex"));
+        assert!(diagnostics.contains("effort=high"));
+        assert!(diagnostics.contains("timeout=30m"));
+        assert!(diagnostics.contains("workspace="));
+        assert!(diagnostics.contains("version="));
+        assert!(diagnostics.contains("$ [\"wrapper\""));
         assert!(!format!("{launch:?}").contains("sensitive-run-key"));
     }
 

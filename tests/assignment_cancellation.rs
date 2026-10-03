@@ -93,9 +93,15 @@ fn cancellation_server(
                     r#"{"id":"iss_cancel","workflow":{"name":"Implementation"}}"#,
                 );
             } else if request.starts_with("POST /api/v1/runs/arun_cancel/logs ") {
+                let (_, body) = request.split_once("\r\n\r\n").expect("log request body");
+                let log: serde_json::Value =
+                    serde_json::from_str(body).expect("decode log request");
+                let seq = log["seq"].as_u64().expect("log sequence");
                 respond(
                     &mut stream,
-                    r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
+                    &format!(
+                        "{{\"status\":\"running\",\"log_bytes_dropped\":0,\"log_seq\":{seq}}}"
+                    ),
                 );
                 let _ = log_seen_tx.send(());
             } else if request.starts_with("POST /api/v1/runs/arun_cancel/finish ") {
@@ -240,7 +246,7 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
         .expect("make wrapper executable");
 
-    let (server_url, server, _log_seen) = cancellation_server(2);
+    let (server_url, server, _log_seen) = cancellation_server(4);
     let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
     let mut assignment = assignment(None);
     assignment.timeout_minutes = 0;
@@ -258,10 +264,12 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
 
     assert_eq!(outcome, ExecutionOutcome::Finished);
     let requests = server.join().expect("join fake Tines server");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
-    assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/finish "));
-    let (_, body) = requests[1].split_once("\r\n\r\n").expect("finish body");
+    assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/logs "));
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/logs "));
+    assert!(requests[3].starts_with("POST /api/v1/runs/arun_cancel/finish "));
+    let (_, body) = requests[3].split_once("\r\n\r\n").expect("finish body");
     let finish: serde_json::Value = serde_json::from_str(body).expect("decode finish payload");
     assert_eq!(finish["status"], "failed");
     assert!(
@@ -368,6 +376,7 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
             &worker_connection,
             &worker_client,
             assignment(None),
+            tines_runner_rs::protocol::client::RunLogBuffer::new(),
             &capabilities(),
             &worker_token,
         )

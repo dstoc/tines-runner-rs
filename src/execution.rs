@@ -3,17 +3,16 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::assignment::PreparedAssignment;
 use crate::cancellation::CancellationToken;
 use crate::codex::CodexLaunch;
-use crate::codex_stream::CodexStreamParser;
+use crate::codex_stream::{CodexEvent, CodexStreamParser};
 use crate::config::WorkspaceRetention;
 use crate::effort::EffortCapabilities;
 use crate::finish::CodexRunReport;
-use crate::process::{ProcessExit, ProcessOutput, SupervisedProcess};
+use crate::process::{ProcessExit, ProcessOutput, ProcessStream, SupervisedProcess};
 use crate::protocol::client::{Client, ClientError, ErrorCategory};
 use crate::protocol::{FinishRunRequest, FinishStatus};
 use crate::retention::{self, RetentionError};
@@ -21,6 +20,8 @@ use crate::runner::{RunnerConnection, RunnerError};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
+const LIVE_LOG_RETRY_WINDOW: Duration = Duration::from_millis(500);
 
 /// Execute one assignment, report its outcome, then remove its workspace.
 ///
@@ -55,6 +56,7 @@ pub fn execute_assignment_cancellable(
     cancellation: &CancellationToken,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     if cancellation.is_cancelled() {
+        assignment.stop_log_delivery();
         assignment
             .workspace()
             .cleanup()
@@ -70,17 +72,27 @@ pub fn execute_assignment_cancellable(
         .filter(|secret| !secret.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let log_context = RunLogContext {
+        client,
+        runner_token,
+        cancellation,
+        secrets: &secrets,
+    };
     let mut report = CodexRunReport::new(assignment.assignment().run.model.as_deref());
     let timeout = Duration::from_secs(assignment.assignment().timeout_minutes.saturating_mul(60));
     let run_output = run_harness(
         &mut assignment,
-        client,
-        runner_token,
+        &log_context,
         capabilities,
         timeout,
-        cancellation,
+        &mut report,
     );
-    if cancellation.is_cancelled() || run_output.as_ref().is_ok_and(|output| output.cancelled) {
+
+    if cancellation.is_cancelled()
+        || assignment.log_delivery_cancelled()
+        || run_output.as_ref().is_ok_and(|output| output.cancelled)
+    {
+        assignment.stop_log_delivery();
         assignment
             .workspace()
             .cleanup()
@@ -88,36 +100,16 @@ pub fn execute_assignment_cancellable(
         return Ok(ExecutionOutcome::Cancelled);
     }
 
-    let (mut status, mut error, output) = match run_output {
+    let (mut status, mut error) = match run_output {
         Ok(output) if !output.timed_out && output.exit == ProcessExit::Code(0) => {
-            (FinishStatus::Completed, None, Some(output))
+            (FinishStatus::Completed, None)
         }
         Ok(output) => {
             let error = process_error(&output, assignment.assignment().timeout_minutes);
-            (FinishStatus::Failed, Some(error), Some(output))
+            (FinishStatus::Failed, Some(error))
         }
-        Err(error) => (FinishStatus::Failed, Some(error), None),
+        Err(error) => (FinishStatus::Failed, Some(error)),
     };
-    if let Some(output) = output {
-        collect_output(
-            &mut report,
-            &mut assignment,
-            client,
-            runner_token,
-            &secrets,
-            &output,
-            cancellation,
-        );
-    }
-
-    if cancellation.is_cancelled() {
-        assignment
-            .workspace()
-            .cleanup()
-            .map_err(ExecutionError::WorkspaceCleanup)?;
-        return Ok(ExecutionOutcome::Cancelled);
-    }
-
     if report.is_rate_limited() {
         status = FinishStatus::Failed;
         if error.is_none() {
@@ -132,7 +124,13 @@ pub fn execute_assignment_cancellable(
     let error = error.map(|error| redact(&error, &secrets));
 
     let finish_request = report.into_finish_request(status, error);
-    if !finish_with_retry(connection, &run_id, &finish_request, cancellation)? {
+    if !finish_with_retry(
+        connection,
+        &run_id,
+        &assignment.run_log_buffer(),
+        &finish_request,
+        cancellation,
+    )? {
         assignment
             .workspace()
             .cleanup()
@@ -169,6 +167,7 @@ pub enum ExecutionOutcome {
 pub fn report_preparation_failure(
     connection: &RunnerConnection,
     run_id: &str,
+    logs: &crate::protocol::client::RunLogBuffer,
     error: &str,
     cancellation: &CancellationToken,
 ) -> Result<ExecutionOutcome, ExecutionError> {
@@ -181,22 +180,35 @@ pub fn report_preparation_failure(
         judgment: None,
         resume_at: None,
     };
-    if finish_with_retry(connection, run_id, &request, cancellation)? {
+    if finish_with_retry(connection, run_id, logs, &request, cancellation)? {
         Ok(ExecutionOutcome::Finished)
     } else {
         Ok(ExecutionOutcome::Cancelled)
     }
 }
 
+struct RunLogContext<'a> {
+    client: &'a Client,
+    runner_token: &'a str,
+    cancellation: &'a CancellationToken,
+    secrets: &'a [String],
+}
+
 fn run_harness(
     assignment: &mut PreparedAssignment,
-    client: &Client,
-    runner_token: &str,
+    context: &RunLogContext<'_>,
     capabilities: &EffortCapabilities,
     timeout: Duration,
-    cancellation: &CancellationToken,
+    report: &mut CodexRunReport,
 ) -> Result<ProcessOutput, String> {
+    let RunLogContext {
+        client,
+        runner_token,
+        cancellation,
+        ..
+    } = context;
     if cancellation.is_cancelled() {
+        assignment.stop_log_delivery();
         return Err("assignment was canceled before process launch".to_owned());
     }
     let launch = CodexLaunch::for_assignment(assignment, capabilities)
@@ -206,82 +218,171 @@ fn run_harness(
         launch = %launch,
         "starting Codex harness"
     );
+    assignment.buffer_launch_diagnostic(&launch.format_diagnostics());
     let mut command = launch.command();
     if cancellation.is_cancelled() {
+        assignment.stop_log_delivery();
         return Err("assignment was canceled before process launch".to_owned());
     }
-    let process = SupervisedProcess::spawn(&mut command)
+    let process = SupervisedProcess::spawn_with_output(&mut command)
         .map_err(|error| format!("could not start Codex harness: {error}"))?;
     let deadline = Instant::now() + timeout;
-    let mut run_logs = assignment.take_run_log_buffer();
-    let log_client = client.clone();
-    let log_run_id = assignment.assignment().run.id.clone();
-    let log_token = runner_token.to_owned();
-    let log_cancellation = cancellation.clone();
-    let log_task = thread::spawn(move || {
-        if !log_cancellation.is_cancelled()
-            && let Some(Err(error)) = retry_protocol_until(deadline, &log_cancellation, || {
-                run_logs.harness_started_until(&log_client, &log_run_id, &log_token, deadline)
-            })
-        {
-            tracing::warn!(
-                run_id = log_run_id,
-                error = %error,
-                "could not report that the Codex harness started"
-            );
-        }
-        run_logs
-    });
 
-    let output = process
-        .wait_timeout_or_cancel(
+    if let Some(Err(error)) = retry_protocol_until(deadline, cancellation, || {
+        assignment.harness_started_until(client, runner_token, deadline)
+    }) {
+        tracing::warn!(
+            run_id = %assignment.assignment().run.id,
+            error = %error,
+            "could not report that the Codex harness started"
+        );
+    }
+
+    let started = Instant::now();
+    let mut stdout = CodexStreamParser::default();
+    let mut stdout_utf8 = Utf8StreamDecoder::default();
+    let mut stderr_utf8 = Utf8StreamDecoder::default();
+    let mut stderr_diagnostic = Vec::new();
+    let mut stderr_truncated = false;
+    let mut last_flush = Instant::now();
+    let mut output = process
+        .wait_timeout_with_output(
             deadline.saturating_duration_since(Instant::now()),
             TERMINATION_GRACE,
-            cancellation,
+            || {
+                if cancellation.is_cancelled() {
+                    assignment.stop_log_delivery();
+                }
+                cancellation.is_cancelled() || assignment.log_delivery_cancelled()
+            },
+            |chunk| {
+                if cancellation.is_cancelled() || assignment.log_delivery_cancelled() {
+                    assignment.stop_log_delivery();
+                    return;
+                }
+                if chunk.stream == ProcessStream::Stdout {
+                    let text = stdout_utf8.push(&chunk.bytes);
+                    append_events(
+                        report,
+                        assignment,
+                        context,
+                        stdout.push(&text),
+                        false,
+                        deadline,
+                    );
+                } else {
+                    let remaining =
+                        MAX_STDERR_DIAGNOSTIC_BYTES.saturating_sub(stderr_diagnostic.len());
+                    let captured = chunk.bytes.len().min(remaining);
+                    stderr_diagnostic.extend_from_slice(&chunk.bytes[..captured]);
+                    stderr_truncated |= captured < chunk.bytes.len();
+                    let text = stderr_utf8.push(&chunk.bytes);
+                    append_stderr(assignment, context, &text, deadline);
+                }
+            },
+            || {
+                if cancellation.is_cancelled() || assignment.log_delivery_cancelled() {
+                    assignment.stop_log_delivery();
+                    return;
+                }
+                if last_flush.elapsed() >= Duration::from_secs(1) {
+                    let log_deadline = live_log_deadline(deadline);
+                    if let Err(error) =
+                        assignment.flush_logs_until(client, runner_token, log_deadline)
+                    {
+                        tracing::warn!(
+                            run_id = %assignment.assignment().run.id,
+                            error = %error,
+                            "could not flush live Codex run logs"
+                        );
+                    }
+                    last_flush = Instant::now();
+                }
+            },
         )
         .map_err(|error| format!("could not wait for Codex harness: {error}"))?;
-    if output.cancelled || cancellation.is_cancelled() {
-        // The start-log request is already in flight, if one started. It owns
-        // no workspace state and checks cancellation before retrying.
-        drop(log_task);
+    if output.cancelled || cancellation.is_cancelled() || assignment.log_delivery_cancelled() {
+        assignment.stop_log_delivery();
         return Ok(output);
     }
-    assignment.restore_run_log_buffer(
-        log_task
-            .join()
-            .map_err(|_| "harness-start log worker panicked".to_owned())?,
-    );
+    let stdout_tail = stdout_utf8.finish();
+    let mut stdout_events = stdout.push(&stdout_tail);
+    stdout_events.extend(stdout.finish());
+    append_events(report, assignment, context, stdout_events, false, deadline);
+    let stderr_tail = stderr_utf8.finish();
+    append_stderr(assignment, context, &stderr_tail, deadline);
+    output.stderr = stderr_diagnostic;
+    if stderr_truncated {
+        output.stderr.extend_from_slice(b"\n[stderr truncated]");
+    }
+    if let Err(error) = assignment.append_exit_diagnostic(
+        client,
+        runner_token,
+        &output.format_exit_diagnostic(started.elapsed()),
+    ) {
+        tracing::warn!(
+            run_id = %assignment.assignment().run.id,
+            error = %error,
+            "could not append Codex exit diagnostic"
+        );
+    }
     Ok(output)
 }
 
-fn collect_output(
-    report: &mut CodexRunReport,
-    assignment: &mut PreparedAssignment,
-    client: &Client,
-    runner_token: &str,
-    secrets: &[String],
-    output: &ProcessOutput,
-    cancellation: &CancellationToken,
+fn append_stderr(
+    assignment: &PreparedAssignment,
+    context: &RunLogContext<'_>,
+    text: &str,
+    deadline: Instant,
 ) {
-    if cancellation.is_cancelled() {
+    if text.is_empty() || context.cancellation.is_cancelled() || assignment.log_delivery_cancelled()
+    {
         return;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parser = CodexStreamParser::default();
-    let events = parser
-        .push(&stdout)
-        .into_iter()
-        .chain(parser.finish())
-        .collect::<Vec<_>>();
+    let rendered = redact(text, context.secrets);
+    let log_deadline = live_log_deadline(deadline);
+    if let Err(error) = assignment.append_harness_output_until(
+        context.client,
+        context.runner_token,
+        &format!("[stderr] {rendered}"),
+        log_deadline,
+    ) {
+        tracing::warn!(
+            run_id = %assignment.assignment().run.id,
+            error = %error,
+            "could not append Codex stderr to the Tines run log"
+        );
+    }
+}
+
+fn append_events(
+    report: &mut CodexRunReport,
+    assignment: &PreparedAssignment,
+    context: &RunLogContext<'_>,
+    events: Vec<CodexEvent>,
+    stderr: bool,
+    deadline: Instant,
+) {
+    let RunLogContext {
+        client,
+        runner_token,
+        cancellation,
+        secrets,
+    } = context;
+    if cancellation.is_cancelled() || assignment.log_delivery_cancelled() {
+        assignment.stop_log_delivery();
+        return;
+    }
     let mut lines = Vec::new();
     for event in events {
         report.observe(&event);
-        lines.extend(event.render_lines());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        lines.extend(stderr.lines().map(|line| format!("[stderr] {line}")));
+        lines.extend(event.render_lines().into_iter().map(|line| {
+            if stderr {
+                format!("[stderr] {line}")
+            } else {
+                line
+            }
+        }));
     }
 
     let rendered = lines
@@ -293,14 +394,67 @@ fn collect_output(
         return;
     }
 
-    if let Err(error) = retry_protocol(cancellation, || {
-        assignment.append_harness_output(client, runner_token, &format!("{rendered}\n"))
-    }) {
+    let log_deadline = live_log_deadline(deadline);
+    if let Err(error) = assignment.append_harness_output_until(
+        client,
+        runner_token,
+        &format!("{rendered}\n"),
+        log_deadline,
+    ) {
         tracing::warn!(
             run_id = %assignment.assignment().run.id,
             error = %error,
             "could not append Codex output to the Tines run log"
         );
+    }
+}
+
+fn live_log_deadline(run_deadline: Instant) -> Instant {
+    (Instant::now() + LIVE_LOG_RETRY_WINDOW).min(run_deadline)
+}
+
+#[derive(Default)]
+struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut decoded = String::new();
+        let mut consumed = 0;
+        loop {
+            let remaining = &self.pending[consumed..];
+            match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    decoded.push_str(valid);
+                    consumed = self.pending.len();
+                    break;
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    decoded.push_str(
+                        std::str::from_utf8(&self.pending[consumed..valid_end])
+                            .expect("valid UTF-8 prefix"),
+                    );
+                    consumed = valid_end;
+                    if let Some(error_len) = error.error_len() {
+                        decoded.push('\u{fffd}');
+                        consumed += error_len;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+        decoded
+    }
+
+    fn finish(&mut self) -> String {
+        let decoded = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        decoded
     }
 }
 
@@ -331,16 +485,18 @@ fn redact(value: &str, secrets: &[String]) -> String {
 fn finish_with_retry(
     connection: &RunnerConnection,
     run_id: &str,
+    logs: &crate::protocol::client::RunLogBuffer,
     request: &FinishRunRequest,
     cancellation: &CancellationToken,
 ) -> Result<bool, ExecutionError> {
     let mut failures = 0u32;
     loop {
-        if cancellation.is_cancelled() {
+        if cancellation.is_cancelled() || logs.is_cancelled() {
             return Ok(false);
         }
-        match connection.finish_assignment(run_id, request) {
-            Ok(_) => return Ok(true),
+        match connection.finish_assignment_with_logs(run_id, logs, request) {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => return Ok(false),
             Err(RunnerError::Protocol(error)) if error.category() == ErrorCategory::Retryable => {
                 let delay = retry_delay(failures);
                 failures = failures.saturating_add(1);
@@ -353,27 +509,6 @@ fn finish_with_retry(
                 cancellation.wait(delay);
             }
             Err(error) => return Err(ExecutionError::FinishReport(error)),
-        }
-    }
-}
-
-fn retry_protocol<T>(
-    cancellation: &CancellationToken,
-    mut request: impl FnMut() -> Result<T, ClientError>,
-) -> Result<(), ClientError> {
-    let mut failures = 0u32;
-    loop {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        match request() {
-            Ok(_) => return Ok(()),
-            Err(error) if error.category() == ErrorCategory::Retryable => {
-                let delay = retry_delay(failures);
-                failures = failures.saturating_add(1);
-                cancellation.wait(delay);
-            }
-            Err(error) => return Err(error),
         }
     }
 }
@@ -451,11 +586,12 @@ impl Error for ExecutionError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::run_harness;
+    use super::{RunLogContext, Utf8StreamDecoder, run_harness};
     use crate::assignment::{PreparedAssignment, resolve_assignment};
     use crate::cancellation::CancellationToken;
     use crate::config::Config;
     use crate::effort::EffortCapabilities;
+    use crate::finish::CodexRunReport;
     use crate::protocol::RunnerAssignment;
     use crate::protocol::client::Client;
     use crate::workspace::MaterializedWorkspace;
@@ -526,13 +662,26 @@ mod tests {
     }
 
     #[test]
-    fn retrying_harness_start_log_does_not_extend_the_process_timeout() {
+    fn utf8_decoder_keeps_multibyte_characters_split_across_process_chunks() {
+        let source = "Codex 🛰️ output";
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut decoded = String::new();
+        for byte in source.as_bytes() {
+            decoded.push_str(&decoder.push(&[*byte]));
+        }
+        decoded.push_str(&decoder.finish());
+        assert_eq!(decoded, source);
+    }
+
+    #[test]
+    fn retrying_live_log_flush_does_not_extend_the_process_timeout() {
         let directory = TestDirectory::new();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Tines server");
         let address = listener.local_addr().expect("read fake Tines address");
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..2 {
+            let mut log_requests = 0;
+            for _ in 0..5 {
                 let (mut stream, _) = listener.accept().expect("accept fake Tines request");
                 let request = read_request(&mut stream);
                 if request.starts_with("GET /api/v1/issues/iss_timeout ") {
@@ -542,11 +691,25 @@ mod tests {
                         r#"{"id":"iss_timeout","workflow":{"name":"Implementation"}}"#,
                     );
                 } else if request.starts_with("POST /api/v1/runs/arun_timeout/logs ") {
-                    respond(
-                        &mut stream,
-                        503,
-                        r#"{"error":{"code":"unavailable","message":"retry"}}"#,
-                    );
+                    log_requests += 1;
+                    match log_requests {
+                        1 => respond(
+                            &mut stream,
+                            200,
+                            r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
+                        ),
+                        2 | 3 => respond(
+                            &mut stream,
+                            503,
+                            r#"{"error":{"code":"unavailable","message":"retry"}}"#,
+                        ),
+                        4 => respond(
+                            &mut stream,
+                            200,
+                            r#"{"status":"running","log_bytes_dropped":0,"log_seq":2}"#,
+                        ),
+                        _ => panic!("unexpected extra log append: {request}"),
+                    }
                 } else {
                     panic!("unexpected fake Tines request: {request}");
                 }
@@ -556,7 +719,11 @@ mod tests {
         });
         let server_url = format!("http://{address}");
         let wrapper_path = directory.0.join("slow-codex-wrapper");
-        fs::write(&wrapper_path, "#!/bin/sh\nexec sleep 30\n").expect("write wrapper");
+        fs::write(
+            &wrapper_path,
+            "#!/bin/sh\necho '{\"type\":\"turn.started\"}'\nexec sleep 30\n",
+        )
+        .expect("write wrapper");
         fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
             .expect("make wrapper executable");
         let workspace_parent = directory.0.join("workspaces");
@@ -604,20 +771,45 @@ mod tests {
         };
 
         let started = Instant::now();
+        let mut report = CodexRunReport::new(None);
+        let cancellation = CancellationToken::default();
+        let log_context = RunLogContext {
+            client: &client,
+            runner_token: "runner-token",
+            cancellation: &cancellation,
+            secrets: &[],
+        };
         let output = run_harness(
             &mut prepared,
-            &client,
-            "runner-token",
+            &log_context,
             &capabilities,
-            Duration::from_millis(200),
-            &CancellationToken::default(),
+            Duration::from_millis(2_200),
+            &mut report,
         )
-        .expect("supervise harness after start-log outage");
+        .expect("supervise harness after live-log outage");
 
         assert!(output.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
         let requests = server.join().expect("join fake Tines server");
         assert!(requests[0].starts_with("GET /api/v1/issues/iss_timeout "));
-        assert!(requests[1].starts_with("POST /api/v1/runs/arun_timeout/logs "));
+        assert_eq!(requests.len(), 5);
+        let log_bodies = requests[2..5]
+            .iter()
+            .map(|request| {
+                let (_, body) = request.split_once("\r\n\r\n").expect("log body");
+                serde_json::from_str::<serde_json::Value>(body).expect("decode log request")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(log_bodies[0], log_bodies[1], "retry keeps the same batch");
+        assert_eq!(
+            log_bodies[1], log_bodies[2],
+            "pending batch keeps its sequence"
+        );
+        assert_eq!(log_bodies[0]["seq"], 2, "requests: {requests:#?}");
+        assert!(
+            log_bodies[0]["chunk"].as_str().unwrap().contains("turn "),
+            "unexpected retried chunk: {:?}",
+            log_bodies[0]["chunk"]
+        );
     }
 }
