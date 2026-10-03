@@ -211,6 +211,12 @@ The release workflow targets Linux x86_64. When a tagged version is
 published, its GitHub release includes a versioned `.tar.gz` archive and a
 SHA256 checksum.
 
+Release Please opens or updates a release PR from conventional commits on
+`main`. Review and merge it to publish the version tag and GitHub release.
+GitHub does not start CI for that generated PR because Release Please uses the
+repository's default `GITHUB_TOKEN`; run **Actions → CI → Run workflow** on the
+release PR's branch. CI starts automatically for ordinary pull requests.
+
 ## More documentation
 
 - [Operator guide](docs/operation.md) — service examples and detailed setup.
