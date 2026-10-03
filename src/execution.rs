@@ -21,6 +21,7 @@ use crate::runner::{RunnerConnection, RunnerError};
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
+const LIVE_LOG_RETRY_WINDOW: Duration = Duration::from_millis(500);
 
 /// Execute one assignment, report its outcome, then remove its workspace.
 ///
@@ -261,7 +262,14 @@ fn run_harness(
                 }
                 if chunk.stream == ProcessStream::Stdout {
                     let text = stdout_utf8.push(&chunk.bytes);
-                    append_events(report, assignment, context, stdout.push(&text), false);
+                    append_events(
+                        report,
+                        assignment,
+                        context,
+                        stdout.push(&text),
+                        false,
+                        deadline,
+                    );
                 } else {
                     let remaining =
                         MAX_STDERR_DIAGNOSTIC_BYTES.saturating_sub(stderr_diagnostic.len());
@@ -269,7 +277,7 @@ fn run_harness(
                     stderr_diagnostic.extend_from_slice(&chunk.bytes[..captured]);
                     stderr_truncated |= captured < chunk.bytes.len();
                     let text = stderr_utf8.push(&chunk.bytes);
-                    append_stderr(assignment, context, &text);
+                    append_stderr(assignment, context, &text, deadline);
                 }
             },
             || {
@@ -278,7 +286,10 @@ fn run_harness(
                     return;
                 }
                 if last_flush.elapsed() >= Duration::from_secs(1) {
-                    if let Err(error) = assignment.flush_logs(client, runner_token) {
+                    let log_deadline = live_log_deadline(deadline);
+                    if let Err(error) =
+                        assignment.flush_logs_until(client, runner_token, log_deadline)
+                    {
                         tracing::warn!(
                             run_id = %assignment.assignment().run.id,
                             error = %error,
@@ -297,9 +308,9 @@ fn run_harness(
     let stdout_tail = stdout_utf8.finish();
     let mut stdout_events = stdout.push(&stdout_tail);
     stdout_events.extend(stdout.finish());
-    append_events(report, assignment, context, stdout_events, false);
+    append_events(report, assignment, context, stdout_events, false, deadline);
     let stderr_tail = stderr_utf8.finish();
-    append_stderr(assignment, context, &stderr_tail);
+    append_stderr(assignment, context, &stderr_tail, deadline);
     output.stderr = stderr_diagnostic;
     if stderr_truncated {
         output.stderr.extend_from_slice(b"\n[stderr truncated]");
@@ -318,16 +329,23 @@ fn run_harness(
     Ok(output)
 }
 
-fn append_stderr(assignment: &PreparedAssignment, context: &RunLogContext<'_>, text: &str) {
+fn append_stderr(
+    assignment: &PreparedAssignment,
+    context: &RunLogContext<'_>,
+    text: &str,
+    deadline: Instant,
+) {
     if text.is_empty() || context.cancellation.is_cancelled() || assignment.log_delivery_cancelled()
     {
         return;
     }
     let rendered = redact(text, context.secrets);
-    if let Err(error) = assignment.append_harness_output(
+    let log_deadline = live_log_deadline(deadline);
+    if let Err(error) = assignment.append_harness_output_until(
         context.client,
         context.runner_token,
         &format!("[stderr] {rendered}"),
+        log_deadline,
     ) {
         tracing::warn!(
             run_id = %assignment.assignment().run.id,
@@ -343,6 +361,7 @@ fn append_events(
     context: &RunLogContext<'_>,
     events: Vec<CodexEvent>,
     stderr: bool,
+    deadline: Instant,
 ) {
     let RunLogContext {
         client,
@@ -375,15 +394,23 @@ fn append_events(
         return;
     }
 
-    if let Err(error) =
-        assignment.append_harness_output(client, runner_token, &format!("{rendered}\n"))
-    {
+    let log_deadline = live_log_deadline(deadline);
+    if let Err(error) = assignment.append_harness_output_until(
+        client,
+        runner_token,
+        &format!("{rendered}\n"),
+        log_deadline,
+    ) {
         tracing::warn!(
             run_id = %assignment.assignment().run.id,
             error = %error,
             "could not append Codex output to the Tines run log"
         );
     }
+}
+
+fn live_log_deadline(run_deadline: Instant) -> Instant {
+    (Instant::now() + LIVE_LOG_RETRY_WINDOW).min(run_deadline)
 }
 
 #[derive(Default)]
@@ -647,14 +674,14 @@ mod tests {
     }
 
     #[test]
-    fn retrying_harness_start_log_does_not_extend_the_process_timeout() {
+    fn retrying_live_log_flush_does_not_extend_the_process_timeout() {
         let directory = TestDirectory::new();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Tines server");
         let address = listener.local_addr().expect("read fake Tines address");
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
             let mut log_requests = 0;
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let (mut stream, _) = listener.accept().expect("accept fake Tines request");
                 let request = read_request(&mut stream);
                 if request.starts_with("GET /api/v1/issues/iss_timeout ") {
@@ -665,14 +692,23 @@ mod tests {
                     );
                 } else if request.starts_with("POST /api/v1/runs/arun_timeout/logs ") {
                     log_requests += 1;
-                    if log_requests == 1 {
-                        respond(
+                    match log_requests {
+                        1 => respond(
+                            &mut stream,
+                            200,
+                            r#"{"status":"running","log_bytes_dropped":0,"log_seq":1}"#,
+                        ),
+                        2 | 3 => respond(
                             &mut stream,
                             503,
                             r#"{"error":{"code":"unavailable","message":"retry"}}"#,
-                        );
-                    } else {
-                        respond(&mut stream, 200, r#"{"log_seq":1}"#);
+                        ),
+                        4 => respond(
+                            &mut stream,
+                            200,
+                            r#"{"status":"running","log_bytes_dropped":0,"log_seq":2}"#,
+                        ),
+                        _ => panic!("unexpected extra log append: {request}"),
                     }
                 } else {
                     panic!("unexpected fake Tines request: {request}");
@@ -683,7 +719,11 @@ mod tests {
         });
         let server_url = format!("http://{address}");
         let wrapper_path = directory.0.join("slow-codex-wrapper");
-        fs::write(&wrapper_path, "#!/bin/sh\nexec sleep 30\n").expect("write wrapper");
+        fs::write(
+            &wrapper_path,
+            "#!/bin/sh\necho '{\"type\":\"turn.started\"}'\nexec sleep 30\n",
+        )
+        .expect("write wrapper");
         fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
             .expect("make wrapper executable");
         let workspace_parent = directory.0.join("workspaces");
@@ -743,20 +783,33 @@ mod tests {
             &mut prepared,
             &log_context,
             &capabilities,
-            Duration::from_millis(200),
+            Duration::from_millis(2_200),
             &mut report,
         )
-        .expect("supervise harness after start-log outage");
+        .expect("supervise harness after live-log outage");
 
         assert!(output.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
         let requests = server.join().expect("join fake Tines server");
         assert!(requests[0].starts_with("GET /api/v1/issues/iss_timeout "));
-        assert!(requests[1].starts_with("POST /api/v1/runs/arun_timeout/logs "));
-        assert!(requests[2].starts_with("POST /api/v1/runs/arun_timeout/logs "));
-        let first_body = requests[1].split_once("\r\n\r\n").unwrap().1;
-        let retry_body = requests[2].split_once("\r\n\r\n").unwrap().1;
-        assert_eq!(first_body, retry_body, "retry must preserve chunk and seq");
-        assert!(first_body.contains("\"seq\":1"));
+        assert_eq!(requests.len(), 5);
+        let log_bodies = requests[2..5]
+            .iter()
+            .map(|request| {
+                let (_, body) = request.split_once("\r\n\r\n").expect("log body");
+                serde_json::from_str::<serde_json::Value>(body).expect("decode log request")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(log_bodies[0], log_bodies[1], "retry keeps the same batch");
+        assert_eq!(
+            log_bodies[1], log_bodies[2],
+            "pending batch keeps its sequence"
+        );
+        assert_eq!(log_bodies[0]["seq"], 2, "requests: {requests:#?}");
+        assert!(
+            log_bodies[0]["chunk"].as_str().unwrap().contains("turn "),
+            "unexpected retried chunk: {:?}",
+            log_bodies[0]["chunk"]
+        );
     }
 }

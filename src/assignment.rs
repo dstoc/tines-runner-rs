@@ -101,6 +101,19 @@ impl PreparedAssignment {
             .append_harness_output(client, &run_id, runner_token, chunk)
     }
 
+    /// Append live harness output without retrying past the harness deadline.
+    pub fn append_harness_output_until(
+        &self,
+        client: &Client,
+        runner_token: &str,
+        chunk: &str,
+        deadline: Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .append_harness_output_until(client, &run_id, runner_token, chunk, deadline)
+    }
+
     /// Add the safe launch banner to the preparation output queue.
     pub fn buffer_launch_diagnostic(&self, diagnostic: &str) {
         self.run_logs.buffer_preparation_output(diagnostic);
@@ -124,6 +137,18 @@ impl PreparedAssignment {
     ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         let run_id = self.assignment().run.id.clone();
         self.run_logs.flush(client, &run_id, runner_token)
+    }
+
+    /// Flush live output without retrying past the harness deadline.
+    pub fn flush_logs_until(
+        &self,
+        client: &Client,
+        runner_token: &str,
+        deadline: Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        let run_id = self.assignment().run.id.clone();
+        self.run_logs
+            .flush_until(client, &run_id, runner_token, deadline)
     }
 
     /// Flush and close logs before the ordinary run finish request.

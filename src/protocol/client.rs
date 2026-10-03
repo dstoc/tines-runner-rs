@@ -502,6 +502,29 @@ impl RunLogBuffer {
         runner_token: &str,
         chunk: &str,
     ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        self.append_harness_output_before(client, run_id, runner_token, chunk, None)
+    }
+
+    /// Append harness output with retries bounded by an absolute deadline.
+    pub fn append_harness_output_until(
+        &self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        chunk: &str,
+        deadline: Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        self.append_harness_output_before(client, run_id, runner_token, chunk, Some(deadline))
+    }
+
+    fn append_harness_output_before(
+        &self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        chunk: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         if chunk.is_empty() || self.shared.stopped.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -522,7 +545,7 @@ impl RunLogBuffer {
             let redacted = state.redactor.write(chunk);
             state.append_output(&redacted);
         }
-        self.drain(client, run_id, runner_token, false, false, None)
+        self.drain(client, run_id, runner_token, false, false, deadline)
     }
 
     /// Send a buffered partial batch while the harness is still running.
@@ -532,11 +555,32 @@ impl RunLogBuffer {
         run_id: &str,
         runner_token: &str,
     ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        self.flush_before(client, run_id, runner_token, None)
+    }
+
+    /// Flush a live partial batch with retries bounded by an absolute deadline.
+    pub fn flush_until(
+        &self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        deadline: Instant,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
+        self.flush_before(client, run_id, runner_token, Some(deadline))
+    }
+
+    fn flush_before(
+        &self,
+        client: &Client,
+        run_id: &str,
+        runner_token: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
         let _send_guard = lock_unpoisoned(&self.shared.send_lock);
         if self.shared.stopped.load(Ordering::Acquire) {
             return Ok(None);
         }
-        self.drain(client, run_id, runner_token, true, false, None)
+        self.drain(client, run_id, runner_token, true, false, deadline)
     }
 
     /// Flush all valid output and close the stream before an ordinary finish.
