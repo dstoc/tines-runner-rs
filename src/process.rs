@@ -92,16 +92,21 @@ impl ProcessIdentity {
     /// Terminate this process tree only when the stored identity still names
     /// the same live process generation.
     ///
-    /// Returns `false` when the process exited or its PID now names a different
-    /// process. This is used during crash recovery, where a stale PID must not
-    /// be treated as ownership of an unrelated process.
+    /// Returns `false` when no matching process tree remains. On macOS, an
+    /// unverifiable surviving process group returns an error so recovery keeps
+    /// its state and workspace for a safe retry.
     pub fn terminate_if_matches(&self, grace: Duration) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
             terminate_linux_group_if_matches(self, grace)
         }
 
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        {
+            terminate_macos_group_if_matches(self, grace)
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         {
             if !self.matches_live_process() {
                 return Ok(false);
@@ -165,6 +170,11 @@ impl ProcessIdentity {
             boot_id,
             start_time_ticks,
         }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_test_child(child: &Child) -> Self {
+        Self::for_child(child)
     }
 }
 
@@ -982,8 +992,18 @@ fn macos_process_details(process_id: u32) -> io::Result<(u64, u32)> {
             std::mem::size_of::<MacProcBsdInfo>() as i32,
         )
     };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
+    if result <= 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ESRCH_MACOS) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, error));
+        }
+        if result < 0 || error.raw_os_error().is_some_and(|code| code != 0) {
+            return Err(error);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned no process identity details",
+        ));
     }
     if result as usize != std::mem::size_of::<MacProcBsdInfo>() || info.pbi_pid != process_id {
         return Err(io::Error::new(
@@ -998,6 +1018,147 @@ fn macos_process_details(process_id: u32) -> io::Result<(u64, u32)> {
         info.pbi_pgid,
     ))
 }
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MacosGroupMember {
+    process_id: u32,
+    process_group_id: u32,
+    start_time_ticks: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_group_member(
+    identity: &ProcessIdentity,
+    member: &MacosGroupMember,
+) -> io::Result<bool> {
+    let (Some(process_group_id), Some(start_time_ticks)) =
+        (identity.process_group_id, identity.start_time_ticks)
+    else {
+        return Ok(false);
+    };
+    if member.process_group_id != process_group_id {
+        return Ok(false);
+    }
+    if member.process_id == identity.process_id && member.start_time_ticks != start_time_ticks {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS process-group leader PID now names a different generation",
+        ));
+    }
+    if member.start_time_ticks < start_time_ticks {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS process group contains a process older than its recorded leader",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_macos_group_if_matches(
+    identity: &ProcessIdentity,
+    grace: Duration,
+) -> io::Result<bool> {
+    let (Some(process_group_id), Some(start_time_ticks)) =
+        (identity.process_group_id, identity.start_time_ticks)
+    else {
+        return Ok(false);
+    };
+    if process_group_id != identity.process_id || start_time_ticks == 0 {
+        return Ok(false);
+    }
+
+    let mut members = macos_process_group_members(identity)?;
+    if members.is_empty() {
+        return Ok(false);
+    }
+
+    signal_unix_group(process_group_id, SIGTERM)?;
+    let deadline = Instant::now() + grace;
+    loop {
+        members = macos_process_group_members(identity)?;
+        if members.is_empty() {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        signal_unix_group(process_group_id, SIGTERM)?;
+        thread::sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(now)));
+    }
+
+    members = macos_process_group_members(identity)?;
+    if members.is_empty() {
+        return Ok(true);
+    }
+    signal_unix_group(process_group_id, SIGKILL)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_members(identity: &ProcessIdentity) -> io::Result<Vec<MacosGroupMember>> {
+    let process_group_id = identity.process_group_id.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "active process has no process group",
+        )
+    })?;
+    let mut capacity =
+        unsafe { proc_listpgrppids(process_group_id as i32, std::ptr::null_mut(), 0) };
+    if capacity < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut capacity = (capacity as usize).max(1);
+    let process_ids = loop {
+        let buffer_size = capacity
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|size| i32::try_from(size).ok())
+            .ok_or_else(|| io::Error::other("macOS process-group PID list is too large"))?;
+        let mut process_ids = vec![0_i32; capacity];
+        let count = unsafe {
+            proc_listpgrppids(
+                process_group_id as i32,
+                process_ids.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = count as usize;
+        if count < capacity {
+            process_ids.truncate(count);
+            break process_ids;
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("macOS process-group PID list is too large"))?;
+    };
+
+    let mut members = Vec::with_capacity(process_ids.len());
+    for process_id in process_ids.into_iter().filter(|process_id| *process_id > 0) {
+        let process_id = process_id as u32;
+        let (start_time_ticks, current_group_id) = match macos_process_details(process_id) {
+            Ok(details) => details,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let member = MacosGroupMember {
+            process_id,
+            process_group_id: current_group_id,
+            start_time_ticks,
+        };
+        if validate_macos_group_member(identity, &member)? {
+            members.push(member);
+        }
+    }
+    Ok(members)
+}
+
+#[cfg(target_os = "macos")]
+const ESRCH_MACOS: i32 = 3;
 
 #[cfg(target_os = "macos")]
 const PROC_PIDTBSDINFO: i32 = 3;
@@ -1034,6 +1195,11 @@ struct MacProcBsdInfo {
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
+    fn proc_listpgrppids(
+        process_group_id: i32,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: i32,
+    ) -> i32;
     fn proc_pidinfo(
         process_id: i32,
         flavor: i32,
@@ -1423,9 +1589,11 @@ fn windows_generate_console_ctrl_break(process_group_id: u32) -> io::Result<()> 
 mod tests {
     #[cfg(unix)]
     use super::SupervisedProcess;
+    use super::{MacosGroupMember, ProcessIdentity, validate_macos_group_member};
     use super::{ProcessExit, ProcessOutput};
     #[cfg(unix)]
     use std::fs;
+    use std::io;
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
     #[cfg(unix)]
@@ -1552,17 +1720,59 @@ mod tests {
         stale_identity.start_time_ticks = stale_identity
             .start_time_ticks
             .map(|start| start.saturating_add(1));
-        assert!(
-            !stale_identity
-                .terminate_if_matches(Duration::from_millis(50))
-                .unwrap()
-        );
+        assert!(!matches!(
+            stale_identity.terminate_if_matches(Duration::from_millis(50)),
+            Ok(true)
+        ));
         assert!(live_identity.matches_live_process());
 
         let output = process
             .wait_timeout(Duration::from_millis(50), Duration::from_millis(50))
             .expect("stop test harness after identity check");
         assert!(output.timed_out);
+    }
+
+    #[test]
+    fn macos_group_validation_accepts_only_members_from_the_recorded_generation() {
+        let identity = ProcessIdentity {
+            process_id: 410,
+            process_group_id: Some(410),
+            boot_id: None,
+            start_time_ticks: Some(100),
+        };
+        let surviving_descendant = MacosGroupMember {
+            process_id: 812,
+            process_group_id: 410,
+            start_time_ticks: 101,
+        };
+        assert!(
+            validate_macos_group_member(&identity, &surviving_descendant)
+                .expect("validate descendant after leader exit")
+        );
+
+        let reused_leader = MacosGroupMember {
+            process_id: 410,
+            process_group_id: 410,
+            start_time_ticks: 200,
+        };
+        assert_eq!(
+            validate_macos_group_member(&identity, &reused_leader)
+                .expect_err("reject a reused process-group leader PID")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let older_process = MacosGroupMember {
+            process_id: 812,
+            process_group_id: 410,
+            start_time_ticks: 99,
+        };
+        assert_eq!(
+            validate_macos_group_member(&identity, &older_process)
+                .expect_err("reject a process older than the recorded group leader")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[cfg(unix)]

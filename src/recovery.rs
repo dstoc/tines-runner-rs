@@ -296,6 +296,8 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 mod tests {
     use super::{ActiveRunStore, recover_active_runs};
     use crate::config::{RetentionMode, WorkspaceRetention};
+    #[cfg(target_os = "macos")]
+    use crate::process::ProcessIdentity;
     use crate::process::SupervisedProcess;
     use std::fs;
     use std::path::PathBuf;
@@ -438,6 +440,129 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(linux_process_state(descendant).is_none_or(|state| matches!(state, 'Z' | 'X')));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_terminates_macOS_group_members_after_leader_exits() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let state_path = directory.0.join("active-runs.json");
+        let ready_path = directory.0.join("descendant.pid");
+
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 300 >/dev/null 2>&1 & echo $! > \"$1\"; exec sleep 300",
+                "stub-harness",
+            ])
+            .arg(&ready_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut leader = command.spawn().expect("spawn stub harness group");
+        let _group_cleanup = TestProcessGroup(leader.id());
+        let identity = ProcessIdentity::for_test_child(&leader);
+        let store = ActiveRunStore::open(&state_path).expect("open active-run state");
+        store
+            .record("arun_orphan_group", identity, &workspace)
+            .expect("persist active run");
+
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_path.exists(), "harness did not start its descendant");
+        let descendant = fs::read_to_string(&ready_path)
+            .expect("read descendant PID")
+            .trim()
+            .parse::<u32>()
+            .expect("valid descendant PID");
+        assert!(macos_process_exists(descendant));
+
+        leader.kill().expect("kill process-group leader");
+        leader.wait().expect("reap process-group leader");
+        assert!(
+            macos_process_exists(descendant),
+            "descendant exited with its process-group leader"
+        );
+
+        drop(store);
+        let restarted_store =
+            ActiveRunStore::open(&state_path).expect("load active state after leader exit");
+        let recovered = recover_active_runs(
+            &restarted_store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect("recover surviving process-group member");
+
+        assert_eq!(recovered, ["arun_orphan_group"]);
+        assert!(restarted_store.records().is_empty());
+        assert!(!workspace.exists());
+        let stopped_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while macos_process_exists(descendant) && std::time::Instant::now() < stopped_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!macos_process_exists(descendant));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_preserves_workspace_when_process_generation_is_uncertain() {
+        let directory = TestDirectory::new();
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("user-file"), "keep").expect("write workspace file");
+        let state_path = directory.0.join("active-runs.json");
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let process = SupervisedProcess::spawn(&mut command).expect("spawn test harness");
+        let store = ActiveRunStore::open(&state_path).expect("open active-run state");
+        store
+            .record(
+                "arun_uncertain_identity",
+                process.identity().clone(),
+                &workspace,
+            )
+            .expect("persist active run");
+        drop(store);
+
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read active-run state"))
+                .expect("parse active-run state");
+        let start_time = state["runs"]["arun_uncertain_identity"]["process"]["start_time_ticks"]
+            .as_u64()
+            .expect("recorded process start time");
+        state["runs"]["arun_uncertain_identity"]["process"]["start_time_ticks"] =
+            serde_json::Value::from(start_time + 1);
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&state).expect("serialize stale active-run state"),
+        )
+        .expect("write stale active-run state");
+
+        let restarted_store = ActiveRunStore::open(&state_path).expect("load stale state");
+        let error = recover_active_runs(
+            &restarted_store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect_err("preserve state when the process generation is uncertain");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(restarted_store.records().len(), 1);
+        assert!(workspace.join("user-file").is_file());
+        assert!(process.identity().matches_live_process());
+        process
+            .terminate(Duration::from_millis(50))
+            .expect("stop test harness after stale identity check");
     }
 
     #[cfg(unix)]
@@ -615,5 +740,27 @@ mod tests {
     fn linux_process_state(process_id: u32) -> Option<char> {
         let stat = fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
         stat.rsplit_once(") ")?.1.chars().next()
+    }
+
+    #[cfg(target_os = "macos")]
+    struct TestProcessGroup(u32);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TestProcessGroup {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = kill(-(self.0 as i32), 9);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_process_exists(process_id: u32) -> bool {
+        unsafe { kill(process_id as i32, 0) == 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn kill(process_id: i32, signal: i32) -> i32;
     }
 }
