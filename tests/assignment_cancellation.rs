@@ -220,6 +220,7 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
         &connection,
         &client,
         &capabilities(),
+        &config.workspace_retention,
         &cancellation,
     )
     .expect("cancel before launch");
@@ -250,6 +251,7 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
         &connection,
         &client,
         &capabilities(),
+        &config.workspace_retention,
         &CancellationToken::default(),
     )
     .expect("report local timeout");
@@ -290,12 +292,14 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
     let workspace_path = prepared.workspace().path().to_path_buf();
     let cancellation = CancellationToken::default();
     let worker_token = cancellation.clone();
+    let worker_retention = config.workspace_retention.clone();
     let worker = thread::spawn(move || {
         execute_assignment_cancellable(
             prepared,
             &connection,
             &client,
             &capabilities(),
+            &worker_retention,
             &worker_token,
         )
     });

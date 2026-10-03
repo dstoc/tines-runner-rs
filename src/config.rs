@@ -106,6 +106,21 @@ impl Error for ConfigError {
 }
 
 impl Config {
+    /// Return each distinct workspace parent configured by the default or an override.
+    pub fn workspace_parents(&self) -> Vec<PathBuf> {
+        let mut parents = vec![self.workspace_parent.clone()];
+        for parent in self
+            .overrides
+            .iter()
+            .filter_map(|rule| rule.workspace_parent.as_ref())
+        {
+            if !parents.contains(parent) {
+                parents.push(parent.clone());
+            }
+        }
+        parents
+    }
+
     /// Return the platform/XDG default location for `config.toml`.
     pub fn default_path() -> Result<PathBuf, ConfigError> {
         Ok(default_paths()?.config_dir.join("config.toml"))
@@ -482,6 +497,33 @@ mod tests {
             "#
         );
         Config::from_toml_str_with_defaults(&contents, defaults()).unwrap()
+    }
+
+    #[test]
+    fn workspace_parents_include_distinct_override_roots() {
+        let config = parse_with_overrides(
+            r#"[[override]]
+project = "Tines"
+workspace_parent = "/project/workspaces"
+
+[[override]]
+workflow = "Implementation"
+workspace_parent = "/review/workspaces"
+
+[[override]]
+state = "Review"
+workspace_parent = "/project/workspaces"
+"#,
+        );
+
+        assert_eq!(
+            config.workspace_parents(),
+            [
+                PathBuf::from("/default/workspaces"),
+                PathBuf::from("/project/workspaces"),
+                PathBuf::from("/review/workspaces"),
+            ]
+        );
     }
 
     fn context<'a>(project: &'a str, workflow: &'a str, state: &'a str) -> MatchContext<'a> {
