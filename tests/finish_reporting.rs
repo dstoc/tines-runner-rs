@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use chrono::{Local, NaiveDateTime, TimeZone};
+use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use tines_runner_rs::codex_stream::CodexStreamParser;
 use tines_runner_rs::finish::CodexRunReport;
 use tines_runner_rs::protocol::client::Client;
@@ -277,6 +277,25 @@ fn recognized_usage_limit_message_parses_codex_local_reset_time() {
 
     assert_eq!(value["judgment"], "rate_limited");
     assert_eq!(value["resume_at"], expected);
+}
+
+#[test]
+fn recognized_usage_limit_message_parses_relative_reset_window() {
+    let duration_ms = (3 * 24 * 60 * 60 + 13 * 60 * 60 + 6 * 60) * 1_000;
+    let earliest = Utc::now().timestamp_millis() as u64 + duration_ms;
+    let request = report_from_stream(
+        include_str!("fixtures/codex-relative-reset-message.jsonl"),
+        FinishStatus::Failed,
+        None,
+    );
+    let latest = Utc::now().timestamp_millis() as u64 + duration_ms;
+    let value = serde_json::to_value(request).expect("serialize finish request");
+    let resume_at = value["resume_at"]
+        .as_u64()
+        .expect("relative reset timestamp");
+
+    assert_eq!(value["judgment"], "rate_limited");
+    assert!((earliest..=latest).contains(&resume_at));
 }
 
 #[test]

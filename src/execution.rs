@@ -178,6 +178,8 @@ pub fn report_preparation_failure(
         provider_session_id: None,
         usage: None,
         pricing_evidence: None,
+        judgment: None,
+        resume_at: None,
     };
     if finish_with_retry(connection, run_id, &request, cancellation)? {
         Ok(ExecutionOutcome::Finished)

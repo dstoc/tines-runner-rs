@@ -1,6 +1,6 @@
 //! Incremental parsing and readable rendering for `codex exec --json` output.
 
-use chrono::{DateTime, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone};
+use chrono::{DateTime, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde_json::Value;
 
 const MAX_SAFE_EPOCH_MS: u64 = 9_007_199_254_740_991;
@@ -212,15 +212,69 @@ fn normalize_epoch(value: u64) -> Option<u64> {
 
 fn parse_timestamp_from_message(message: &str) -> Option<u64> {
     let lower = message.to_ascii_lowercase();
-    let start = lower.find("try again at ")? + "try again at ".len();
-    let value = message[start..]
+    let retry_at = lower.find("try again at ");
+    let retry_in = lower.find("try again in ");
+    let (start, phrase, relative) = match (retry_at, retry_in) {
+        (Some(at), Some(in_)) if in_ < at => (in_, "try again in ", true),
+        (Some(at), _) => (at, "try again at ", false),
+        (None, Some(in_)) => (in_, "try again in ", true),
+        (None, None) => return None,
+    };
+    let value = message[start + phrase.len()..]
         .split_once('\n')
-        .map_or(&message[start..], |(line, _)| line)
+        .map_or(&message[start + phrase.len()..], |(line, _)| line)
         .trim()
         .trim_end_matches(|character: char| {
             matches!(character, '.' | ',' | ')' | ']' | '"' | '\'')
         });
-    parse_rfc3339(value).or_else(|| parse_codex_local_reset(value))
+    if relative {
+        parse_relative_reset(value)
+    } else {
+        parse_rfc3339(value).or_else(|| parse_codex_local_reset(value))
+    }
+}
+
+fn parse_relative_reset(value: &str) -> Option<u64> {
+    let mut tokens = value.split_whitespace();
+    let mut seconds = 0_u64;
+    let mut found_unit = false;
+
+    while let Some(amount) = tokens.next() {
+        if amount.eq_ignore_ascii_case("and") {
+            continue;
+        }
+        let amount = amount
+            .trim_matches(|character: char| matches!(character, '(' | '[' | '{' | ',' | ':'))
+            .parse::<u64>()
+            .ok();
+        let Some(amount) = amount else {
+            break;
+        };
+        let Some(unit) = tokens.next() else {
+            break;
+        };
+        let unit = unit
+            .trim_matches(|character: char| {
+                matches!(character, '.' | ',' | ';' | ':' | ')' | ']' | '}')
+            })
+            .to_ascii_lowercase();
+        let multiplier = match unit.as_str() {
+            "second" | "seconds" => 1,
+            "minute" | "minutes" => 60,
+            "hour" | "hours" => 60 * 60,
+            "day" | "days" => 24 * 60 * 60,
+            _ => break,
+        };
+        seconds = seconds.checked_add(amount.checked_mul(multiplier)?)?;
+        found_unit = true;
+    }
+
+    if !found_unit || seconds == 0 {
+        return None;
+    }
+    let now = u64::try_from(Utc::now().timestamp_millis()).ok()?;
+    let resume_at = now.checked_add(seconds.checked_mul(1_000)?)?;
+    (resume_at <= MAX_SAFE_EPOCH_MS).then_some(resume_at)
 }
 
 fn parse_rfc3339(value: &str) -> Option<u64> {
