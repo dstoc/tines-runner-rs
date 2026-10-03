@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"thread-limited"}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":8}}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Try again later.","codex_error_info":"usage_limit_exceeded","resets_at":1791000000}}

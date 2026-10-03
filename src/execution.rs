@@ -88,7 +88,7 @@ pub fn execute_assignment_cancellable(
         return Ok(ExecutionOutcome::Cancelled);
     }
 
-    let (status, error, output) = match run_output {
+    let (mut status, mut error, output) = match run_output {
         Ok(output) if !output.timed_out && output.exit == ProcessExit::Code(0) => {
             (FinishStatus::Completed, None, Some(output))
         }
@@ -98,8 +98,6 @@ pub fn execute_assignment_cancellable(
         }
         Err(error) => (FinishStatus::Failed, Some(error), None),
     };
-    let error = error.map(|error| redact(&error, &secrets));
-
     if let Some(output) = output {
         collect_output(
             &mut report,
@@ -119,6 +117,19 @@ pub fn execute_assignment_cancellable(
             .map_err(ExecutionError::WorkspaceCleanup)?;
         return Ok(ExecutionOutcome::Cancelled);
     }
+
+    if report.is_rate_limited() {
+        status = FinishStatus::Failed;
+        if error.is_none() {
+            error = Some(
+                report
+                    .rate_limit_message()
+                    .map(|message| format!("Codex provider usage limit: {message}"))
+                    .unwrap_or_else(|| "Codex provider usage limit reached".to_owned()),
+            );
+        }
+    }
+    let error = error.map(|error| redact(&error, &secrets));
 
     let finish_request = report.into_finish_request(status, error);
     if !finish_with_retry(connection, &run_id, &finish_request, cancellation)? {
@@ -167,6 +178,8 @@ pub fn report_preparation_failure(
         provider_session_id: None,
         usage: None,
         pricing_evidence: None,
+        judgment: None,
+        resume_at: None,
     };
     if finish_with_retry(connection, run_id, &request, cancellation)? {
         Ok(ExecutionOutcome::Finished)

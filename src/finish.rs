@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Number, Value};
 
-use crate::codex_stream::CodexEvent;
+use crate::codex_stream::{CodexEvent, CodexRateLimit};
 use crate::protocol::{
     CodexMeasurementStatus, CodexPricingEvidenceV1, CodexRawUsageV1, FinishRunRequest,
     FinishStatus, RunUsage,
@@ -30,6 +30,7 @@ pub struct CodexRunReport {
     terminal_snapshots: u64,
     invalid_usage: bool,
     nonmonotonic_usage: bool,
+    rate_limit: Option<CodexRateLimit>,
 }
 
 impl CodexRunReport {
@@ -47,11 +48,16 @@ impl CodexRunReport {
             terminal_snapshots: 0,
             invalid_usage: false,
             nonmonotonic_usage: false,
+            rate_limit: None,
         }
     }
 
     /// Keep a provider thread ID or terminal usage snapshot from an event.
     pub fn observe(&mut self, event: &CodexEvent) {
+        if let Some(rate_limit) = event.rate_limit() {
+            self.rate_limit = Some(rate_limit);
+        }
+
         if let Some(thread_id) = event
             .thread_id()
             .filter(|value| valid_short(value, MAX_PROVIDER_SESSION_ID_LEN))
@@ -110,6 +116,11 @@ impl CodexRunReport {
         status: FinishStatus,
         error: Option<String>,
     ) -> FinishRunRequest {
+        let rate_limit = (status == FinishStatus::Failed)
+            .then_some(self.rate_limit.as_ref())
+            .flatten();
+        let judgment = rate_limit.map(|_| crate::protocol::FinishJudgment::RateLimited);
+        let resume_at = rate_limit.and_then(|signal| signal.resume_at);
         let measurement_status = self.measurement_status(status);
         let usage = self.raw_usage.as_ref().and_then(normalize_usage);
         let provider_session_id = (self.thread_ids.len() == 1)
@@ -136,7 +147,21 @@ impl CodexRunReport {
             provider_session_id,
             usage,
             pricing_evidence: Some(pricing_evidence),
+            judgment,
+            resume_at,
         }
+    }
+
+    /// Whether a terminal Codex event reported a supported provider limit.
+    pub fn is_rate_limited(&self) -> bool {
+        self.rate_limit.is_some()
+    }
+
+    /// The provider's terminal limit message, when Codex supplied one.
+    pub fn rate_limit_message(&self) -> Option<&str> {
+        self.rate_limit
+            .as_ref()
+            .and_then(|signal| signal.message.as_deref())
     }
 
     fn measurement_status(&self, status: FinishStatus) -> CodexMeasurementStatus {
