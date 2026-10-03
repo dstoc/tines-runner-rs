@@ -69,4 +69,18 @@ Run these commands before submitting a change:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 RUST_TEST_THREADS=2 cargo test --all-targets
+bash scripts/package-release.test.sh
 ```
+
+## Releases
+
+Release Please opens or updates a release pull request from conventional
+commits on `main`. Review and merge that pull request to create the matching
+GitHub tag and release. The release workflow builds the Linux x86_64 binary and
+uploads a versioned `.tar.gz` archive with a SHA256 checksum.
+
+Release Please uses the repository's default `GITHUB_TOKEN`. GitHub does not
+start another workflow for a pull request created with that token. To run the
+existing CI on a generated release pull request, open **Actions → CI → Run
+workflow** and select the release pull request's branch. The same CI workflow
+also runs for ordinary pull requests.

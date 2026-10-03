@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare release PR or create release
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Check out released source
+        if: steps.release.outputs.release_created == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Build Linux x86_64 binary
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "$TARGET"
+          cargo +stable build --release --locked --target "$TARGET"
+
+      - name: Package binary and checksum
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          TARGET: x86_64-unknown-linux-gnu
+        run: |
+          test "$TAG_NAME" = "v$VERSION"
+          bash scripts/package-release.sh "$VERSION" "$TARGET" \
+            "target/$TARGET/release/tines-runner-rs" dist
+
+      - name: Upload release assets
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          TARGET: x86_64-unknown-linux-gnu
+        run: |
+          archive="dist/tines-runner-rs-${TAG_NAME}-${TARGET}.tar.gz"
+          gh release upload "$TAG_NAME" "$archive" "$archive.sha256" --clobber
