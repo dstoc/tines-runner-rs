@@ -299,7 +299,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn recovery_terminates_orphan_and_clears_active_state() {
         let directory = TestDirectory::new();
@@ -330,6 +330,78 @@ mod tests {
         process
             .wait_timeout(Duration::from_secs(1), Duration::from_millis(50))
             .expect("reap terminated test harness");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_terminates_group_members_after_leader_exits() {
+        let directory = TestDirectory::new();
+        let workspace = directory
+            .0
+            .join(format!("tines-runner-workspace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let state_path = directory.0.join("active-runs.json");
+        let ready_path = directory.0.join("descendant.pid");
+
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 300 >/dev/null 2>&1 & echo $! > \"$1\"; exec sleep 300",
+                "stub-harness",
+            ])
+            .arg(&ready_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let leader = SupervisedProcess::spawn(&mut command).expect("spawn stub harness group");
+        let process_identity = leader.identity().clone();
+        let leader_pid = process_identity.process_id();
+        let store = ActiveRunStore::open(&state_path).expect("open active-run state");
+        store
+            .record("arun_orphan_group", process_identity, &workspace)
+            .expect("persist active run");
+
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_path.exists(), "harness did not start its descendant");
+        let descendant = fs::read_to_string(&ready_path)
+            .expect("read descendant PID")
+            .trim()
+            .parse::<u32>()
+            .expect("valid descendant PID");
+        assert!(linux_process_state(descendant).is_some_and(|state| !matches!(state, 'Z' | 'X')));
+
+        let leader_kill = Command::new("sh")
+            .args([
+                "-c",
+                "kill -KILL \"$1\"",
+                "kill-leader",
+                &leader_pid.to_string(),
+            ])
+            .status()
+            .expect("kill process-group leader");
+        assert!(leader_kill.success());
+        leader.wait().expect("reap process-group leader");
+        assert!(linux_process_state(leader_pid).is_none());
+
+        drop(store);
+        let restarted_store =
+            ActiveRunStore::open(&state_path).expect("load active state after leader exit");
+        let recovered = recover_active_runs(&restarted_store, &retention(RetentionMode::Never))
+            .expect("recover surviving process-group member");
+
+        assert_eq!(recovered, ["arun_orphan_group"]);
+        assert!(restarted_store.records().is_empty());
+        assert!(!workspace.exists());
+        let stopped_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while linux_process_state(descendant).is_some_and(|state| !matches!(state, 'Z' | 'X'))
+            && std::time::Instant::now() < stopped_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(linux_process_state(descendant).is_none_or(|state| matches!(state, 'Z' | 'X')));
     }
 
     #[cfg(unix)]

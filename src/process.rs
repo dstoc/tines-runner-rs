@@ -3,8 +3,9 @@
 //! On Unix, each command runs in a fresh process group. On Windows, the
 //! suspended child is assigned to a Job Object before its main thread resumes.
 //! Both mechanisms contain wrappers and their descendants. Linux identities
-//! include the boot ID and start time; Windows identities include process
-//! creation time to reject a reused PID.
+//! include the boot ID and start time; macOS identities include the process
+//! start time; Windows identities include process creation time to reject a
+//! reused PID.
 
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -21,7 +22,7 @@ use std::os::windows::process::CommandExt;
 
 /// Identifies a launched process and, where available, its process group.
 ///
-/// Linux uses `boot_id` and `start_time_ticks`; Windows uses the process
+/// Linux uses `boot_id` and `start_time_ticks`; macOS and Windows use process
 /// creation time in `start_time_ticks`. Check the generation with
 /// [`ProcessIdentity::matches_live_process`] before using the process or group
 /// IDs during crash recovery.
@@ -47,23 +48,23 @@ impl ProcessIdentity {
     /// Check that the same process generation is still running.
     ///
     /// Linux compares the boot ID, process start time, and process group.
-    /// Windows compares process creation time. On other platforms this returns
-    /// `false` because this implementation does not have a generation-safe
-    /// process query there.
+    /// macOS compares process start time and process group. Windows compares
+    /// process creation time. On other platforms this returns `false` because
+    /// this implementation does not have a generation-safe process query
+    /// there.
     pub fn matches_live_process(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
             if self.process_group_id != Some(self.process_id) {
                 return false;
             }
-            let (boot_id, start_time_ticks, process_group_id) =
-                match linux_process_details(self.process_id) {
-                    Ok(details) => details,
-                    Err(_) => return false,
-                };
-            self.boot_id.as_deref() == Some(boot_id.as_str())
-                && self.start_time_ticks == Some(start_time_ticks)
-                && self.process_group_id == Some(process_group_id)
+            let details = match linux_process_details(self.process_id) {
+                Ok(details) => details,
+                Err(_) => return false,
+            };
+            self.boot_id.as_deref() == Some(details.boot_id.as_str())
+                && self.start_time_ticks == Some(details.start_time_ticks)
+                && self.process_group_id == Some(details.process_group_id)
         }
 
         #[cfg(windows)]
@@ -73,7 +74,18 @@ impl ProcessIdentity {
                 && windows_process_creation_time(self.process_id).ok() == self.start_time_ticks
         }
 
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(target_os = "macos")]
+        {
+            self.process_group_id == Some(self.process_id)
+                && macos_process_details(self.process_id).is_ok_and(
+                    |(start_time, process_group_id)| {
+                        self.start_time_ticks == Some(start_time)
+                            && self.process_group_id == Some(process_group_id)
+                    },
+                )
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         false
     }
 
@@ -84,7 +96,12 @@ impl ProcessIdentity {
     /// process. This is used during crash recovery, where a stale PID must not
     /// be treated as ownership of an unrelated process.
     pub fn terminate_if_matches(&self, grace: Duration) -> io::Result<bool> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            terminate_linux_group_if_matches(self, grace)
+        }
+
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             if !self.matches_live_process() {
                 return Ok(false);
@@ -129,9 +146,13 @@ impl ProcessIdentity {
 
         #[cfg(target_os = "linux")]
         let (boot_id, start_time_ticks) = linux_process_details(process_id)
-            .map(|(boot_id, start_time_ticks, _)| (Some(boot_id), Some(start_time_ticks)))
+            .map(|details| (Some(details.boot_id), Some(details.start_time_ticks)))
             .unwrap_or((None, None));
-        #[cfg(all(not(target_os = "linux"), not(windows)))]
+        #[cfg(target_os = "macos")]
+        let (boot_id, start_time_ticks) = macos_process_details(process_id)
+            .map(|(start_time, _)| (None, Some(start_time)))
+            .unwrap_or((None, None));
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
         let (boot_id, start_time_ticks) = (None, None);
         #[cfg(windows)]
         let boot_id = None;
@@ -690,12 +711,41 @@ fn unix_group_exists(process_group_id: u32) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_details(process_id: u32) -> io::Result<(String, u64, u32)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxProcessDetails {
+    boot_id: String,
+    start_time_ticks: u64,
+    process_group_id: u32,
+    state: char,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxGroupMember {
+    process_id: u32,
+    details: LinuxProcessDetails,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_details(process_id: u32) -> io::Result<LinuxProcessDetails> {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    linux_process_details_on_boot(process_id, boot_id.trim())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_details_on_boot(
+    process_id: u32,
+    boot_id: &str,
+) -> io::Result<LinuxProcessDetails> {
     let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat"))?;
     let (_, fields) = stat
         .rsplit_once(") ")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid proc stat record"))?;
     let fields = fields.split_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|field| field.chars().next())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process state"))?;
     let process_group_id = fields
         .get(2)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process group ID"))?
@@ -706,10 +756,291 @@ fn linux_process_details(process_id: u32) -> io::Result<(String, u64, u32)> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
         .parse::<u64>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-        .trim()
-        .to_owned();
-    Ok((boot_id, start_time_ticks, process_group_id))
+    Ok(LinuxProcessDetails {
+        boot_id: boot_id.to_owned(),
+        start_time_ticks,
+        process_group_id,
+        state,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_group_if_matches(
+    identity: &ProcessIdentity,
+    grace: Duration,
+) -> io::Result<bool> {
+    let (Some(process_group_id), Some(boot_id), Some(start_time_ticks)) = (
+        identity.process_group_id,
+        identity.boot_id.as_deref(),
+        identity.start_time_ticks,
+    ) else {
+        return Ok(false);
+    };
+    if process_group_id != identity.process_id {
+        return Ok(false);
+    }
+
+    let Some(members) = linux_process_group_members(
+        identity.process_id,
+        process_group_id,
+        boot_id,
+        start_time_ticks,
+    )?
+    else {
+        // The leader PID exists but names a different process generation.
+        return Ok(false);
+    };
+    if members.is_empty() {
+        return Ok(false);
+    }
+
+    for member in &members {
+        linux_signal_member(member, boot_id, process_group_id, SIGTERM)?;
+    }
+
+    let term_deadline = Instant::now() + grace;
+    loop {
+        if Instant::now() >= term_deadline {
+            break;
+        }
+        thread::sleep(
+            Duration::from_millis(50).min(term_deadline.saturating_duration_since(Instant::now())),
+        );
+        let Some(current) = linux_process_group_members(
+            identity.process_id,
+            process_group_id,
+            boot_id,
+            start_time_ticks,
+        )?
+        else {
+            return Ok(true);
+        };
+        if current.is_empty() {
+            return Ok(true);
+        }
+        for member in &current {
+            linux_signal_member(member, boot_id, process_group_id, SIGTERM)?;
+        }
+    }
+
+    let kill_deadline = Instant::now() + grace.max(Duration::from_millis(100));
+    loop {
+        let Some(current) = linux_process_group_members(
+            identity.process_id,
+            process_group_id,
+            boot_id,
+            start_time_ticks,
+        )?
+        else {
+            return Ok(true);
+        };
+        if current.is_empty() {
+            return Ok(true);
+        }
+        for member in &current {
+            linux_signal_member(member, boot_id, process_group_id, SIGKILL)?;
+        }
+        if Instant::now() >= kill_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "orphan process group did not stop after SIGKILL",
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_members(
+    process_id: u32,
+    process_group_id: u32,
+    boot_id: &str,
+    start_time_ticks: u64,
+) -> io::Result<Option<Vec<LinuxGroupMember>>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(candidate_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let details = match linux_process_details_on_boot(candidate_id, boot_id) {
+            Ok(details) => details,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
+
+        if candidate_id == process_id {
+            if details.process_group_id != process_group_id {
+                // The leader PID was reused outside the recorded group. The
+                // group scan below can still find its surviving descendants.
+                continue;
+            }
+            if details.boot_id != boot_id || details.start_time_ticks != start_time_ticks {
+                // The PID now leads a different generation of this group.
+                return Ok(None);
+            }
+        }
+        if details.process_group_id != process_group_id || details.boot_id != boot_id {
+            continue;
+        }
+        if details.start_time_ticks < start_time_ticks {
+            // A process group cannot contain a process that predates its
+            // leader. Treat this as an unrelated reused group ID.
+            return Ok(None);
+        }
+        if matches!(details.state, 'Z' | 'X') {
+            continue;
+        }
+        members.push(LinuxGroupMember {
+            process_id: candidate_id,
+            details,
+        });
+    }
+    Ok(Some(members))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_signal_member(
+    member: &LinuxGroupMember,
+    boot_id: &str,
+    process_group_id: u32,
+    signal: i32,
+) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    const SYS_PIDFD_SEND_SIGNAL: std::ffi::c_long = 424;
+    const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
+
+    let descriptor = unsafe { syscall(SYS_PIDFD_OPEN, member.process_id as i32, 0u32) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ESRCH_LINUX) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+    let current = match linux_process_details_on_boot(member.process_id, boot_id) {
+        Ok(current) => current,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if current.boot_id != member.details.boot_id
+        || current.start_time_ticks != member.details.start_time_ticks
+        || current.boot_id != boot_id
+        || current.process_group_id != process_group_id
+    {
+        return Ok(false);
+    }
+    if matches!(current.state, 'Z' | 'X') {
+        return Ok(false);
+    }
+
+    let result = unsafe {
+        syscall(
+            SYS_PIDFD_SEND_SIGNAL,
+            descriptor.as_raw_fd(),
+            signal,
+            std::ptr::null::<std::ffi::c_void>(),
+            0u32,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH_LINUX) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const ESRCH_LINUX: i32 = 3;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_details(process_id: u32) -> io::Result<(u64, u32)> {
+    let mut info = MacProcBsdInfo::default();
+    let result = unsafe {
+        proc_pidinfo(
+            process_id as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut MacProcBsdInfo).cast(),
+            std::mem::size_of::<MacProcBsdInfo>() as i32,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if result as usize != std::mem::size_of::<MacProcBsdInfo>() || info.pbi_pid != process_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned incomplete process identity details",
+        ));
+    }
+    Ok((
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+        info.pbi_pgid,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDTBSDINFO: i32 = 3;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+#[allow(dead_code)]
+struct MacProcBsdInfo {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [u8; 16],
+    pbi_name: [u8; 32],
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        process_id: i32,
+        flavor: i32,
+        argument: u64,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: i32,
+    ) -> i32;
 }
 
 #[cfg(windows)]
@@ -1208,7 +1539,7 @@ mod tests {
         assert_descendant_stopped(descendant);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn stale_process_generation_does_not_kill_a_reused_pid() {
         let mut command = Command::new("sh");
