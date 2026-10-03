@@ -236,45 +236,108 @@ fn parse_timestamp_from_message(message: &str) -> Option<u64> {
 
 fn parse_relative_reset(value: &str) -> Option<u64> {
     let mut tokens = value.split_whitespace();
-    let mut seconds = 0_u64;
+    let mut duration_ms = 0_u64;
     let mut found_unit = false;
 
-    while let Some(amount) = tokens.next() {
-        if amount.eq_ignore_ascii_case("and") {
+    while let Some(token) = tokens.next() {
+        if token.eq_ignore_ascii_case("and") {
             continue;
         }
-        let amount = amount
-            .trim_matches(|character: char| matches!(character, '(' | '[' | '{' | ',' | ':'))
-            .parse::<u64>()
-            .ok();
-        let Some(amount) = amount else {
+
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | '[' | '{' | ',' | ':' | '.' | ';' | ')' | ']' | '}'
+            )
+        });
+        let unit_start = token
+            .char_indices()
+            .find(|(_, character)| !character.is_ascii_digit() && *character != '.')
+            .map_or(token.len(), |(index, _)| index);
+        let (amount, suffix) = token.split_at(unit_start);
+        let unit = if suffix.is_empty() {
+            let Some(unit) = tokens.next() else {
+                break;
+            };
+            unit
+        } else {
+            suffix
+        };
+        let Some(multiplier_ms) = relative_unit_milliseconds(unit) else {
             break;
         };
-        let Some(unit) = tokens.next() else {
+        let Some(amount_ms) = parse_decimal_duration_ms(amount, multiplier_ms) else {
             break;
         };
-        let unit = unit
-            .trim_matches(|character: char| {
-                matches!(character, '.' | ',' | ';' | ':' | ')' | ']' | '}')
-            })
-            .to_ascii_lowercase();
-        let multiplier = match unit.as_str() {
-            "second" | "seconds" => 1,
-            "minute" | "minutes" => 60,
-            "hour" | "hours" => 60 * 60,
-            "day" | "days" => 24 * 60 * 60,
-            _ => break,
-        };
-        seconds = seconds.checked_add(amount.checked_mul(multiplier)?)?;
+        duration_ms = duration_ms.checked_add(amount_ms)?;
         found_unit = true;
     }
 
-    if !found_unit || seconds == 0 {
+    if !found_unit || duration_ms == 0 {
         return None;
     }
     let now = u64::try_from(Utc::now().timestamp_millis()).ok()?;
-    let resume_at = now.checked_add(seconds.checked_mul(1_000)?)?;
+    let resume_at = now.checked_add(duration_ms)?;
     (resume_at <= MAX_SAFE_EPOCH_MS).then_some(resume_at)
+}
+
+fn relative_unit_milliseconds(unit: &str) -> Option<u64> {
+    let unit = unit
+        .trim_matches(|character: char| {
+            matches!(character, '.' | ',' | ';' | ':' | ')' | ']' | '}')
+        })
+        .to_ascii_lowercase();
+    match unit.as_str() {
+        "millisecond" | "milliseconds" | "ms" => Some(1),
+        "second" | "seconds" | "sec" | "secs" | "s" => Some(1_000),
+        "minute" | "minutes" | "min" | "mins" | "m" => Some(60_000),
+        "hour" | "hours" | "hr" | "hrs" | "h" => Some(3_600_000),
+        "day" | "days" | "d" => Some(86_400_000),
+        _ => None,
+    }
+}
+
+fn parse_decimal_duration_ms(amount: &str, multiplier_ms: u64) -> Option<u64> {
+    let (whole, fraction) = amount
+        .split_once('.')
+        .map_or((amount, None), |(whole, fraction)| (whole, Some(fraction)));
+    let whole = if whole.is_empty() {
+        0_u128
+    } else {
+        whole.parse::<u128>().ok()?
+    };
+    let multiplier_ms = u128::from(multiplier_ms);
+    let mut duration_ms = whole.checked_mul(multiplier_ms)?;
+
+    if let Some(fraction) = fraction {
+        if fraction.is_empty() || fraction.len() > 18 {
+            return None;
+        }
+        let fraction_value = fraction.parse::<u128>().ok()?;
+        let denominator = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+        duration_ms = duration_ms.checked_add(
+            fraction_value
+                .checked_mul(multiplier_ms)?
+                .checked_div(denominator)?,
+        )?;
+    }
+
+    u64::try_from(duration_ms).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_decimal_duration_ms;
+
+    #[test]
+    fn compact_retry_amounts_keep_millisecond_precision() {
+        assert_eq!(parse_decimal_duration_ms("11.054", 1_000), Some(11_054));
+        assert_eq!(parse_decimal_duration_ms("20", 1), Some(20));
+        assert_eq!(
+            parse_decimal_duration_ms("3", 86_400_000),
+            Some(259_200_000)
+        );
+    }
 }
 
 fn parse_rfc3339(value: &str) -> Option<u64> {

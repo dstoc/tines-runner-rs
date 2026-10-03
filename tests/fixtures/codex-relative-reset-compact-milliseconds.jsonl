@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"thread-compact-milliseconds"}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":8}}
+{"type":"turn.failed","error":{"codex_error_info":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 20ms"}}

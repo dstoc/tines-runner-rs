@@ -299,6 +299,47 @@ fn recognized_usage_limit_message_parses_relative_reset_window() {
 }
 
 #[test]
+fn compact_relative_resets_preserve_session_and_usage_in_finish_report() {
+    for (fixture, duration_ms, session_id) in [
+        (
+            include_str!("fixtures/codex-relative-reset-compact-seconds.jsonl"),
+            11_054,
+            "thread-compact-seconds",
+        ),
+        (
+            include_str!("fixtures/codex-relative-reset-compact-milliseconds.jsonl"),
+            20,
+            "thread-compact-milliseconds",
+        ),
+    ] {
+        let earliest = Utc::now().timestamp_millis() as u64 + duration_ms;
+        let request = report_from_stream(
+            fixture,
+            FinishStatus::Failed,
+            Some("Codex exited with code 1"),
+        );
+        let value = serde_json::to_value(request).expect("serialize finish request");
+        let latest = Utc::now().timestamp_millis() as u64 + duration_ms;
+        let resume_at = value["resume_at"]
+            .as_u64()
+            .expect("compact retry delay produces a reset timestamp");
+
+        assert_eq!(value["judgment"], "rate_limited");
+        assert!((earliest.saturating_sub(250)..=latest).contains(&resume_at));
+        assert_eq!(value["provider_session_id"], session_id);
+        assert_eq!(
+            value["usage"],
+            serde_json::json!({
+                "input_tokens": 95,
+                "output_tokens": 8,
+                "cache_read_tokens": 20,
+                "cache_write_tokens": 5
+            })
+        );
+    }
+}
+
+#[test]
 fn authentication_and_model_errors_do_not_become_rate_limits() {
     let request = report_from_stream(
         include_str!("fixtures/codex-provider-errors.jsonl"),
