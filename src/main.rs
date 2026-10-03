@@ -56,6 +56,21 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let state_directory = config
+        .credentials_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let active_runs =
+        tines_runner_rs::recovery::ActiveRunStore::open(state_directory.join("active-runs.json"))?;
+    let recovered_runs = tines_runner_rs::recovery::recover_active_runs(
+        &active_runs,
+        &config.workspace_retention,
+        &config.workspace_parents(),
+    )?;
+    for run_id in recovered_runs {
+        tracing::info!(run_id, "recovered interrupted assignment before polling");
+    }
     tines_runner_rs::retention::prune_retained_roots(
         config.workspace_parents(),
         &config.workspace_retention,
@@ -123,10 +138,11 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                 let worker_capabilities = capabilities.clone();
                 let worker_assignment = assignment.clone();
                 let worker_run_logs = run_logs;
+                let worker_active_runs = active_runs.clone();
                 match thread::Builder::new()
                     .name(format!("runner-run-{run_id}"))
                     .spawn(move || {
-                        tines_runner_rs::assignment_worker::run_assignment(
+                        tines_runner_rs::assignment_worker::run_assignment_with_active_runs(
                             &worker_config,
                             &worker_connection,
                             &worker_client,
@@ -134,6 +150,7 @@ fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
                             worker_run_logs,
                             &worker_capabilities,
                             &worker_cancellation,
+                            &worker_active_runs,
                         )
                     })
                 {

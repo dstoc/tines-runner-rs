@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::WorkspaceRetention;
 use crate::process::ProcessIdentity;
-use crate::workspace::{prune_retained_workspaces, settle_recovered_workspace};
+use crate::retention;
 
 const STATE_VERSION: u8 = 1;
 const ORPHAN_TERMINATION_GRACE: Duration = Duration::from_secs(2);
@@ -179,10 +179,12 @@ impl ActiveRunStore {
 pub fn recover_active_runs(
     store: &ActiveRunStore,
     retention: &WorkspaceRetention,
+    workspace_roots: &[PathBuf],
 ) -> io::Result<Vec<String>> {
     let records = store.records();
     let mut recovered = Vec::with_capacity(records.len());
     for record in records {
+        validate_workspace_root(&record.workspace, workspace_roots)?;
         let terminated = record
             .process
             .as_ref()
@@ -203,14 +205,44 @@ pub fn recover_active_runs(
             );
         }
 
-        settle_recovered_workspace(&record.workspace, &record.run_id, retention)?;
+        retention::settle_recovered_workspace(&record.workspace, retention, &record.run_id)
+            .map_err(io::Error::other)?;
         if let Some(parent) = record.workspace.parent() {
-            prune_retained_workspaces(parent, retention)?;
+            retention::prune_retained(parent, retention).map_err(io::Error::other)?;
         }
         store.remove(&record.run_id)?;
         recovered.push(record.run_id);
     }
     Ok(recovered)
+}
+
+fn validate_workspace_root(workspace: &Path, roots: &[PathBuf]) -> io::Result<()> {
+    let Some(parent) = workspace.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "active-run workspace has no parent directory",
+        ));
+    };
+    for root in roots {
+        let root = match fs::canonicalize(root) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if root.is_absolute() {
+                    root.clone()
+                } else {
+                    std::env::current_dir()?.join(root)
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        if root == parent {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "active-run workspace is outside the configured workspace roots",
+    ))
 }
 
 fn write_state(path: &Path, runs: &BTreeMap<String, ActiveRunRecord>) -> io::Result<()> {
@@ -303,9 +335,7 @@ mod tests {
     #[test]
     fn recovery_terminates_orphan_and_clears_active_state() {
         let directory = TestDirectory::new();
-        let workspace = directory
-            .0
-            .join(format!("tines-runner-workspace-{}", uuid::Uuid::new_v4()));
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&workspace).expect("create workspace");
         fs::write(workspace.join("prompt.md"), "stub").expect("write workspace file");
 
@@ -322,8 +352,12 @@ mod tests {
         let restarted_store =
             ActiveRunStore::open(&state_path).expect("load state after runner restart");
 
-        let recovered = recover_active_runs(&restarted_store, &retention(RetentionMode::Never))
-            .expect("recover active run");
+        let recovered = recover_active_runs(
+            &restarted_store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect("recover active run");
         assert_eq!(recovered, ["arun_recovery"]);
         assert!(restarted_store.records().is_empty());
         assert!(!workspace.exists());
@@ -336,9 +370,7 @@ mod tests {
     #[test]
     fn recovery_terminates_group_members_after_leader_exits() {
         let directory = TestDirectory::new();
-        let workspace = directory
-            .0
-            .join(format!("tines-runner-workspace-{}", uuid::Uuid::new_v4()));
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&workspace).expect("create workspace");
         let state_path = directory.0.join("active-runs.json");
         let ready_path = directory.0.join("descendant.pid");
@@ -389,8 +421,12 @@ mod tests {
         drop(store);
         let restarted_store =
             ActiveRunStore::open(&state_path).expect("load active state after leader exit");
-        let recovered = recover_active_runs(&restarted_store, &retention(RetentionMode::Never))
-            .expect("recover surviving process-group member");
+        let recovered = recover_active_runs(
+            &restarted_store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect("recover surviving process-group member");
 
         assert_eq!(recovered, ["arun_orphan_group"]);
         assert!(restarted_store.records().is_empty());
@@ -408,9 +444,7 @@ mod tests {
     #[test]
     fn active_state_survives_reopen_and_is_removed_atomically() {
         let directory = TestDirectory::new();
-        let workspace = directory
-            .0
-            .join(format!("tines-runner-workspace-{}", uuid::Uuid::new_v4()));
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&workspace).expect("create workspace");
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 30"]);
@@ -434,9 +468,7 @@ mod tests {
     #[test]
     fn recovery_cleans_workspace_abandoned_before_harness_spawn() {
         let directory = TestDirectory::new();
-        let workspace = directory
-            .0
-            .join(format!("tines-runner-workspace-{}", uuid::Uuid::new_v4()));
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&workspace).expect("create workspace");
         fs::write(workspace.join("partial-checkout"), "in progress")
             .expect("write partial checkout");
@@ -449,11 +481,45 @@ mod tests {
 
         let restarted_store =
             ActiveRunStore::open(&state_path).expect("load state after runner restart");
-        let recovered = recover_active_runs(&restarted_store, &retention(RetentionMode::Never))
-            .expect("recover workspace without a spawned harness");
+        let recovered = recover_active_runs(
+            &restarted_store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect("recover workspace without a spawned harness");
         assert_eq!(recovered, ["arun_preparing"]);
         assert!(restarted_store.records().is_empty());
         assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn recovery_leaves_workspaces_outside_configured_roots_untouched() {
+        let directory = TestDirectory::new();
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("user-file"), "keep").expect("write workspace file");
+        let state_path = directory.0.join("active-runs.json");
+        let store = ActiveRunStore::open(&state_path).expect("open active-run state");
+        store
+            .record_workspace("arun_outside_root", &workspace)
+            .expect("persist workspace");
+
+        let configured_root = directory.0.join("configured-workspaces");
+        fs::create_dir_all(&configured_root).expect("create configured workspace root");
+        let result = recover_active_runs(
+            &store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&configured_root),
+        );
+
+        assert_eq!(
+            result
+                .expect_err("reject workspace outside configured roots")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(workspace.join("user-file").is_file());
+        assert_eq!(store.records().len(), 1);
     }
 
     #[cfg(target_os = "linux")]
@@ -487,9 +553,7 @@ mod tests {
         let directory = TestDirectory::new();
         let state_path = directory.0.join("active-runs.json");
         let ready_path = directory.0.join("runner-ready");
-        let workspace = directory
-            .0
-            .join(format!("tines-runner-workspace-{}", uuid::Uuid::new_v4()));
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
         let mut runner = Command::new(std::env::current_exe().expect("current test binary"));
         runner
             .args([
@@ -528,8 +592,12 @@ mod tests {
             .expect("fixture has process identity")
             .process_id();
 
-        let recovered = recover_active_runs(&store, &retention(RetentionMode::Never))
-            .expect("recover after runner crash");
+        let recovered = recover_active_runs(
+            &store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect("recover after runner crash");
         assert_eq!(recovered, ["arun_killed_runner"]);
         assert!(!workspace.exists());
         assert!(store.records().is_empty());

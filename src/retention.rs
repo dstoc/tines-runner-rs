@@ -61,6 +61,59 @@ pub fn settle_workspace(
     Ok(())
 }
 
+/// Apply the failed-run retention policy to a workspace left by a crash.
+pub fn settle_recovered_workspace(
+    workspace: &Path,
+    retention: &WorkspaceRetention,
+    run_id: &str,
+) -> Result<(), RetentionError> {
+    let name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("run-"));
+    if name
+        .and_then(|name| uuid::Uuid::parse_str(name).ok())
+        .is_none()
+    {
+        return Err(RetentionError::Io {
+            operation: "validate recovered workspace",
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid generated workspace path",
+            ),
+        });
+    }
+
+    match fs::symlink_metadata(workspace) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(RetentionError::Io {
+                operation: "validate recovered workspace",
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recovered workspace is not a real directory",
+                ),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(RetentionError::Io {
+                operation: "inspect recovered workspace",
+                source,
+            });
+        }
+    }
+
+    settle_workspace(
+        workspace,
+        retention,
+        run_id,
+        None,
+        FinishStatus::Failed,
+        Some("runner stopped before reporting a terminal result"),
+    )
+}
+
 /// Return whether a terminal outcome is selected by a retention mode.
 pub fn should_retain(mode: RetentionMode, status: FinishStatus) -> bool {
     match mode {

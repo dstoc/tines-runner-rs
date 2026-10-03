@@ -14,6 +14,7 @@ pub mod logging;
 pub mod poll;
 pub mod process;
 pub mod protocol;
+pub mod recovery;
 pub mod retention;
 pub mod runner;
 pub mod workspace;
