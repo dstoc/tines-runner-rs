@@ -40,14 +40,25 @@ checks the default workspace parent and every workspace parent set by an
 override. Pruning only deletes workspace directories with a valid marker. The
 runner leaves unmarked directories untouched during pruning.
 
-## Development checks
+## Protocol acceptance
 
-The protocol integration suite in `tests/fake_tines_integration.rs` runs the
-runner against a deterministic local Tines server and a configurable Codex
-stub. It covers registration, assignment and override selection, wrapper argv,
-log and finish retries, rate limits, cancellation, timeout, concurrency,
-crash recovery, graceful shutdown, and daemon fencing. It does not need a live
-Tines deployment or a provider account.
+Run the end-to-end protocol acceptance suite on Unix with:
+
+```sh
+cargo test --test fake_tines_integration
+```
+
+The suite starts an isolated Tines protocol server and a stub Codex executable.
+The acceptance scenario registers a local runner, routes a test issue to its
+name, checks the project/workflow/state override, clones a local Git fixture
+into the assignment workspace, and uses the run key from the Codex process to
+read issue details. It also checks log streaming and the completed finish
+state. Other scenarios cover retries, rate limits, cancellation, timeout,
+concurrency, crash recovery, graceful shutdown, and daemon fencing/reconnect.
+The check needs Git and curl. It does not need a live Tines deployment or a
+provider account.
+
+## Development checks
 
 Run these commands before submitting a change:
 

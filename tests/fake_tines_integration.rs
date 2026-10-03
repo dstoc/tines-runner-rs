@@ -205,6 +205,34 @@ fn write_jsonl(directory: &TestDirectory, name: &str, contents: &str) -> std::pa
     path
 }
 
+fn create_local_repository(directory: &std::path::Path) -> std::path::PathBuf {
+    fs::create_dir_all(directory).expect("create local acceptance repository");
+    fs::write(
+        directory.join("acceptance.txt"),
+        "materialized from routed test repository\n",
+    )
+    .expect("write acceptance repository fixture");
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.name", "Acceptance Test"][..],
+        &["config", "user.email", "acceptance@example.invalid"][..],
+        &["add", "acceptance.txt"][..],
+        &["commit", "--quiet", "-m", "acceptance fixture"][..],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .expect("run git to prepare acceptance repository");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    directory.to_owned()
+}
+
 fn poll_requests(requests: &[RecordedRequest]) -> Vec<&RecordedRequest> {
     requests
         .iter()
@@ -239,11 +267,12 @@ fn stop_gracefully(fake: &FakeTines, runner: &mut RunnerProcess) {
 }
 
 #[test]
-fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
+fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 1, true);
+    let local_repository = create_local_repository(&directory.path.join("acceptance-repository"));
 
     let jsonl = write_jsonl(
         &directory,
@@ -255,26 +284,41 @@ fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
     );
     let wrapper_marker = directory.path.join("wrapper-selected.txt");
     let args_file = directory.path.join("codex-args.txt");
+    let workspace_probe = directory.path.join("workspace-probe.txt");
+    let run_key_probe = directory.path.join("run-key-api.json");
+    let mut routed_assignment = assignment(
+        "arun_happy",
+        5,
+        vec![
+            env("FAKE_CODEX_JSONL_FILE", jsonl.to_string_lossy()),
+            env("FAKE_CODEX_WRAPPER_FILE", wrapper_marker.to_string_lossy()),
+            env("FAKE_CODEX_ARGS_FILE", args_file.to_string_lossy()),
+            env(
+                "FAKE_CODEX_WORKSPACE_PROBE_FILE",
+                workspace_probe.to_string_lossy(),
+            ),
+            env(
+                "FAKE_CODEX_RUN_KEY_PROBE_FILE",
+                run_key_probe.to_string_lossy(),
+            ),
+        ],
+    );
+    routed_assignment["run"]["issue_ref"]["number"] = json!(2301);
+    routed_assignment["run"]["issue_ref"]["title"] = json!("Acceptance fixture issue");
+    routed_assignment["bundle"]["repos"] = json!([{
+        "url": local_repository.to_string_lossy(),
+        "branch": null,
+        "dir": "materialized"
+    }]);
     fake.fail_next_polls(1);
     fake.fail_next_logs(1);
     fake.fail_next_finishes(1);
-    fake.enqueue_poll(json!({
-        "assignments": [assignment(
-            "arun_happy",
-            5,
-            vec![
-                env("FAKE_CODEX_JSONL_FILE", jsonl.to_string_lossy()),
-                env("FAKE_CODEX_WRAPPER_FILE", wrapper_marker.to_string_lossy()),
-                env("FAKE_CODEX_ARGS_FILE", args_file.to_string_lossy()),
-            ],
-        )],
-        "cancels": []
-    }));
+    fake.route_issue("fake-tines-integration", routed_assignment);
 
     let mut runner = directory.runner(Some("fake-bootstrap-key"));
     let finishes = fake.wait_for_finishes(1, Duration::from_secs(20));
     let finish = &finishes[0];
-    assert_eq!(finish["status"], "completed");
+    assert_eq!(finish["status"], "completed", "finish state reaches Tines");
     assert_eq!(finish["provider_session_id"], "thread-from-stub");
     assert_eq!(finish["usage"]["input_tokens"], 75);
     assert_eq!(finish["usage"]["cache_read_tokens"], 20);
@@ -284,7 +328,23 @@ fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
         fs::read_to_string(&wrapper_marker)
             .expect("read selected wrapper marker")
             .trim(),
-        "selected"
+        "selected",
+        "project, workflow, and state selectors choose the override"
+    );
+    let workspace_evidence = fs::read_to_string(&workspace_probe)
+        .expect("read workspace materialization evidence from the harness");
+    assert!(
+        workspace_evidence.contains("workspace=")
+            && workspace_evidence.contains("prompt=exercise arun_happy")
+            && workspace_evidence.contains("repo=materialized from routed test repository"),
+        "harness sees the assignment prompt and cloned repository: {workspace_evidence:?}"
+    );
+    let run_key_response = fs::read_to_string(&run_key_probe)
+        .expect("read successful Tines API response fetched by the Codex stub");
+    assert!(
+        run_key_response.contains("\"id\":\"iss_arun_happy\"")
+            && run_key_response.contains("\"name\":\"Implementation\""),
+        "Codex stub can use its run key to read issue details: {run_key_response:?}"
     );
     let args = fs::read_to_string(args_file).expect("read captured Codex argv");
     assert!(
@@ -304,6 +364,11 @@ fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
         registration.header("authorization"),
         Some("Bearer fake-bootstrap-key")
     );
+    assert_eq!(
+        registration.json()["name"],
+        "fake-tines-integration",
+        "Tines routes the issue using the registered local runner name"
+    );
     let poll_attempts = poll_requests(&requests);
     assert!(
         poll_attempts.len() >= 4,
@@ -319,8 +384,21 @@ fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
         .expect("issue metadata request");
     assert_eq!(
         metadata.header("authorization"),
-        Some("Bearer issue-run-key-arun_happy")
+        Some("Bearer issue-run-key-arun_happy"),
+        "issue detail lookup uses the assignment run key"
     );
+    let issue_detail_requests = requests
+        .iter()
+        .filter(|request| request.target == "/api/v1/issues/iss_arun_happy")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        issue_detail_requests.len(),
+        2,
+        "both the runner and harness use the run-key issue API"
+    );
+    assert!(issue_detail_requests.iter().all(|request| {
+        request.header("authorization") == Some("Bearer issue-run-key-arun_happy")
+    }));
 
     let log_attempts = requests
         .iter()
@@ -341,6 +419,13 @@ fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
             .as_str()
             .is_some_and(|chunk| chunk.contains("thread-from-stub"))
     }));
+    assert!(
+        requests.iter().any(|request| {
+            request.target == "/api/v1/runs/arun_happy/logs"
+                && request.header("authorization") == Some("Bearer fake-runner-token")
+        }),
+        "streamed logs use the registered runner token"
+    );
 
     let finish_attempts = requests
         .iter()
@@ -355,6 +440,11 @@ fn registered_runner_completes_assignment_with_wrapper_override_and_retries() {
     assert_eq!(
         fs::read_dir(directory.workspace_parent()).unwrap().count(),
         0
+    );
+    assert!(
+        fake.unexpected_requests().is_empty(),
+        "unexpected protocol requests: {:?}",
+        fake.unexpected_requests()
     );
 }
 
