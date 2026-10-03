@@ -42,6 +42,13 @@ runner leaves unmarked directories untouched during pruning.
 
 ## Development checks
 
+The protocol integration suite in `tests/fake_tines_integration.rs` runs the
+runner against a deterministic local Tines server and a configurable Codex
+stub. It covers registration, assignment and override selection, wrapper argv,
+log and finish retries, rate limits, cancellation, timeout, concurrency,
+crash recovery, graceful shutdown, and daemon fencing. It does not need a live
+Tines deployment or a provider account.
+
 Run these commands before submitting a change:
 
 ```sh
