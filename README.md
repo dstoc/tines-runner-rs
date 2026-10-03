@@ -68,5 +68,5 @@ Run these commands before submitting a change:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+RUST_TEST_THREADS=2 cargo test --all-targets
 ```
