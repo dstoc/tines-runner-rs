@@ -64,13 +64,53 @@ impl MaterializedWorkspace {
         cancellation: &CancellationToken,
         on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
-        Self::create_with_git_program(
+        Self::create_cancellable_with_workspace_hook(
+            parent,
+            assignment,
+            api_url,
+            cancellation,
+            |_| Ok(()),
+            on_git_output,
+        )
+    }
+
+    /// Create a workspace and persist its path before materializing files.
+    pub fn create_cancellable_with_workspace_hook(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        cancellation: &CancellationToken,
+        on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
+        on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
+        Self::create_with_git_program_and_hook(
             parent,
             assignment,
             api_url,
             cancellation,
             OsStr::new("git"),
+            on_workspace_created,
             on_git_output,
+        )
+    }
+
+    fn create_with_git_program_and_hook(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        cancellation: &CancellationToken,
+        git_program: &OsStr,
+        mut on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
+        mut on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
+        Self::create_with_git_program(
+            parent,
+            assignment,
+            api_url,
+            cancellation,
+            git_program,
+            |path| on_workspace_created(path),
+            |chunk| on_git_output(chunk),
         )
     }
 
@@ -80,6 +120,7 @@ impl MaterializedWorkspace {
         api_url: &Url,
         cancellation: &CancellationToken,
         git_program: &OsStr,
+        mut on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
         mut on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
         let environment = LaunchEnvironment::new(
@@ -96,13 +137,20 @@ impl MaterializedWorkspace {
             source,
         })?;
         let path = create_unique_workspace(parent)?;
-        let result = materialize_contents(
-            &path,
-            assignment,
-            cancellation,
-            git_program,
-            &mut on_git_output,
-        );
+        let result = on_workspace_created(&path)
+            .map_err(|source| WorkspaceError::Io {
+                operation: "persist active-run state",
+                source,
+            })
+            .and_then(|()| {
+                materialize_contents(
+                    &path,
+                    assignment,
+                    cancellation,
+                    git_program,
+                    &mut on_git_output,
+                )
+            });
         if let Err(error) = result {
             match fs::remove_dir_all(&path) {
                 Ok(()) => {}
@@ -137,6 +185,19 @@ impl MaterializedWorkspace {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+impl WorkspaceError {
+    /// Whether workspace removal failed while handling a materialization error.
+    pub(crate) fn workspace_cleanup_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::Io {
+                operation: "remove incomplete assignment workspace",
+                ..
+            }
+        )
     }
 }
 
@@ -940,6 +1001,7 @@ mod tests {
                 &api_url,
                 &worker_cancellation,
                 fake_git_path.as_os_str(),
+                |_| Ok(()),
                 |_| {},
             )
         });

@@ -15,6 +15,7 @@ use crate::finish::CodexRunReport;
 use crate::process::{ProcessExit, ProcessOutput, ProcessStream, SupervisedProcess};
 use crate::protocol::client::{Client, ClientError, ErrorCategory};
 use crate::protocol::{FinishRunRequest, FinishStatus};
+use crate::recovery::ActiveRunStore;
 use crate::retention::{self, RetentionError};
 use crate::runner::{RunnerConnection, RunnerError};
 
@@ -48,20 +49,56 @@ pub fn execute_assignment(
 /// Execute one assignment while honoring supervisor cancellation at every
 /// process, log, and finish boundary.
 pub fn execute_assignment_cancellable(
-    mut assignment: PreparedAssignment,
+    assignment: PreparedAssignment,
     connection: &RunnerConnection,
     client: &Client,
     capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
 ) -> Result<ExecutionOutcome, ExecutionError> {
+    execute_assignment_cancellable_inner(
+        assignment,
+        connection,
+        client,
+        capabilities,
+        retention,
+        cancellation,
+        None,
+    )
+}
+
+/// Execute an assignment and update its durable active-run record.
+pub fn execute_assignment_cancellable_with_active_runs(
+    assignment: PreparedAssignment,
+    connection: &RunnerConnection,
+    client: &Client,
+    capabilities: &EffortCapabilities,
+    retention: &WorkspaceRetention,
+    cancellation: &CancellationToken,
+    active_runs: &ActiveRunStore,
+) -> Result<ExecutionOutcome, ExecutionError> {
+    execute_assignment_cancellable_inner(
+        assignment,
+        connection,
+        client,
+        capabilities,
+        retention,
+        cancellation,
+        Some(active_runs),
+    )
+}
+
+fn execute_assignment_cancellable_inner(
+    mut assignment: PreparedAssignment,
+    connection: &RunnerConnection,
+    client: &Client,
+    capabilities: &EffortCapabilities,
+    retention: &WorkspaceRetention,
+    cancellation: &CancellationToken,
+    active_runs: Option<&ActiveRunStore>,
+) -> Result<ExecutionOutcome, ExecutionError> {
     if cancellation.is_cancelled() {
-        assignment.stop_log_delivery();
-        assignment
-            .workspace()
-            .cleanup()
-            .map_err(ExecutionError::WorkspaceCleanup)?;
-        return Ok(ExecutionOutcome::Cancelled);
+        return settle_canceled_assignment(&assignment, active_runs);
     }
     let run_id = assignment.assignment().run.id.clone();
     let runner_token = connection.credentials().runner_token();
@@ -84,6 +121,7 @@ pub fn execute_assignment_cancellable(
         &mut assignment,
         &log_context,
         capabilities,
+        active_runs,
         timeout,
         &mut report,
     );
@@ -92,12 +130,7 @@ pub fn execute_assignment_cancellable(
         || assignment.log_delivery_cancelled()
         || run_output.as_ref().is_ok_and(|output| output.cancelled)
     {
-        assignment.stop_log_delivery();
-        assignment
-            .workspace()
-            .cleanup()
-            .map_err(ExecutionError::WorkspaceCleanup)?;
-        return Ok(ExecutionOutcome::Cancelled);
+        return settle_canceled_assignment(&assignment, active_runs);
     }
 
     let (mut status, mut error) = match run_output {
@@ -131,11 +164,7 @@ pub fn execute_assignment_cancellable(
         &finish_request,
         cancellation,
     )? {
-        assignment
-            .workspace()
-            .cleanup()
-            .map_err(ExecutionError::WorkspaceCleanup)?;
-        return Ok(ExecutionOutcome::Cancelled);
+        return settle_canceled_assignment(&assignment, active_runs);
     }
     let issue_ref = assignment
         .assignment()
@@ -152,7 +181,29 @@ pub fn execute_assignment_cancellable(
         finish_request.error.as_deref(),
     )
     .map_err(ExecutionError::WorkspaceRetention)?;
+    remove_active_run(active_runs, &run_id).map_err(ExecutionError::ActiveStateCleanup)?;
     Ok(ExecutionOutcome::Finished)
+}
+
+fn settle_canceled_assignment(
+    assignment: &PreparedAssignment,
+    active_runs: Option<&ActiveRunStore>,
+) -> Result<ExecutionOutcome, ExecutionError> {
+    assignment.stop_log_delivery();
+    assignment
+        .workspace()
+        .cleanup()
+        .map_err(ExecutionError::WorkspaceCleanup)?;
+    remove_active_run(active_runs, &assignment.assignment().run.id)
+        .map_err(ExecutionError::ActiveStateCleanup)?;
+    Ok(ExecutionOutcome::Cancelled)
+}
+
+fn remove_active_run(active_runs: Option<&ActiveRunStore>, run_id: &str) -> io::Result<()> {
+    if let Some(active_runs) = active_runs {
+        active_runs.remove(run_id)?;
+    }
+    Ok(())
 }
 
 /// The terminal action taken for one assignment.
@@ -198,6 +249,7 @@ fn run_harness(
     assignment: &mut PreparedAssignment,
     context: &RunLogContext<'_>,
     capabilities: &EffortCapabilities,
+    active_runs: Option<&ActiveRunStore>,
     timeout: Duration,
     report: &mut CodexRunReport,
 ) -> Result<ProcessOutput, String> {
@@ -227,6 +279,21 @@ fn run_harness(
     let process = SupervisedProcess::spawn_with_output(&mut command)
         .map_err(|error| format!("could not start Codex harness: {error}"))?;
     let deadline = Instant::now() + timeout;
+
+    if let Some(active_runs) = active_runs
+        && let Err(error) = active_runs.record(
+            assignment.assignment().run.id.clone(),
+            process.identity().clone(),
+            assignment.workspace().path(),
+        )
+    {
+        return Err(match process.terminate(TERMINATION_GRACE) {
+            Ok(_) => format!("could not persist harness identity; harness was stopped: {error}"),
+            Err(stop_error) => format!(
+                "could not persist harness identity ({error}) or stop the harness ({stop_error})"
+            ),
+        });
+    }
 
     if let Some(Err(error)) = retry_protocol_until(deadline, cancellation, || {
         assignment.harness_started_until(client, runner_token, deadline)
@@ -554,6 +621,7 @@ pub enum ExecutionError {
     FinishReport(RunnerError),
     WorkspaceCleanup(io::Error),
     WorkspaceRetention(RetentionError),
+    ActiveStateCleanup(io::Error),
 }
 
 impl fmt::Display for ExecutionError {
@@ -570,6 +638,12 @@ impl fmt::Display for ExecutionError {
                 f,
                 "run finish was accepted, but workspace retention failed: {error}"
             ),
+            Self::ActiveStateCleanup(error) => {
+                write!(
+                    f,
+                    "run settled, but active-run state could not be cleared: {error}"
+                )
+            }
         }
     }
 }
@@ -580,6 +654,7 @@ impl Error for ExecutionError {
             Self::FinishReport(error) => Some(error),
             Self::WorkspaceCleanup(error) => Some(error),
             Self::WorkspaceRetention(error) => Some(error),
+            Self::ActiveStateCleanup(error) => Some(error),
         }
     }
 }
@@ -783,6 +858,7 @@ mod tests {
             &mut prepared,
             &log_context,
             &capabilities,
+            None,
             Duration::from_millis(2_200),
             &mut report,
         )
