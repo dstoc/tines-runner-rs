@@ -78,7 +78,7 @@ impl ProcessIdentity {
         {
             self.process_group_id == Some(self.process_id)
                 && macos_process_details(self.process_id).is_ok_and(
-                    |(start_time, process_group_id)| {
+                    |(start_time, process_group_id, _)| {
                         self.start_time_ticks == Some(start_time)
                             && self.process_group_id == Some(process_group_id)
                     },
@@ -155,7 +155,7 @@ impl ProcessIdentity {
             .unwrap_or((None, None));
         #[cfg(target_os = "macos")]
         let (boot_id, start_time_ticks) = macos_process_details(process_id)
-            .map(|(start_time, _)| (None, Some(start_time)))
+            .map(|(start_time, _, _)| (None, Some(start_time)))
             .unwrap_or((None, None));
         #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
         let (boot_id, start_time_ticks) = (None, None);
@@ -981,7 +981,7 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_details(process_id: u32) -> io::Result<(u64, u32)> {
+fn macos_process_details(process_id: u32) -> io::Result<(u64, u32, u32)> {
     let mut info = MacProcBsdInfo::default();
     let result = unsafe {
         proc_pidinfo(
@@ -1016,6 +1016,7 @@ fn macos_process_details(process_id: u32) -> io::Result<(u64, u32)> {
             .saturating_mul(1_000_000)
             .saturating_add(info.pbi_start_tvusec),
         info.pbi_pgid,
+        info.pbi_status,
     ))
 }
 
@@ -1094,7 +1095,38 @@ fn terminate_macos_group_if_matches(
         return Ok(true);
     }
     signal_unix_group(process_group_id, SIGKILL)?;
+    wait_for_group_to_stop(grace.max(Duration::from_millis(100)), || {
+        let members = macos_process_group_members(identity)?;
+        if members.is_empty() {
+            return Ok(true);
+        }
+        // A member can fork while the initial group signal is being
+        // delivered. Signal the verified group again until no members remain.
+        signal_unix_group(process_group_id, SIGKILL)?;
+        Ok(false)
+    })?;
     Ok(true)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn wait_for_group_to_stop(
+    timeout: Duration,
+    mut is_stopped: impl FnMut() -> io::Result<bool>,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if is_stopped()? {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "orphan process group did not stop after SIGKILL",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(now)));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1140,11 +1172,14 @@ fn macos_process_group_members(identity: &ProcessIdentity) -> io::Result<Vec<Mac
     let mut members = Vec::with_capacity(process_ids.len());
     for process_id in process_ids.into_iter().filter(|process_id| *process_id > 0) {
         let process_id = process_id as u32;
-        let (start_time_ticks, current_group_id) = match macos_process_details(process_id) {
+        let (start_time_ticks, current_group_id, status) = match macos_process_details(process_id) {
             Ok(details) => details,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
+        if status == MACOS_STATUS_ZOMBIE {
+            continue;
+        }
         let member = MacosGroupMember {
             process_id,
             process_group_id: current_group_id,
@@ -1162,6 +1197,9 @@ const ESRCH_MACOS: i32 = 3;
 
 #[cfg(target_os = "macos")]
 const PROC_PIDTBSDINFO: i32 = 3;
+
+#[cfg(target_os = "macos")]
+const MACOS_STATUS_ZOMBIE: u32 = 5;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -1589,6 +1627,8 @@ fn windows_generate_console_ctrl_break(process_group_id: u32) -> io::Result<()> 
 mod tests {
     #[cfg(unix)]
     use super::SupervisedProcess;
+    #[cfg(unix)]
+    use super::wait_for_group_to_stop;
     use super::{MacosGroupMember, ProcessIdentity, validate_macos_group_member};
     use super::{ProcessExit, ProcessOutput};
     #[cfg(unix)]
@@ -1616,6 +1656,26 @@ mod tests {
             output.format_exit_diagnostic(Duration::from_secs(61)),
             "# tines runner: exit signal=9 (timed out) after 1m1s\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_stop_waits_until_the_last_member_is_gone() {
+        let mut checks = 0;
+        wait_for_group_to_stop(Duration::from_secs(1), || {
+            checks += 1;
+            Ok(checks == 3)
+        })
+        .expect("group should stop after the third check");
+        assert_eq!(checks, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_stop_times_out_while_members_remain() {
+        let error = wait_for_group_to_stop(Duration::from_millis(20), || Ok(false))
+            .expect_err("group with surviving members must not be reported as stopped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[cfg(unix)]

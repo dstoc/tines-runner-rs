@@ -181,6 +181,17 @@ pub fn recover_active_runs(
     retention: &WorkspaceRetention,
     workspace_roots: &[PathBuf],
 ) -> io::Result<Vec<String>> {
+    recover_active_runs_with(store, retention, workspace_roots, |process, grace| {
+        process.terminate_if_matches(grace)
+    })
+}
+
+fn recover_active_runs_with(
+    store: &ActiveRunStore,
+    retention: &WorkspaceRetention,
+    workspace_roots: &[PathBuf],
+    mut terminate: impl FnMut(&ProcessIdentity, Duration) -> io::Result<bool>,
+) -> io::Result<Vec<String>> {
     let records = store.records();
     let mut recovered = Vec::with_capacity(records.len());
     for record in records {
@@ -188,7 +199,7 @@ pub fn recover_active_runs(
         let terminated = record
             .process
             .as_ref()
-            .map(|process| process.terminate_if_matches(ORPHAN_TERMINATION_GRACE))
+            .map(|process| terminate(process, ORPHAN_TERMINATION_GRACE))
             .transpose()?
             .unwrap_or(false);
         if terminated {
@@ -294,12 +305,13 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveRunStore, recover_active_runs};
+    use super::{ActiveRunStore, recover_active_runs, recover_active_runs_with};
     use crate::config::{RetentionMode, WorkspaceRetention};
     #[cfg(target_os = "macos")]
     use crate::process::ProcessIdentity;
     use crate::process::SupervisedProcess;
     use std::fs;
+    use std::io;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -366,6 +378,49 @@ mod tests {
         process
             .wait_timeout(Duration::from_secs(1), Duration::from_millis(50))
             .expect("reap terminated test harness");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_state_and_workspace_when_termination_is_unconfirmed() {
+        let directory = TestDirectory::new();
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("user-file"), "keep").expect("write workspace file");
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let process = SupervisedProcess::spawn(&mut command).expect("spawn test harness");
+        let store = ActiveRunStore::open(directory.0.join("active-runs.json"))
+            .expect("open active-run state");
+        store
+            .record(
+                "arun_unconfirmed_termination",
+                process.identity().clone(),
+                &workspace,
+            )
+            .expect("persist active run");
+
+        let error = recover_active_runs_with(
+            &store,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "orphan process group did not stop after SIGKILL",
+                ))
+            },
+        )
+        .expect_err("unconfirmed termination must stop recovery");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(store.records().len(), 1);
+        assert!(workspace.join("user-file").is_file());
+        assert!(process.identity().matches_live_process());
+        process
+            .terminate(Duration::from_millis(50))
+            .expect("stop test harness after recovery check");
     }
 
     #[cfg(target_os = "linux")]
