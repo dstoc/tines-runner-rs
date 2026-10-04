@@ -77,6 +77,7 @@ impl PollState {
             ),
             executor_harness: match config.runner_type {
                 crate::config::RunnerType::Codex => "codex".to_owned(),
+                crate::config::RunnerType::Custom => "custom".to_owned(),
             },
             executor_capabilities: None,
             executor_capabilities_refreshed_at: None,

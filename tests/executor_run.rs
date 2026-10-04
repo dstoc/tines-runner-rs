@@ -46,6 +46,15 @@ fn request(workspace_parent: &Path, retention: &str, timeout_minutes: u64) -> Va
 }
 
 fn run_executor(directory: &Path, request: &Value, codex: &str) -> ExecutorOutput {
+    run_executor_with_env(directory, request, codex, &[])
+}
+
+fn run_executor_with_env(
+    directory: &Path,
+    request: &Value,
+    codex: &str,
+    inherited_env: &[(&str, &str)],
+) -> ExecutorOutput {
     let bin_directory = directory.join("bin");
     fs::create_dir_all(&bin_directory).expect("create stub bin directory");
     let stub = bin_directory.join("codex");
@@ -57,14 +66,17 @@ fn run_executor(directory: &Path, request: &Value, codex: &str) -> ExecutorOutpu
         std::iter::once(bin_directory.clone()).chain(std::env::split_paths(&current_path)),
     )
     .expect("compose executor PATH");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command
         .arg("execute")
         .env("PATH", path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start executor");
+        .stderr(Stdio::piped());
+    for (name, value) in inherited_env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("start executor");
     serde_json::to_writer(
         child.stdin.take().expect("executor stdin is piped"),
         request,
@@ -106,6 +118,19 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":42,"cached_input
 "##
 }
 
+fn custom_request(workspace_parent: &Path, command: Vec<String>) -> Value {
+    let mut request = request(workspace_parent, "failed", 120);
+    request["execution"]["harness"] = Value::String("custom".to_owned());
+    request["execution"]["custom_command"] = json!(command);
+    request
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write custom harness script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("make custom harness executable");
+}
+
 #[test]
 fn successful_execution_emits_one_result_and_applies_always_retention() {
     let directory = TestDirectory::new();
@@ -136,6 +161,154 @@ fn successful_execution_emits_one_result_and_applies_always_retention() {
     .expect("valid retention marker");
     assert_eq!(marker["terminal_status"], "completed");
     assert_eq!(marker["issue_ref"], "Tines/4");
+}
+
+#[test]
+fn custom_github_checks_style_command_runs_with_placeholders_environment_and_generic_logs() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("custom-workspaces");
+    let script_path = directory.0.join("github-checks-style");
+    let interpolation_target = directory.0.join("should-not-exist");
+    let injected_argument = format!("literal; $(touch {})", interpolation_target.display());
+    let script = format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = '{injected_argument}' ] || exit 31\n\
+         [ -f \"$2\" ] || exit 32\n\
+         [ \"$(cat \"$2\")\" = 'Implement the assigned issue.' ] || exit 33\n\
+         [ \"$3\" = \"$PWD\" ] || exit 34\n\
+         [ \"$4\" = \"prefix=$PWD\" ] || exit 35\n\
+         [ \"$TINES_API_KEY\" = 'fixture-run-key' ] || exit 36\n\
+         [ \"$TINES_API_URL\" = 'https://tines.example.test' ] || exit 37\n\
+         [ \"$FIXTURE_TOKEN\" = 'fixture-secret' ] || exit 38\n\
+         [ \"${{TINES_RUNNER_TOKEN+x}}\" != x ] || exit 39\n\
+         [ \"${{TYPESAFE_API_KEY+x}}\" != x ] || exit 40\n\
+         printf '%s\\n' 'github-checks style fixture passed'\n\
+         printf '%s\\n' 'custom stderr diagnostic' >&2\n"
+    );
+    write_executable(&script_path, &script);
+    let command = vec![
+        script_path.to_string_lossy().into_owned(),
+        injected_argument,
+        "{prompt_file}".to_owned(),
+        "{workspace}".to_owned(),
+        "prefix={workspace}".to_owned(),
+    ];
+    let request = custom_request(&workspace_parent, command);
+
+    let output = run_executor_with_env(
+        &directory.0,
+        &request,
+        "#!/bin/sh\nexit 99\n",
+        &[
+            ("TINES_API_KEY", "long-lived-bootstrap-key"),
+            ("TINES_API_URL", "https://daemon.example.test"),
+            ("TINES_RUNNER_TOKEN", "long-lived-runner-token"),
+            ("TYPESAFE_API_KEY", "typesafe-key"),
+        ],
+    );
+
+    assert!(
+        output.success,
+        "stderr: {}\nevents: {:#?}",
+        output.stderr, output.events
+    );
+    assert_eq!(result(&output)["status"], "completed");
+    assert!(
+        !interpolation_target.exists(),
+        "argv was shell-interpolated"
+    );
+    let logs = output
+        .events
+        .iter()
+        .filter(|event| event["type"] == "log")
+        .collect::<Vec<_>>();
+    assert!(logs.iter().any(|event| {
+        event["stream"] == "stdout"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("github-checks style fixture passed"))
+    }));
+    let stderr = logs
+        .iter()
+        .filter(|event| event["stream"] == "stderr")
+        .filter_map(|event| event["message"].as_str())
+        .collect::<String>();
+    assert!(stderr.contains("custom stderr diagnostic"));
+    let rendered = serde_json::to_string(&output.events).unwrap();
+    for secret in [
+        "fixture-secret",
+        "fixture-run-key",
+        "long-lived-bootstrap-key",
+        "long-lived-runner-token",
+        "typesafe-key",
+    ] {
+        assert!(!rendered.contains(secret), "secret {secret} reached logs");
+    }
+}
+
+#[test]
+fn custom_nonzero_exit_fails_with_redacted_stderr_context() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("custom-workspaces");
+    let script_path = directory.0.join("failing-check");
+    let before_boundary = "x".repeat(8 * 1024 - 4);
+    let after_secret = "y".repeat(
+        16 * 1024 - before_boundary.len() - "fixture-secret".len() - "fixture-run-key".len(),
+    );
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{before_boundary}' >&2\nprintf '%s' 'fixture-secret' >&2\nprintf '%s' '{after_secret}' >&2\nprintf '%s' 'fixture-run-key' >&2\nexit 7\n"
+    );
+    write_executable(&script_path, &script);
+    let request = custom_request(
+        &workspace_parent,
+        vec![script_path.to_string_lossy().into_owned()],
+    );
+
+    let output = run_executor(&directory.0, &request, "#!/bin/sh\nexit 99\n");
+
+    assert!(!output.success);
+    let terminal = result(&output);
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["exit_code"], 7);
+    let error = terminal["error"].as_str().expect("failure diagnostic");
+    assert!(error.contains("custom harness exited with code 7"));
+    assert!(error.contains("custom harness stderr"));
+    assert!(error.contains("***"));
+    assert!(!error.contains("fixture-secret"));
+    assert!(!error.contains("e-secret"));
+    assert!(output.events.iter().any(|event| {
+        event["type"] == "log"
+            && event["stream"] == "stderr"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("***"))
+    }));
+    let rendered_events = serde_json::to_string(&output.events).expect("serialize test events");
+    for secret in ["fixture-secret", "e-secret", "fixture-run-key"] {
+        assert!(
+            !rendered_events.contains(secret),
+            "secret fragment {secret} reached executor events"
+        );
+    }
+
+    let workspace = fs::read_dir(workspace_parent)
+        .expect("failed workspace parent remains")
+        .next()
+        .expect("failed workspace retained")
+        .expect("workspace entry")
+        .path();
+    let marker: Value = serde_json::from_slice(
+        &fs::read(workspace.join(".tines-runner-retained.json")).expect("retention marker"),
+    )
+    .expect("valid retention marker");
+    let retained_error = marker["error"].as_str().expect("retained error diagnostic");
+    assert!(retained_error.contains("***"));
+    for secret in ["fixture-secret", "e-secret", "fixture-run-key"] {
+        assert!(
+            !retained_error.contains(secret),
+            "secret fragment {secret} reached retained metadata"
+        );
+    }
 }
 
 #[test]

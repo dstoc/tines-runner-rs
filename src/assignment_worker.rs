@@ -137,6 +137,7 @@ fn run_assignment_inner(
     }
     let harness = match resolved.resolution().config.runner_type {
         crate::config::RunnerType::Codex => "codex",
+        crate::config::RunnerType::Custom => "custom",
     };
     if !capabilities.supports(harness) {
         return Ok(AssignmentTaskOutcome::Declined(format!(

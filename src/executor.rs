@@ -26,6 +26,7 @@ use crate::shutdown::ShutdownSignal;
 pub mod codex;
 pub mod codex_adapter;
 pub mod codex_stream;
+pub mod custom_adapter;
 pub mod harness;
 pub mod workspace;
 
@@ -126,7 +127,7 @@ pub fn execute_request(
             return emit_failure(request, output, diagnostics, error.to_string());
         }
     };
-    let mut parser = events.event_parser();
+    let mut parser = events.event_parser_for_request(request);
     let retention = retention_policy(request);
     let workspace_parent =
         match config::resolve_workspace_parent(request.execution.workspace.parent.as_deref()) {
@@ -238,17 +239,13 @@ pub fn execute_request(
                                         }
                                         ProcessStream::Stderr => {
                                             let message = stderr_decoder.push(&chunk.bytes);
-                                            if !message.is_empty() {
-                                                streamed_error = write_event(
-                                                    request,
-                                                    output,
-                                                    &ExecutionEvent::new(ExecutionEventKind::Log {
-                                                        stream: LogStream::Stderr,
-                                                        message,
-                                                    }),
-                                                )
-                                                .err()
-                                                .map(|error| error.to_string());
+                                            for event in parser.push_stderr(&message) {
+                                                if let Err(error) =
+                                                    write_event(request, output, &event)
+                                                {
+                                                    streamed_error = Some(error.to_string());
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -276,17 +273,25 @@ pub fn execute_request(
                                             }
                                         }
                                         let stderr_tail = stderr_decoder.finish();
-                                        if streamed_error.is_none() && !stderr_tail.is_empty() {
-                                            streamed_error = write_event(
-                                                request,
-                                                output,
-                                                &ExecutionEvent::new(ExecutionEventKind::Log {
-                                                    stream: LogStream::Stderr,
-                                                    message: stderr_tail,
-                                                }),
-                                            )
-                                            .err()
-                                            .map(|error| error.to_string());
+                                        if streamed_error.is_none() {
+                                            for event in parser.push_stderr(&stderr_tail) {
+                                                if let Err(error) =
+                                                    write_event(request, output, &event)
+                                                {
+                                                    streamed_error = Some(error.to_string());
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if streamed_error.is_none() {
+                                            for event in parser.finish_stderr() {
+                                                if let Err(error) =
+                                                    write_event(request, output, &event)
+                                                {
+                                                    streamed_error = Some(error.to_string());
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
 
@@ -425,6 +430,9 @@ fn emit_terminal(
             ExecutionEventKind::Result { result } => result,
             _ => unreachable!("executor terminal event must be a result"),
         };
+        if let Some(error) = &mut terminal.error {
+            request.redact_sensitive_text(error);
+        }
         let status = match terminal.status {
             TerminalStatus::Completed => FinishStatus::Completed,
             TerminalStatus::Failed | TerminalStatus::RateLimited => FinishStatus::Failed,

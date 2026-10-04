@@ -253,10 +253,15 @@ impl LaunchEnvironment {
     /// The machine's existing `PATH` remains in effect, and the assignment
     /// cannot replace the Tines-owned API key or API URL.
     pub fn apply_to(&self, command: &mut Command) {
+        command
+            .env_remove("TINES_RUNNER_TOKEN")
+            .env_remove("TYPESAFE_API_KEY");
         for entry in self.variables.values() {
             if entry.name != "PATH"
                 && entry.name != "TINES_API_KEY"
                 && entry.name != "TINES_API_URL"
+                && entry.name != "TINES_RUNNER_TOKEN"
+                && entry.name != "TYPESAFE_API_KEY"
             {
                 command.env(&entry.name, &entry.value);
             }

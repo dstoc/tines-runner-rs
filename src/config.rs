@@ -12,12 +12,12 @@ use url::Url;
 
 /// The harness types supported by the runner.
 ///
-/// Add variants here when the runner gains another harness. The initial
-/// configuration format accepts only `codex`.
+/// Add variants here when the runner gains another harness.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RunnerType {
     Codex,
+    Custom,
 }
 
 /// Whether a completed assignment's workspace should be retained.
@@ -51,6 +51,8 @@ pub struct Config {
     legacy_workspace_roots: Vec<PathBuf>,
     /// The argv prefix used to reach the local or isolated executor.
     pub executor: Vec<String>,
+    /// Default argv command for assignments using the custom harness.
+    pub custom_command: Option<Vec<String>>,
     /// The daemon-side working directory for the executor transport process.
     pub executor_cwd: PathBuf,
     pub max_concurrent: usize,
@@ -70,6 +72,8 @@ pub struct ResolvedRunConfig {
     pub workspace_parent: Option<PathBuf>,
     /// The argv prefix used to reach the executor; `execute` is appended.
     pub executor: Vec<String>,
+    /// Command argv for the semantic custom harness, if configured.
+    pub custom_command: Option<Vec<String>>,
     /// Absolute daemon-side working directory for the executor process.
     pub executor_cwd: PathBuf,
 }
@@ -175,6 +179,7 @@ impl Config {
             runner_type: self.runner_type,
             workspace_parent: self.workspace_parent.clone(),
             executor: self.executor.clone(),
+            custom_command: self.custom_command.clone(),
             executor_cwd: self.executor_cwd.clone(),
         };
         let mut matching_overrides = Vec::new();
@@ -192,6 +197,11 @@ impl Config {
             }
             if let Some(executor) = &rule.executor {
                 resolved.executor.clone_from(executor);
+            }
+            if let Some(custom_command) = &rule.custom_command {
+                resolved
+                    .custom_command
+                    .clone_from(&Some(custom_command.clone()));
             }
             if let Some(executor_cwd) = &rule.executor_cwd {
                 resolved.executor_cwd.clone_from(executor_cwd);
@@ -293,10 +303,14 @@ impl Config {
                     && rule.runner_type.is_none()
                     && rule.executor.is_none()
                     && rule.executor_cwd.is_none()
+                    && rule.custom_command.is_none()
                 {
                     return Err(ConfigError::Invalid(
                         "each [[override]] must set at least one override value".to_owned(),
                     ));
+                }
+                if let Some(command) = &rule.custom_command {
+                    validate_custom_command(command)?;
                 }
                 Ok(ConfigOverride {
                     project: rule.project,
@@ -305,6 +319,7 @@ impl Config {
                     workspace_parent: rule.workspace_parent,
                     runner_type: rule.runner_type,
                     executor: rule.executor,
+                    custom_command: rule.custom_command,
                     executor_cwd: rule
                         .executor_cwd
                         .as_deref()
@@ -324,6 +339,11 @@ impl Config {
                 .runner
                 .executor
                 .unwrap_or_else(|| vec!["tines-runner-rs".to_owned()]),
+            custom_command: raw
+                .runner
+                .custom_command
+                .map(|command| validate_custom_command(&command).map(|()| command))
+                .transpose()?,
             executor_cwd,
             max_concurrent,
             allow_remote_concurrency: raw.runner.allow_remote_concurrency,
@@ -361,6 +381,7 @@ struct ConfigOverride {
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     executor: Option<Vec<String>>,
+    custom_command: Option<Vec<String>>,
     executor_cwd: Option<PathBuf>,
 }
 
@@ -406,6 +427,7 @@ struct RawRunner {
     runner_type: Option<RunnerType>,
     workspace_parent: Option<PathBuf>,
     executor: Option<Vec<String>>,
+    custom_command: Option<Vec<String>>,
     executor_cwd: Option<PathBuf>,
     max_concurrent: Option<usize>,
     #[serde(default)]
@@ -431,6 +453,7 @@ struct RawOverride {
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     executor: Option<Vec<String>>,
+    custom_command: Option<Vec<String>>,
     executor_cwd: Option<PathBuf>,
 }
 
@@ -536,6 +559,20 @@ fn resolve_executor_cwd(path: &Path, home: &Path) -> Result<PathBuf, ConfigError
     } else {
         Ok(home.join(expanded))
     }
+}
+
+fn validate_custom_command(command: &[String]) -> Result<(), ConfigError> {
+    if command.is_empty() || command[0].trim().is_empty() {
+        return Err(ConfigError::Invalid(
+            "custom_command must contain a non-empty executable argument".to_owned(),
+        ));
+    }
+    if command.iter().any(|argument| argument.contains('\0')) {
+        return Err(ConfigError::Invalid(
+            "custom_command arguments must not contain null bytes".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn absolute_path(path: Option<PathBuf>) -> Option<PathBuf> {
@@ -801,6 +838,60 @@ workspace_parent = "/review"
         let resolved = config.resolve(context("Tines", "Implementation", "Review"));
         assert_eq!(resolved.workspace_parent, Some(PathBuf::from("/review")));
         assert_eq!(resolved.executor, ["workflow-executor"]);
+    }
+
+    #[test]
+    fn custom_commands_resolve_by_field_in_override_declaration_order() {
+        let config = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+
+[runner]
+name = "test-runner"
+executor_cwd = "/host/default"
+runner_type = "custom"
+custom_command = ["base-checks", "{prompt_file}"]
+
+[[override]]
+project = "Payments"
+custom_command = ["payments-checks", "{workspace}"]
+
+[[override]]
+state = "Review"
+custom_command = ["review-checks", "{prompt_file}"]
+"#,
+            defaults(),
+        )
+        .unwrap();
+
+        let payments = config.resolve(context("Payments", "Build", "Implement"));
+        assert_eq!(payments.runner_type, RunnerType::Custom);
+        assert_eq!(
+            payments.custom_command,
+            Some(vec!["payments-checks".to_owned(), "{workspace}".to_owned()])
+        );
+
+        let review = config.resolve(context("Other", "Build", "Review"));
+        assert_eq!(
+            review.custom_command,
+            Some(vec!["review-checks".to_owned(), "{prompt_file}".to_owned()])
+        );
+
+        let overlapping = config.resolve(context("Payments", "Build", "Review"));
+        assert_eq!(
+            overlapping.custom_command,
+            Some(vec!["review-checks".to_owned(), "{prompt_file}".to_owned()])
+        );
+    }
+
+    #[test]
+    fn custom_commands_must_have_a_program_and_no_null_bytes() {
+        for command in ["[]", "[\"\"]", "[\"check\", \"bad\\u0000arg\"]"] {
+            let config = format!(
+                "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test\"\nrunner_type = \"custom\"\ncustom_command = {command}\nexecutor_cwd = \"/daemon\"\n"
+            );
+            assert!(Config::from_toml_str_with_defaults(&config, defaults()).is_err());
+        }
     }
 
     #[test]

@@ -30,43 +30,52 @@ pub struct ExecutorHarnessCapabilities {
 impl ExecutorCapabilities {
     /// Probe Codex in the current environment and return a versioned document.
     pub fn discover(daemon_version: &str) -> Self {
+        let mut harnesses = BTreeMap::from([(
+            "custom".to_owned(),
+            ExecutorHarnessCapabilities {
+                version: format!("tines-runner-rs {daemon_version}")
+                    .chars()
+                    .take(MAX_IDENTIFIER_LENGTH)
+                    .collect(),
+                effort: None,
+            },
+        )]);
         let effort = EffortCapabilities::discover(daemon_version);
         if effort.validate_for_harness("codex").is_err() {
             return Self {
                 version: EXECUTOR_CAPABILITIES_VERSION,
-                harnesses: BTreeMap::new(),
+                harnesses,
                 discovery_error: Some("Codex capabilities could not be verified".to_owned()),
             };
         }
 
         let version = effort.harness_version.clone();
         if let Some(error) = effort.discovery_error.clone() {
-            let harnesses = if version != "unknown" {
-                BTreeMap::from([(
+            if version != "unknown" {
+                harnesses.insert(
                     "codex".to_owned(),
                     ExecutorHarnessCapabilities {
                         version,
                         effort: None,
                     },
-                )])
-            } else {
-                BTreeMap::new()
-            };
+                );
+            }
             return Self {
                 version: EXECUTOR_CAPABILITIES_VERSION,
                 harnesses,
                 discovery_error: Some(error),
             };
         }
+        harnesses.insert(
+            "codex".to_owned(),
+            ExecutorHarnessCapabilities {
+                version,
+                effort: Some(effort),
+            },
+        );
         Self {
             version: EXECUTOR_CAPABILITIES_VERSION,
-            harnesses: BTreeMap::from([(
-                "codex".to_owned(),
-                ExecutorHarnessCapabilities {
-                    version,
-                    effort: Some(effort),
-                },
-            )]),
+            harnesses,
             discovery_error: None,
         }
     }
@@ -175,4 +184,20 @@ pub fn discover_for_cli(daemon_version: &str) -> Result<(), std::io::Error> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &capabilities).map_err(std::io::Error::other)?;
     std::io::Write::write_all(&mut stdout, b"\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecutorCapabilities;
+
+    #[test]
+    fn generic_executor_capability_document_supports_custom_without_effort() {
+        let report = ExecutorCapabilities::parse(
+            br#"{"version":1,"harnesses":{"custom":{"version":"tines-runner-rs 0.1.0"}}}"#,
+        )
+        .expect("valid custom harness report");
+
+        assert!(report.supports("custom"));
+        assert!(report.harnesses["custom"].effort.is_none());
+    }
 }

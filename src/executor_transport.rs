@@ -52,7 +52,9 @@ pub fn execution_request(
         execution: LocalExecutionPolicy {
             harness: match policy.runner_type {
                 RunnerType::Codex => "codex".to_owned(),
+                RunnerType::Custom => "custom".to_owned(),
             },
+            custom_command: policy.custom_command.clone(),
             workspace: WorkspacePolicy {
                 parent: policy.workspace_parent.clone(),
             },

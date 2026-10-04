@@ -203,6 +203,7 @@ impl RunnerConnection {
 fn registration_request(config: &Config) -> RegisterRunnerRequest {
     let harness = match config.runner_type {
         RunnerType::Codex => RunnerHarness::Codex,
+        RunnerType::Custom => RunnerHarness::Custom,
     };
 
     RegisterRunnerRequest {
@@ -291,7 +292,7 @@ impl Error for RunnerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunnerConnection, RunnerError};
+    use super::{RunnerConnection, RunnerError, registration_request};
     use crate::config::Config;
     use crate::credentials::{BootstrapKey, CredentialStore, RunnerCredentials};
     use crate::protocol::client::{Client, RunLogBuffer};
@@ -441,6 +442,22 @@ mod tests {
         assert!(saved.contains("rnr_registered"));
         assert!(saved.contains("runner-secret"));
         assert!(!saved.contains("user-api-secret"));
+    }
+
+    #[test]
+    fn custom_runner_registers_with_the_custom_semantic_harness() {
+        let directory = TestDirectory::new();
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"checks-runner\"\nrunner_type = \"custom\"\ncustom_command = [\"checks\"]\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {:?}\n",
+            directory.credentials_path()
+        ))
+        .expect("custom runner config");
+
+        let request = serde_json::to_value(registration_request(&config))
+            .expect("serialize registration request");
+        assert_eq!(request["harness"], "custom");
+        assert_eq!(request["name"], "checks-runner");
+        assert!(request.get("command").is_none());
     }
 
     #[test]
