@@ -20,9 +20,14 @@ use crate::execution_protocol::{
     EXECUTION_PROTOCOL_VERSION, ExecutionRequest, ExecutionRetentionPolicy, LocalExecutionPolicy,
     TinesExecutionContext, WorkspacePolicy,
 };
+use crate::executor_capabilities::ExecutorCapabilities;
 use crate::process::{ProcessExit as ChildExit, ProcessStream, SupervisedProcess};
 
 const EXECUTOR_MODE: &str = "execute";
+const CAPABILITIES_MODE: &str = "capabilities";
+const MAX_CAPABILITIES_OUTPUT_BYTES: usize = 64 * 1024;
+const CAPABILITIES_DEADLINE: Duration = Duration::from_secs(10);
+const CAPABILITIES_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 const STDERR_TRUNCATION_MARKER: &str = "\n[executor stderr truncated]";
 
@@ -78,6 +83,63 @@ impl ExecutorTransport {
             argv,
             executor_cwd: executor_cwd.into(),
         }
+    }
+
+    /// Run `<argv...> capabilities` and validate the bounded JSON document it returns.
+    pub fn discover_capabilities(&self) -> Result<ExecutorCapabilities, ExecutorTransportError> {
+        let program = self
+            .argv
+            .first()
+            .filter(|program| !program.trim().is_empty())
+            .ok_or(ExecutorTransportError::MissingCommand)?;
+        let working_directory = validate_capabilities_cwd(&self.executor_cwd)?;
+        let mut command = Command::new(program);
+        command
+            .args(self.argv.iter().skip(1))
+            .arg(CAPABILITIES_MODE)
+            .current_dir(working_directory)
+            .stdin(std::process::Stdio::null());
+        command.env_clear();
+        command.envs(safe_capabilities_environment(env::vars_os()));
+
+        let process = SupervisedProcess::spawn_with_output(&mut command)
+            .map_err(|_| ExecutorTransportError::Capabilities("could not start executor"))?;
+        let mut stdout = Vec::new();
+        let mut stdout_too_large = false;
+        let output = process
+            .wait_timeout_with_output(
+                CAPABILITIES_DEADLINE,
+                CAPABILITIES_TERMINATION_GRACE,
+                || false,
+                |chunk| {
+                    if chunk.stream == ProcessStream::Stdout {
+                        let remaining = MAX_CAPABILITIES_OUTPUT_BYTES.saturating_sub(stdout.len());
+                        let accepted = chunk.bytes.len().min(remaining);
+                        stdout.extend_from_slice(&chunk.bytes[..accepted]);
+                        stdout_too_large |= accepted < chunk.bytes.len();
+                    }
+                },
+                || {},
+            )
+            .map_err(|_| ExecutorTransportError::Capabilities("could not wait for executor"))?;
+
+        if output.timed_out {
+            return Err(ExecutorTransportError::Capabilities(
+                "executor capability discovery timed out",
+            ));
+        }
+        if output.exit != ChildExit::Code(0) {
+            return Err(ExecutorTransportError::Capabilities(
+                "executor capability command failed",
+            ));
+        }
+        if stdout_too_large {
+            return Err(ExecutorTransportError::Capabilities(
+                "executor capability document exceeded 64 KiB",
+            ));
+        }
+        ExecutorCapabilities::parse(&stdout)
+            .map_err(|_| ExecutorTransportError::Capabilities("invalid capability document"))
     }
 
     /// Launch `<argv...> execute`, deliver one JSON document on stdin, and
@@ -197,6 +259,48 @@ fn validate_executor_cwd(
     })
 }
 
+fn validate_capabilities_cwd(path: &Path) -> Result<PathBuf, ExecutorTransportError> {
+    let metadata = fs::metadata(path).map_err(|_| {
+        ExecutorTransportError::InvalidWorkingDirectory(format!(
+            "configured executor_cwd {} is unavailable",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(ExecutorTransportError::InvalidWorkingDirectory(format!(
+            "configured executor_cwd {} is not a directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        const X_OK: c_int = 1;
+        let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            ExecutorTransportError::InvalidWorkingDirectory(
+                "configured executor_cwd contains a null byte".to_owned(),
+            )
+        })?;
+        if unsafe { access(path_c.as_ptr(), X_OK) } != 0 {
+            return Err(ExecutorTransportError::InvalidWorkingDirectory(format!(
+                "configured executor_cwd {} is inaccessible",
+                path.display()
+            )));
+        }
+    }
+    fs::read_dir(path).map_err(|_| {
+        ExecutorTransportError::InvalidWorkingDirectory(format!(
+            "configured executor_cwd {} is inaccessible",
+            path.display()
+        ))
+    })?;
+    fs::canonicalize(path).map_err(|_| {
+        ExecutorTransportError::InvalidWorkingDirectory(format!(
+            "could not resolve configured executor_cwd {}",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(unix)]
 fn validate_executor_cwd_search_access(
     path: &Path,
@@ -267,9 +371,22 @@ fn safe_executor_environment(
 }
 
 fn is_tines_credential_name(name: &str) -> bool {
-    ["TINES_API_KEY", "TINES_API_URL", "TINES_RUNNER_TOKEN"]
-        .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    [
+        "TINES_API_KEY",
+        "TINES_API_URL",
+        "TINES_RUNNER_TOKEN",
+        "TYPESAFE_API_KEY",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+fn safe_capabilities_environment(
+    environment: impl Iterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .filter(|(name, _)| !is_tines_credential_name(&name.to_string_lossy()))
+        .collect()
 }
 
 fn secret_values(request: &ExecutionRequest) -> Vec<String> {
@@ -392,6 +509,7 @@ pub enum ExecutorTransportError {
     Spawn(String),
     RequestDelivery,
     Wait(String),
+    Capabilities(&'static str),
 }
 
 impl fmt::Display for ExecutorTransportError {
@@ -406,6 +524,7 @@ impl fmt::Display for ExecutorTransportError {
                 f.write_str("executor closed stdin before receiving the complete request")
             }
             Self::Wait(error) => write!(f, "could not wait for executor transport: {error}"),
+            Self::Capabilities(error) => write!(f, "executor capabilities unavailable: {error}"),
         }
     }
 }

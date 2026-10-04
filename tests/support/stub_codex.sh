@@ -1,12 +1,21 @@
 #!/bin/sh
 set -eu
 
-if [ "${1:-}" = "--version" ]; then
+if [ "${1:-}" = "--version" ] || {
+    [ "${2:-}" = "codex" ] && [ "${3:-}" = "--version" ];
+}; then
     printf '%s\n' 'codex-fake 0.1.0'
     exit 0
 fi
 
-if [ "${1:-}" = "app-server" ]; then
+if [ "${1:-}" = "app-server" ] || {
+    [ "${2:-}" = "codex" ] && [ "${3:-}" = "app-server" ];
+}; then
+    if [ "${1:-}" = "app-server" ]; then
+        shift
+    else
+        shift 3
+    fi
     while IFS= read -r message; do
         case "$message" in
             *'"method":"initialize"'*)

@@ -9,6 +9,8 @@ use std::time::Instant;
 use crate::assignment::PreparedAssignment;
 use crate::config::Config;
 use crate::effort::EffortCapabilities;
+use crate::executor_capabilities::ExecutorCapabilities;
+use crate::executor_transport::ExecutorTransport;
 use crate::protocol::client::{ErrorCategory, RunLogBuffer};
 use crate::protocol::{
     RunnerCancellationAck, RunnerConcurrencyApplied, RunnerConcurrencyReport, RunnerPollRequest,
@@ -37,8 +39,13 @@ pub struct PollState {
     applied_concurrency: Option<RunnerConcurrencyApplied>,
     draining: bool,
     draining_poll_reported: bool,
-    effort_capabilities: Option<EffortCapabilities>,
-    effort_capabilities_refreshed_at: Option<Instant>,
+    executor_transport: ExecutorTransport,
+    executor_harness: String,
+    executor_capabilities: Option<ExecutorCapabilities>,
+    executor_capabilities_refreshed_at: Option<Instant>,
+    legacy_launch_capabilities: Option<EffortCapabilities>,
+    legacy_launch_capabilities_refreshed_at: Option<Instant>,
+    legacy_launch_wrapper: Vec<String>,
 }
 
 /// Result of reserving one server-delivered assignment in the local run set.
@@ -68,8 +75,18 @@ impl PollState {
             applied_concurrency: None,
             draining: false,
             draining_poll_reported: false,
-            effort_capabilities: None,
-            effort_capabilities_refreshed_at: None,
+            executor_transport: ExecutorTransport::new(
+                config.executor.clone(),
+                config.executor_cwd.clone(),
+            ),
+            executor_harness: match config.runner_type {
+                crate::config::RunnerType::Codex => "codex".to_owned(),
+            },
+            executor_capabilities: None,
+            executor_capabilities_refreshed_at: None,
+            legacy_launch_capabilities: None,
+            legacy_launch_capabilities_refreshed_at: None,
+            legacy_launch_wrapper: config.wrapper.clone(),
         }
     }
 
@@ -167,23 +184,50 @@ impl PollState {
         !self.cancellation_acks.is_empty()
     }
 
-    /// Refresh the local Codex capability report when it expires, or before an
-    /// effort-bearing assignment when `force` is true.
-    pub fn refresh_effort_capabilities(&mut self, force: bool) -> &EffortCapabilities {
+    /// Refresh the executor report when it expires, or before an effort-bearing
+    /// assignment when `force` is true.
+    pub fn refresh_executor_capabilities(&mut self, force: bool) -> &ExecutorCapabilities {
         let now = Instant::now();
         let expired = self
-            .effort_capabilities
+            .executor_capabilities
             .as_ref()
             .is_none_or(|capabilities| {
-                capabilities.refresh_due(self.effort_capabilities_refreshed_at, now)
+                capabilities.refresh_due(self.executor_capabilities_refreshed_at, now)
             });
         if force || expired {
-            self.effort_capabilities = Some(EffortCapabilities::discover(crate::VERSION));
-            self.effort_capabilities_refreshed_at = Some(now);
+            self.executor_capabilities = Some(
+                self.executor_transport
+                    .discover_capabilities()
+                    .unwrap_or_else(|error| ExecutorCapabilities::unavailable(error.to_string())),
+            );
+            self.executor_capabilities_refreshed_at = Some(now);
         }
-        self.effort_capabilities
+        self.executor_capabilities
             .as_ref()
-            .expect("effort capabilities are discovered before use")
+            .expect("executor capabilities are discovered before use")
+    }
+
+    /// Refresh the local report used by the current legacy Codex launcher.
+    /// This remains separate from the executor report advertised to Tines
+    /// until assignment execution moves through the executor boundary.
+    pub fn refresh_legacy_launch_capabilities(&mut self, force: bool) -> &EffortCapabilities {
+        let now = Instant::now();
+        let expired = self
+            .legacy_launch_capabilities
+            .as_ref()
+            .is_none_or(|capabilities| {
+                capabilities.refresh_due(self.legacy_launch_capabilities_refreshed_at, now)
+            });
+        if force || expired {
+            self.legacy_launch_capabilities = Some(EffortCapabilities::discover_with_wrapper(
+                &self.legacy_launch_wrapper,
+                crate::VERSION,
+            ));
+            self.legacy_launch_capabilities_refreshed_at = Some(now);
+        }
+        self.legacy_launch_capabilities
+            .as_ref()
+            .expect("legacy launch capabilities are discovered before use")
     }
 
     /// The local concurrency cap after applying the latest server instruction.
@@ -252,7 +296,9 @@ impl PollState {
             declined_assignments,
             draining: Some(self.draining),
             env_delivery: Some(1),
-            effort_capabilities: self.effort_capabilities.clone(),
+            effort_capabilities: self.executor_capabilities.as_ref().map(|capabilities| {
+                capabilities.effort_report(&self.executor_harness, crate::VERSION)
+            }),
         }
     }
 
@@ -375,7 +421,7 @@ impl PollLoop {
             if !should_continue(&self.state) {
                 break;
             }
-            self.state.refresh_effort_capabilities(false);
+            self.state.refresh_executor_capabilities(false);
             let request = self.state.request();
             match self.connection.poll(&request) {
                 Ok(response) => {
@@ -542,14 +588,18 @@ mod tests {
     use crate::config::Config;
     use crate::credentials::{CredentialStore, RunnerCredentials};
     use crate::effort::{EffortCapabilities, EffortModelCapability};
+    use crate::executor_capabilities::{ExecutorCapabilities, ExecutorHarnessCapabilities};
     use crate::protocol::client::RunLogBuffer;
     use crate::protocol::{RunnerCancellationAck, RunnerPollResponse};
     use crate::runner::RunnerConnection;
     use serde_json::Value;
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread::{self, JoinHandle};
@@ -594,7 +644,7 @@ mod tests {
         max_concurrent: usize,
     ) -> Config {
         Config::from_toml_str(&format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"poll-test\"\nexecutor_cwd = \"~\"\nmax_concurrent = {max_concurrent}\nallow_remote_concurrency = {allow_remote_concurrency}\n[storage]\ncredentials_file = {:?}\n",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"poll-test\"\nexecutor = []\nexecutor_cwd = \"~\"\nmax_concurrent = {max_concurrent}\nallow_remote_concurrency = {allow_remote_concurrency}\n[storage]\ncredentials_file = {:?}\n",
             credentials_file
         ))
         .expect("valid poll config")
@@ -792,7 +842,7 @@ mod tests {
         let directory = TestDirectory::new();
         let (url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
         let mut poller = poller(&directory, &url, false);
-        poller.state_mut().effort_capabilities = Some(EffortCapabilities {
+        let effort = EffortCapabilities {
             version: 1,
             daemon_version: "0.1.0".to_owned(),
             harness: "codex".to_owned(),
@@ -805,8 +855,19 @@ mod tests {
             }],
             accepts_asserted_effort: Some(true),
             discovery_error: None,
+        };
+        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
+            version: 1,
+            harnesses: BTreeMap::from([(
+                "codex".to_owned(),
+                ExecutorHarnessCapabilities {
+                    version: "codex-cli 0.153.4".to_owned(),
+                    effort: Some(effort),
+                },
+            )]),
+            discovery_error: None,
         });
-        poller.state_mut().effort_capabilities_refreshed_at = Some(Instant::now());
+        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
         let polls = Cell::new(0);
 
         poller
@@ -830,6 +891,48 @@ mod tests {
                 "accepts_asserted_effort": true
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_capability_cache_refreshes_on_expiry_and_before_effort_work() {
+        let directory = TestDirectory::new();
+        let counter = directory.0.join("capability-probes");
+        let document = r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#;
+        let stub = directory.0.join("capability-executor");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf '%s\\n' '{}'\n",
+                counter.display(),
+                document
+            ),
+        )
+        .expect("write fake executor");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("make fake executor executable");
+        let argv = serde_json::to_string(&[stub.to_string_lossy().into_owned()])
+            .expect("serialize executor command");
+        let cwd = serde_json::to_string(&directory.0.to_string_lossy().as_ref())
+            .expect("serialize executor cwd");
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"capability-cache-test\"\nexecutor = {argv}\nexecutor_cwd = {cwd}\n[storage]\ncredentials_file = {:?}\n",
+            directory.credentials_path()
+        ))
+        .expect("valid runner config");
+        let mut state = PollState::new(&config);
+
+        assert!(state.refresh_executor_capabilities(false).supports("codex"));
+        assert!(state.refresh_executor_capabilities(false).supports("codex"));
+        assert_eq!(fs::read(&counter).unwrap().len(), 1);
+
+        state.refresh_executor_capabilities(true);
+        assert_eq!(fs::read(&counter).unwrap().len(), 2);
+
+        state.executor_capabilities_refreshed_at =
+            Some(Instant::now() - Duration::from_secs(10 * 60));
+        state.refresh_executor_capabilities(false);
+        assert_eq!(fs::read(&counter).unwrap().len(), 3);
     }
 
     #[test]

@@ -38,14 +38,28 @@ struct Cli {
 enum CliCommand {
     /// Read and validate one execution request from stdin.
     Execute,
+    /// Report harness and effort capabilities from this executor environment.
+    Capabilities,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     tines_runner_rs::logging::init();
 
-    if let Some(CliCommand::Execute) = cli.command {
-        return execute_stdin();
+    match cli.command {
+        Some(CliCommand::Execute) => return execute_stdin(),
+        Some(CliCommand::Capabilities) => {
+            return match tines_runner_rs::executor_capabilities::discover_for_cli(
+                tines_runner_rs::VERSION,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("executor could not write its capability document: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        None => {}
     }
 
     match start_runner(cli.check, cli.config.as_deref()) {
@@ -125,6 +139,10 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
     }
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
     let execution_connection = connection.clone();
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
@@ -157,7 +175,18 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                 tracing::warn!(run_id, "supervisor settled run; stopping local work without finish reporting");
             }
 
-            let capabilities = state.refresh_effort_capabilities(false).clone();
+            let force_capability_refresh = response
+                .assignments
+                .iter()
+                .any(|assignment| assignment.effort.is_some());
+            let capabilities = state
+                .refresh_executor_capabilities(force_capability_refresh)
+                .clone();
+            let legacy_launch_capabilities = (!response.assignments.is_empty()).then(|| {
+                state
+                    .refresh_legacy_launch_capabilities(force_capability_refresh)
+                    .clone()
+            });
             for assignment in &response.assignments {
                 let run_id = assignment.run.id.clone();
                 if response.released_assignments.contains(&run_id) {
@@ -197,7 +226,12 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                 let worker_config = config.clone();
                 let worker_connection = execution_connection.clone();
                 let worker_client = issue_client.clone();
+                let worker_default_executor = default_executor.clone();
                 let worker_capabilities = capabilities.clone();
+                let worker_legacy_launch_capabilities = legacy_launch_capabilities
+                    .as_ref()
+                    .expect("assignments trigger legacy launch capability discovery")
+                    .clone();
                 let worker_assignment = assignment.clone();
                 let worker_shutdown = shutdown.clone();
                 let worker_active_runs = active_runs.clone();
@@ -214,7 +248,9 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                             &worker_client,
                             worker_assignment,
                             run_logs,
+                            &worker_default_executor,
                             &worker_capabilities,
+                            &worker_legacy_launch_capabilities,
                             &worker_cancellation,
                             &context,
                         )
@@ -323,7 +359,7 @@ fn reap_completed_workers(
                         tracing::error!(
                             run_id,
                             error,
-                            "assignment declined because required metadata or Codex capability is unavailable"
+                            "assignment declined because required metadata or launch capability is unavailable"
                         );
                         state.decline_assignment(run_id);
                     }

@@ -15,7 +15,7 @@ use crate::protocol::{RunnerAssignment, RunnerAssignmentEffort};
 
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_STDOUT: usize = 1024 * 1024;
-const MAX_EFFORT_CAPABILITIES_AGE: Duration = Duration::from_secs(10 * 60);
+pub const MAX_EFFORT_CAPABILITIES_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_MODELS: usize = 256;
 const MAX_EFFORTS_PER_MODEL: usize = 16;
 const RECOGNIZED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -47,8 +47,22 @@ impl EffortCapabilities {
         Self::discover_with_program("codex", daemon_version)
     }
 
+    /// Discover Codex capabilities through the legacy launcher's argv prefix.
+    pub fn discover_with_wrapper(wrapper: &[String], daemon_version: &str) -> Self {
+        let Some((program, arguments)) = wrapper.split_first() else {
+            return Self::discover(daemon_version);
+        };
+        let mut prefix = arguments.to_vec();
+        prefix.push("codex".to_owned());
+        Self::discover_with_prefix(program, &prefix, daemon_version)
+    }
+
     fn discover_with_program(program: &str, daemon_version: &str) -> Self {
-        let harness_version = match run_capture(program, &["--version"]) {
+        Self::discover_with_prefix(program, &[], daemon_version)
+    }
+
+    fn discover_with_prefix(program: &str, prefix: &[String], daemon_version: &str) -> Self {
+        let harness_version = match run_capture(program, prefix, &["--version"]) {
             Ok(output) => match String::from_utf8(output) {
                 Ok(version) if !version.trim().is_empty() => truncate(version.trim(), 100),
                 Ok(_) => return Self::failure(daemon_version, "Codex returned an empty version"),
@@ -57,19 +71,37 @@ impl EffortCapabilities {
             Err(error) => return Self::failure(daemon_version, &error),
         };
 
-        match discover_models(program, daemon_version, harness_version) {
+        match discover_models(program, prefix, daemon_version, harness_version.clone()) {
             Ok(capabilities) => capabilities,
-            Err(error) => Self::failure(daemon_version, &error),
+            Err(error) => Self::catalog_failure(daemon_version, &harness_version, &error),
         }
     }
 
     fn failure(daemon_version: &str, reason: &str) -> Self {
+        Self::unavailable(daemon_version, "codex", reason)
+    }
+
+    /// Build a valid empty report when an executor cannot verify a harness.
+    pub fn unavailable(daemon_version: &str, harness: &str, reason: &str) -> Self {
+        Self::unavailable_with_version(daemon_version, harness, "unknown", reason)
+    }
+
+    fn catalog_failure(daemon_version: &str, harness_version: &str, reason: &str) -> Self {
+        Self::unavailable_with_version(daemon_version, "codex", harness_version, reason)
+    }
+
+    fn unavailable_with_version(
+        daemon_version: &str,
+        harness: &str,
+        harness_version: &str,
+        reason: &str,
+    ) -> Self {
         let models = Vec::new();
         Self {
             version: 1,
             daemon_version: truncate(daemon_version, 100),
-            harness: "codex".to_owned(),
-            harness_version: "unknown".to_owned(),
+            harness: truncate(harness, 100),
+            harness_version: truncate(harness_version, 100),
             catalog_digest: catalog_digest(&models),
             models,
             accepts_asserted_effort: None,
@@ -81,6 +113,31 @@ impl EffortCapabilities {
     pub fn refresh_due(&self, refreshed_at: Option<Instant>, now: Instant) -> bool {
         refreshed_at
             .is_none_or(|at| now.saturating_duration_since(at) >= MAX_EFFORT_CAPABILITIES_AGE)
+    }
+
+    /// Check that this report has a valid catalog and belongs to `harness`.
+    pub fn validate_for_harness(&self, harness: &str) -> Result<(), String> {
+        if self.version != 1 || self.harness != harness {
+            return Err("unsupported effort capability report".to_owned());
+        }
+        if self.harness_version.trim().is_empty()
+            || self.harness_version.len() > 100
+            || self.daemon_version.len() > 100
+            || self.catalog_digest.len() > 100
+        {
+            return Err("malformed effort capability report".to_owned());
+        }
+        validate_catalog(&self.models)?;
+        if catalog_digest(&self.models) != self.catalog_digest {
+            return Err("effort capability catalog digest is invalid".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Whether this report confirms that the named harness is installed in
+    /// the environment that produced the report.
+    pub fn supports_harness(&self, harness: &str) -> bool {
+        self.validate_for_harness(harness).is_ok() && self.harness_version != "unknown"
     }
 }
 
@@ -164,8 +221,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn run_capture(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+fn run_capture(program: &str, prefix: &[String], args: &[&str]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(program)
+        .args(prefix)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -240,10 +298,12 @@ fn wait_child(child: &mut Child, started: Instant) -> Result<std::process::ExitS
 
 fn discover_models(
     program: &str,
+    prefix: &[String],
     daemon_version: &str,
     harness_version: String,
 ) -> Result<EffortCapabilities, String> {
     let mut child = Command::new(program)
+        .args(prefix)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -786,5 +846,45 @@ exit 2
         assert_eq!(report.discovery_error, None);
 
         fs::remove_dir_all(root).expect("remove fake Codex directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_runs_through_the_legacy_wrapper_prefix() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "tines-runner-codex-wrapper-capabilities-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create fake Codex wrapper directory");
+        let wrapper = root.join("codex-wrapper");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\n[ \"$1\" = \"--profile\" ] || exit 8\nshift\n[ \"$1\" = \"codex\" ] || exit 9\nshift\nif [ \"$1\" = \"--version\" ]; then printf 'wrapped-codex 1.2.3\\n'; exit 0; fi\nexit 10\n",
+        )
+        .expect("write fake Codex wrapper");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("stat fake Codex wrapper")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+
+        let report = EffortCapabilities::discover_with_wrapper(
+            &[
+                wrapper.to_string_lossy().into_owned(),
+                "--profile".to_owned(),
+            ],
+            "0.1.0",
+        );
+
+        assert_eq!(report.harness_version, "wrapped-codex 1.2.3");
+        assert!(report.discovery_error.is_some());
+        assert!(report.supports_harness("codex"));
+        fs::remove_dir_all(root).expect("remove fake Codex wrapper directory");
     }
 }

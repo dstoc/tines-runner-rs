@@ -20,7 +20,9 @@ use tines_runner_rs::effort::EffortCapabilities;
 use tines_runner_rs::execution::{
     ExecutionContext, ExecutionOutcome, execute_assignment_cancellable,
 };
+use tines_runner_rs::executor_capabilities::{ExecutorCapabilities, ExecutorHarnessCapabilities};
 use tines_runner_rs::protocol::RunnerAssignment;
+use tines_runner_rs::protocol::RunnerAssignmentEffort;
 use tines_runner_rs::protocol::client::Client;
 use tines_runner_rs::recovery::ActiveRunStore;
 use tines_runner_rs::runner::RunnerConnection;
@@ -165,9 +167,28 @@ fn capabilities() -> EffortCapabilities {
         daemon_version: "test-runner".to_owned(),
         harness: "codex".to_owned(),
         harness_version: "stub".to_owned(),
-        catalog_digest: "empty".to_owned(),
+        catalog_digest: "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            .to_owned(),
         models: Vec::new(),
         accepts_asserted_effort: Some(false),
+        discovery_error: None,
+    }
+}
+
+fn executor_capabilities(accepts_asserted_effort: bool) -> ExecutorCapabilities {
+    let effort = EffortCapabilities {
+        accepts_asserted_effort: Some(accepts_asserted_effort),
+        ..capabilities()
+    };
+    ExecutorCapabilities {
+        version: 1,
+        harnesses: std::collections::BTreeMap::from([(
+            "codex".to_owned(),
+            ExecutorHarnessCapabilities {
+                version: effort.harness_version.clone(),
+                effort: Some(effort),
+            },
+        )]),
         discovery_error: None,
     }
 }
@@ -400,6 +421,13 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
             &worker_client,
             assignment(None),
             tines_runner_rs::protocol::client::RunLogBuffer::new(),
+            &tines_runner_rs::executor_transport::ExecutorTransport::new(
+                worker_config.executor.clone(),
+                worker_config.executor_cwd.clone(),
+            ),
+            &tines_runner_rs::executor_capabilities::ExecutorCapabilities::unavailable(
+                "test cancellation",
+            ),
             &capabilities(),
             &worker_token,
             &context,
@@ -424,6 +452,144 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
     );
     let request = server.join().expect("join fake Tines server");
     assert!(request.starts_with("GET /api/v1/issues/iss_cancel "));
+}
+
+#[test]
+fn unsupported_executor_declines_before_workspace_materialization() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let (config, client, connection) = configured(&directory, &server_url, None);
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment(None),
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &tines_runner_rs::executor_capabilities::ExecutorCapabilities::unavailable(
+            "Codex is not installed in the executor",
+        ),
+        &capabilities(),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline an assignment without harness support");
+
+    assert!(
+        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("does not verify support"))
+    );
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
+    assert!(
+        !directory.0.join("workspaces").exists(),
+        "unsupported harnesses do not create workspaces"
+    );
+}
+
+#[test]
+fn executor_effort_does_not_authorize_unsupported_legacy_launch_effort() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let launch_marker = directory.0.join("legacy-launch-started");
+    let wrapper = directory.0.join("legacy-launcher");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nprintf started > {:?}\nexit 0\n", launch_marker),
+    )
+    .expect("write local launch wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+        .expect("make local launch wrapper executable");
+    let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+    let legacy_launch_capabilities = capabilities();
+    let mut assignment = assignment(None);
+    assignment.effort = Some(RunnerAssignmentEffort {
+        version: 1,
+        value: "high".to_owned(),
+        capability_digest: Some(legacy_launch_capabilities.catalog_digest.clone()),
+        verification: Some("asserted".to_owned()),
+    });
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment,
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &executor_capabilities(true),
+        &legacy_launch_capabilities,
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline effort that the local launcher cannot verify");
+
+    assert!(
+        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("local legacy launcher"))
+    );
+    assert!(!launch_marker.exists(), "the local harness must not launch");
+    assert!(
+        !directory.0.join("workspaces").exists(),
+        "unsupported local effort is declined before workspace creation"
+    );
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1, "only issue metadata is requested");
+}
+
+#[test]
+fn executor_harness_does_not_authorize_missing_local_codex() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let (config, client, connection) = configured(&directory, &server_url, None);
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment(None),
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &executor_capabilities(true),
+        &EffortCapabilities::unavailable("test-runner", "codex", "Codex is not installed locally"),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline an assignment when the local launcher lacks Codex");
+
+    assert!(
+        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("local legacy launcher"))
+    );
+    assert!(
+        !directory.0.join("workspaces").exists(),
+        "an unavailable local harness is declined before workspace creation"
+    );
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1, "only issue metadata is requested");
 }
 
 #[cfg(target_os = "linux")]
