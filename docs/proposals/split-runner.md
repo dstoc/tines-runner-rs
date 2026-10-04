@@ -202,6 +202,12 @@ No intermediate shell is used.
 
 If the image defines `tines-runner-rs` as its entrypoint, the configuration may be shorter.
 
+The configured transport must remain in the foreground for the full execution.
+It must forward stdin, stdout, and stderr, preserve the executor's exit status,
+and propagate termination. Docker and Podman examples must use attached mode,
+such as `docker run --rm -i ...`; detached mode is unsupported. The daemon treats
+the executor argv as opaque and does not parse container-specific options.
+
 ## Responsibility split
 
 ### Runner daemon responsibilities
@@ -716,9 +722,11 @@ When the daemon receives a cancellation for an active run it should:
 4. acknowledge cancellation according to the runner protocol;
 5. avoid sending a second finish for a run already settled by Tines.
 
-The configured executor command is responsible for providing useful process-tree semantics.
-
-For container execution, the configured command should propagate termination into the container. Operators should use container options appropriate for reliable signal handling and cleanup.
+The configured executor command must remain in the foreground and provide
+useful process-tree semantics. It must forward stdin, stdout, and stderr,
+preserve the executor's exit status, and propagate termination into its process
+tree. For Docker and Podman, use attached commands and options that support
+signal handling and cleanup, such as `docker run --rm -i ...`.
 
 ## Timeout
 
@@ -771,7 +779,11 @@ The daemon supervises the `docker run ...` execution boundary.
 
 The executor is responsible for supervising Codex inside that boundary.
 
-Containerized executor configurations should be constructed so termination or abandonment of the outer transport does not intentionally leave unmanaged long-lived containers.
+Containerized executor configurations should be constructed so termination or
+abandonment of the outer transport does not intentionally leave unmanaged
+long-lived containers. The daemon does not parse container-engine options to
+detect detached mode; attached execution is part of the executor transport
+contract.
 
 Container-engine-specific lifecycle recovery is outside the first version of this proposal.
 

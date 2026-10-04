@@ -164,7 +164,10 @@ file order; a later entry replaces earlier values only for fields it sets.
 Overrides can set `workspace_parent`, `runner_type`, `executor`, or
 `executor_cwd`. Executor entries are arguments, not a shell command string.
 The runner appends `execute` and starts the command from the resolved
-`executor_cwd`.
+`executor_cwd`. The executor transport must stay in the foreground for the full
+execution and propagate stdin, stdout, stderr, exit status, and termination.
+Detached Docker and Podman modes are unsupported; use attached commands such as
+`docker run --rm -i ...`.
 
 `wrapper` remains as a deprecated compatibility setting for the legacy
 direct-Codex path. It keeps its Codex-prefix behavior and logs a warning, but

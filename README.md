@@ -207,11 +207,11 @@ a daemon-side transport setting; it is not sent in the execution request.
 `workspace_parent` and workspace-retention settings are sent to the executor
 and use paths and retention policy in the executor environment. A configured
 `~` uses the executor's home directory. If `workspace_parent` is omitted, the
-executor uses its own platform/XDG workspace default. For Docker or Podman, keep
-`run` attached: do not add `-d` or `--detach`. The daemon supervises the attached
-transport process group and rejects detached Docker and Podman `run` commands
-because they can outlive that group. Include `--rm` to remove the container when
-it exits. Mount any retained workspace storage into the container.
+executor uses its own platform/XDG workspace default. The executor transport
+must stay in the foreground for the full execution and propagate stdin, stdout,
+stderr, exit status, and termination. Detached Docker and Podman modes are
+unsupported. Use attached commands such as `docker run --rm -i ...`; mount any
+retained workspace storage into the container.
 
 `[runner].wrapper` and `[[override]].wrapper` are deprecated compatibility
 settings for the legacy direct-Codex execution path. The runner keeps their
