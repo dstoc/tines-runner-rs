@@ -20,7 +20,9 @@ use crate::runner::{RunnerConnection, RunnerError};
 use crate::shutdown::ShutdownSignal;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+// Allow the executor to receive shutdown and terminate its own harness group
+// before the daemon escalates to SIGKILL. The executor has a two-second grace.
+const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const LIVE_LOG_RETRY_WINDOW: Duration = Duration::from_millis(500);
 
 /// Shared shutdown signal and durable run inventory for an assignment worker.
