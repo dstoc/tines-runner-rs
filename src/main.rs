@@ -29,16 +29,39 @@ struct Cli {
     /// Validate configuration and stored credentials, then exit without polling.
     #[arg(long)]
     check: bool,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum CliCommand {
+    /// Read and validate one execution request from stdin.
+    Execute,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     tines_runner_rs::logging::init();
 
+    if let Some(CliCommand::Execute) = cli.command {
+        return execute_stdin();
+    }
+
     match start_runner(cli.check, cli.config.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "runner startup failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn execute_stdin() -> ExitCode {
+    match tines_runner_rs::execution_protocol::read_execution_request(std::io::stdin().lock()) {
+        Ok(_request) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("executor request rejected: {error}");
             ExitCode::FAILURE
         }
     }

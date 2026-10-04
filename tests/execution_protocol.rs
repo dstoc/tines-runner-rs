@@ -1,9 +1,11 @@
+use std::io::Cursor;
+
 use serde_json::Value;
 use tines_runner_rs::execution_protocol::{
     EXECUTION_PROTOCOL_VERSION, ExecutionEvent, ExecutionEventKind, ExecutionEventParser,
     ExecutionPricingEvidence, ExecutionRequest, ExecutionUsage, LogStream,
     MAX_EXECUTION_EVENT_LINE_BYTES, ProtocolError, TerminalResult, TerminalStatus,
-    render_event_jsonl,
+    read_execution_request, render_event_jsonl,
 };
 
 fn request_fixture() -> (ExecutionRequest, Value) {
@@ -32,6 +34,54 @@ fn unsupported_request_versions_are_rejected_during_deserialization() {
         error.to_string(),
         "unsupported execution protocol version 2"
     );
+}
+
+#[test]
+fn request_reader_accepts_one_valid_document_and_rejects_trailing_documents() {
+    let fixture = include_str!("fixtures/execution-request-v1.json");
+    let request = read_execution_request(Cursor::new(fixture)).expect("valid request");
+    assert_eq!(request.version, EXECUTION_PROTOCOL_VERSION);
+
+    let two_documents = format!("{fixture}\n{fixture}");
+    assert_eq!(
+        read_execution_request(Cursor::new(two_documents))
+            .unwrap_err()
+            .to_string(),
+        "malformed execution request JSON"
+    );
+}
+
+#[test]
+fn request_reader_reports_safe_deterministic_errors() {
+    let malformed = br#"{"version":1,"assignment":{"run_key":"raw-run-key-secret",not-json}}"#;
+    let malformed_error = read_execution_request(Cursor::new(malformed)).unwrap_err();
+    assert_eq!(
+        malformed_error.to_string(),
+        "malformed execution request JSON"
+    );
+    assert!(!malformed_error.to_string().contains("raw-run-key-secret"));
+
+    let mut unsupported: Value =
+        serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
+    unsupported["version"] = Value::from(37);
+    let unsupported_error =
+        read_execution_request(Cursor::new(unsupported.to_string())).unwrap_err();
+    assert_eq!(
+        unsupported_error.to_string(),
+        "unsupported execution protocol version 37"
+    );
+    assert!(!unsupported_error.to_string().contains("fixture-run-key"));
+
+    let mut invalid: Value =
+        serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
+    invalid["assignment"]["run_key"] = Value::String("raw-run-key-secret".to_owned());
+    invalid["assignment"]["timeout_minutes"] = Value::String("raw-schema-value".to_owned());
+    invalid["assignment"]["env"][0]["value"] = Value::String("raw-env-secret".to_owned());
+    let invalid_error = read_execution_request(Cursor::new(invalid.to_string())).unwrap_err();
+    assert_eq!(invalid_error.to_string(), "invalid executor request");
+    assert!(!invalid_error.to_string().contains("raw-run-key-secret"));
+    assert!(!invalid_error.to_string().contains("raw-schema-value"));
+    assert!(!invalid_error.to_string().contains("raw-env-secret"));
 }
 
 #[test]
