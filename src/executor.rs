@@ -2,10 +2,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
-
 use url::Url;
 
+use crate::config::{self, ConfigError};
 use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionRequest, ProtocolError, TerminalResult,
     TerminalStatus, render_event_jsonl,
@@ -16,6 +15,7 @@ use crate::workspace::{MaterializedWorkspace, WorkspaceError};
 #[derive(Debug)]
 pub enum PreparationError {
     InvalidRequest(ProtocolError),
+    WorkspacePolicy(ConfigError),
     Workspace(WorkspaceError),
 }
 
@@ -23,6 +23,7 @@ impl fmt::Display for PreparationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequest(error) => error.fmt(f),
+            Self::WorkspacePolicy(error) => error.fmt(f),
             Self::Workspace(error) => error.fmt(f),
         }
     }
@@ -32,6 +33,7 @@ impl Error for PreparationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidRequest(error) => Some(error),
+            Self::WorkspacePolicy(error) => Some(error),
             Self::Workspace(error) => Some(error),
         }
     }
@@ -52,8 +54,11 @@ pub fn prepare_workspace(
         .map_err(PreparationError::InvalidRequest)?;
     let api_url = Url::parse(&request.tines.api_url)
         .map_err(|_| PreparationError::InvalidRequest(ProtocolError::InvalidRequest))?;
+    let workspace_parent =
+        config::resolve_executor_workspace_parent(request.execution.workspace.parent.as_deref())
+            .map_err(PreparationError::WorkspacePolicy)?;
     MaterializedWorkspace::create_with_git_log(
-        Path::new(&request.execution.workspace.parent),
+        &workspace_parent,
         &request.assignment,
         &api_url,
         on_git_output,

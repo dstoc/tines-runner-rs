@@ -49,7 +49,7 @@ pub fn execution_request(
                 RunnerType::Codex => "codex".to_owned(),
             },
             workspace: WorkspacePolicy {
-                parent: policy.workspace_parent.clone(),
+                parent: policy.executor_workspace_parent.clone(),
             },
             retention: ExecutionRetentionPolicy {
                 mode: retention.mode,

@@ -283,7 +283,7 @@ keep_workspaces_max = 17
     assert_eq!(request.execution.harness, "codex");
     assert_eq!(
         request.execution.workspace.parent,
-        PathBuf::from("/executor/workspaces")
+        Some(PathBuf::from("/executor/workspaces"))
     );
     assert_eq!(
         request.execution.retention.mode,
@@ -294,6 +294,37 @@ keep_workspaces_max = 17
     let serialized = serde_json::to_value(request).expect("serialize executor request");
     assert!(serialized.get("executor_cwd").is_none());
     assert!(serialized["execution"].get("executor_cwd").is_none());
+}
+
+#[test]
+fn execution_request_preserves_executor_tilde_paths_and_omits_its_default() {
+    let (server_url, server) = issue_server(3);
+    let cases = [
+        (
+            "workspace_parent = \"~/work/base\"",
+            Some(PathBuf::from("~/work/base")),
+        ),
+        (
+            "[[override]]\nproject = \"Tines\"\nworkspace_parent = \"~/work/payments\"",
+            Some(PathBuf::from("~/work/payments")),
+        ),
+        ("", None),
+    ];
+
+    for (workspace_config, expected_parent) in cases {
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = \"http://127.0.0.1:1\"\n[runner]\nname = \"executor-path-test\"\nexecutor_cwd = \"/host/daemon\"\n{workspace_config}\n"
+        ))
+        .expect("parse executor workspace configuration");
+        let client =
+            Client::with_timeout(&server_url, Duration::from_secs(5)).expect("issue client");
+        let resolved = resolve_assignment(&config, &client, &assignment())
+            .expect("resolve assignment metadata");
+        let request = execution_request(&resolved, &server_url, &config.workspace_retention);
+        assert_eq!(request.execution.workspace.parent, expected_parent);
+    }
+
+    server.join().expect("issue detail requests");
 }
 
 #[test]

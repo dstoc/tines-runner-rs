@@ -24,6 +24,27 @@ fn execution_request_fixture_round_trips_the_assignment_and_local_policy() {
 }
 
 #[test]
+fn missing_workspace_parent_selects_the_executor_default() {
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
+    fixture["execution"]["workspace"]
+        .as_object_mut()
+        .unwrap()
+        .remove("parent");
+
+    let request: ExecutionRequest = serde_json::from_value(fixture).unwrap();
+    request
+        .validate()
+        .expect("executor default is valid policy");
+    assert_eq!(request.execution.workspace.parent, None);
+    assert!(
+        serde_json::to_value(request).unwrap()["execution"]["workspace"]
+            .get("parent")
+            .is_none()
+    );
+}
+
+#[test]
 fn unsupported_request_versions_are_rejected_during_deserialization() {
     let mut fixture: Value =
         serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
@@ -305,7 +326,7 @@ fn any_other_output_after_a_terminal_result_is_rejected() {
 fn request_debug_and_rendered_events_redact_the_run_key_and_secret_environment_values() {
     let (mut request, _) = request_fixture();
     request.execution.harness = "fixture-run-key".into();
-    request.execution.workspace.parent = "/workspace/fixture-secret".into();
+    request.execution.workspace.parent = Some("/workspace/fixture-secret".into());
     let debug = format!("{request:?}");
     assert!(!debug.contains("fixture-run-key"));
     assert!(!debug.contains("fixture-secret"));
@@ -350,7 +371,7 @@ fn request_debug_redacts_secrets_before_rust_escapes_them() {
     for secret in ["private\nvalue", "private\"value", "private\\value"] {
         request.assignment.run_key = secret.into();
         request.assignment.env[0].value = secret.into();
-        request.execution.workspace.parent = format!("/workspace/{secret}").into();
+        request.execution.workspace.parent = Some(format!("/workspace/{secret}").into());
 
         let debug = format!("{request:?}");
         let rust_escaped = format!("{secret:?}");

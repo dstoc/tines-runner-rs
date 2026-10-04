@@ -82,8 +82,10 @@ keep_workspaces = "never"
 ```
 
 `[server].url` and `[runner].name` are required. The runner type defaults to
-`codex`; it is the only supported type. The runner expands `~` at the start of
-configured paths. Unknown settings cause startup to fail.
+`codex`; it is the only supported type. The runner expands `~` in daemon-side
+paths such as `executor_cwd` and `credentials_file`. It interprets
+`workspace_parent` in the executor environment. Unknown settings cause startup
+to fail.
 
 ### 2. Register and validate
 
@@ -170,7 +172,7 @@ The main settings are:
 | `[server].url` | Tines instance URL. Required; must use HTTP or HTTPS. |
 | `[runner].name` | Name used to register this runner. Required. |
 | `[runner].runner_type` | Harness type. Only `codex` is supported. |
-| `[runner].workspace_parent` | Parent directory for assignment workspaces. |
+| `[runner].workspace_parent` | Optional parent path for assignment workspaces, interpreted in the executor environment. |
 | `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
 | `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
 | `[runner].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
@@ -203,16 +205,19 @@ not a shell command string. The runner appends `execute` and launches it
 directly from the resolved `executor_cwd`. The executor working directory is
 a daemon-side transport setting; it is not sent in the execution request.
 `workspace_parent` and workspace-retention settings are sent to the executor
-and use paths and retention policy in the executor environment. For Docker or
-Podman, mount any retained workspace storage into the container.
+and use paths and retention policy in the executor environment. A configured
+`~` uses the executor's home directory. If `workspace_parent` is omitted, the
+executor uses its own platform/XDG workspace default. For Docker or Podman,
+mount any retained workspace storage into the container.
 
 `[runner].wrapper` and `[[override]].wrapper` are deprecated compatibility
 settings for the legacy direct-Codex execution path. The runner keeps their
 old Codex-prefix behavior and logs a warning when either setting is present.
-They do not configure the executor transport. To migrate a Codex profile
-wrapper, install it as the `codex` command in the executor environment, such as
-in the container image or its `PATH`. To move an isolation wrapper such as
-Docker or Podman, put its arguments in `executor` and set `executor_cwd`.
+They do not configure the executor transport, and that legacy path keeps its
+daemon-side workspace resolution. To migrate a Codex profile wrapper, install
+it as the `codex` command in the executor environment, such as in the
+container image or its `PATH`. To move an isolation wrapper such as Docker or
+Podman, put its arguments in `executor` and set `executor_cwd`.
 
 ## Workspace retention
 

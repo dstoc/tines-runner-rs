@@ -76,12 +76,13 @@ directories are:
 | macOS | `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs` | `${XDG_DATA_HOME:-~/Library/Application Support}/tines-runner-rs/workspaces` |
 | Windows | `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs` | `${XDG_DATA_HOME:-%LOCALAPPDATA%}/tines-runner-rs/workspaces` |
 
-On Windows, if `APPDATA` or `LOCALAPPDATA` is not set, the runner uses the
-equivalent directories under `%USERPROFILE%\AppData\Roaming` and
-`%USERPROFILE%\AppData\Local`. XDG directory variables are used only when
-they contain absolute paths. Set `XDG_CONFIG_HOME` before starting the
-process if you need a different default configuration directory. Use
-`--config` to select another file.
+The workspace directory defaults shown in the table apply in the executor
+environment. On Windows, if `APPDATA` or `LOCALAPPDATA` is not set, the
+executor uses the equivalent directories under `%USERPROFILE%\AppData\Roaming`
+and `%USERPROFILE%\AppData\Local`. XDG directory variables are used only when
+they contain absolute paths. Set `XDG_CONFIG_HOME` before starting the daemon
+if you need a different default configuration directory. Use `--config` to
+select another file.
 
 The following example shows the supported settings and their defaults:
 
@@ -114,15 +115,19 @@ with Tines using the configured name and concurrency. Tines and this local
 configuration must agree about which work the runner can accept.
 
 `max_concurrent` must be between 1 and 100. `poll_interval_seconds` must be
-greater than zero. The configured workspace parent must be writable by the
-service account.
+greater than zero. The configured workspace parent must be writable in the
+executor environment.
 
-The runner expands `~` at the start of configured paths. Use absolute paths
-or paths beginning with `~` so a service does not depend on its working
-directory. `executor_cwd` belongs to the daemon transport and is not sent to
-the executor. `workspace_parent` and retention settings are sent to the
-executor and use its filesystem and retention policy. Unknown configuration
-keys cause startup to fail.
+The runner expands `~` in daemon-side paths such as `executor_cwd` and
+`credentials_file`. It sends `workspace_parent` to the executor without
+expanding it. A configured `~` uses the executor's home directory. If
+`workspace_parent` is omitted, the executor uses its own platform/XDG default.
+Use absolute paths or paths beginning with `~` for workspace parents so their
+meaning does not depend on the executor's working directory. `executor_cwd`
+belongs to the daemon transport and is not sent to the executor. Workspace
+paths and retention settings use the executor's filesystem and retention
+policy. The deprecated legacy wrapper path keeps its daemon-side workspace
+resolution. Unknown configuration keys cause startup to fail.
 
 ### Configure execution overrides
 

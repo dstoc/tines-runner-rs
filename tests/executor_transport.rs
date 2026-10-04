@@ -62,7 +62,7 @@ fn request(prompt: String) -> ExecutionRequest {
         execution: LocalExecutionPolicy {
             harness: "codex".to_owned(),
             workspace: WorkspacePolicy {
-                parent: PathBuf::from("/executor/workspaces"),
+                parent: Some(PathBuf::from("/executor/workspaces")),
             },
             retention: ExecutionRetentionPolicy {
                 mode: tines_runner_rs::config::RetentionMode::Never,
@@ -193,7 +193,7 @@ fn launches_container_style_argv_and_redacts_bounded_stderr() {
     );
     assert_eq!(
         request.execution.workspace.parent,
-        PathBuf::from("/executor/workspaces")
+        Some(PathBuf::from("/executor/workspaces"))
     );
     assert!(!output.stderr.contains("ephemeral-run-key"));
     assert!(!output.stderr.contains("assignment-secret"));
