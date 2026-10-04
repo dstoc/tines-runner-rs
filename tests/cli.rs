@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+use tines_runner_rs::execution_protocol::{
+    ExecutionEventKind, ExecutionEventParser, TerminalStatus,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -281,7 +284,14 @@ fn version_flag_reports_package_version() {
 
 #[test]
 fn execute_accepts_one_request_without_writing_to_stdout() {
-    let output = run_executor(include_bytes!("fixtures/execution-request-v1.json"));
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("executor-workspaces");
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/execution-request-v1.json"))
+            .expect("valid execution request fixture");
+    fixture["execution"]["workspace"]["parent"] =
+        serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
+    let output = run_executor(fixture.to_string().as_bytes());
 
     assert!(
         output.status.success(),
@@ -290,6 +300,61 @@ fn execute_accepts_one_request_without_writing_to_stdout() {
     );
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+    assert!(
+        fs::read_dir(workspace_parent)
+            .expect("executor creates its selected workspace parent")
+            .next()
+            .is_none(),
+        "one-shot preparation removes its workspace after successful setup"
+    );
+}
+
+#[test]
+fn execute_reports_workspace_failures_as_protocol_results_without_tines_calls() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("executor-workspaces");
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/execution-request-v1.json"))
+            .expect("valid execution request fixture");
+    fixture["execution"]["workspace"]["parent"] =
+        serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
+    fixture["assignment"]["bundle"]["repos"] = serde_json::json!([{
+        "name": "missing-repo",
+        "dir": "checkout",
+        "url": directory.0.join("missing-repository").to_string_lossy(),
+        "branch": null
+    }]);
+
+    let output = run_executor(fixture.to_string().as_bytes());
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let mut parser = ExecutionEventParser::default();
+    let events = parser
+        .push(&output.stdout)
+        .expect("executor failure should be JSONL");
+    assert!(parser.finish().unwrap().is_none());
+    assert_eq!(events.len(), 1);
+    let ExecutionEventKind::Result { result } = &events[0].kind else {
+        panic!("workspace failure should produce a result event");
+    };
+    assert_eq!(result.status, TerminalStatus::Failed);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("git clone failed")
+    );
+    let line = String::from_utf8(output.stdout).expect("protocol result is UTF-8");
+    assert!(!line.contains("fixture-run-key"));
+    assert!(!line.contains("fixture-secret"));
+    assert!(
+        fs::read_dir(workspace_parent)
+            .expect("read workspace parent")
+            .next()
+            .is_none(),
+        "failed setup removes its incomplete workspace"
+    );
 }
 
 #[test]
