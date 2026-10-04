@@ -3,6 +3,17 @@
 This guide covers installation, setup, normal operation, and common failures.
 The runner supports the `codex` harness.
 
+## How execution is split
+
+The daemon polls Tines, resolves assignment settings, starts the configured
+executor, and sends logs and the terminal status to Tines. The executor
+materializes the assignment workspace and runs the selected harness. The
+executor can be the local runner binary or a command that starts a container.
+`runner_type` selects the harness; `executor` selects the transport command.
+
+For design rationale and the local executor protocol, see the
+[split-runner proposal](proposals/split-runner.md).
+
 ## Requirements
 
 Install the configured executor command for the operating-system account that
@@ -131,15 +142,64 @@ configuration must agree about which work the runner can accept.
 greater than zero. The configured workspace parent must be writable in the
 executor environment.
 
-The runner expands `~` in daemon-side paths such as `executor_cwd` and
-`credentials_file`. It sends `workspace_parent` to the executor without
-expanding it. A configured `~` uses the executor's home directory. If
-`workspace_parent` is omitted, the executor uses its own platform/XDG default.
-Use absolute paths or paths beginning with `~` for workspace parents so their
-meaning does not depend on the executor's working directory. `executor_cwd`
-belongs to the daemon transport and is not sent to the executor. Workspace
-paths and retention settings use the executor's filesystem and retention
-policy. The deprecated legacy wrapper path keeps its daemon-side workspace
+### Choose an executor environment
+
+Set `[runner].executor_cwd` in the base configuration. It is required and has
+no implicit default. An override can replace its value for matching
+assignments. The daemon expands `~` and resolves a relative value under the
+daemon account's home directory, then uses that path as the working directory
+when it starts the executor transport process. The path must exist and be
+accessible to that account.
+
+For native execution, the default executor starts the local runner binary.
+Install `tines-runner-rs`, Codex CLI, and Git for the daemon account, and make
+Codex and Git credentials available to that account:
+
+```toml
+[runner]
+runner_type = "codex"
+executor = ["tines-runner-rs"]
+executor_cwd = "~"
+workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
+```
+
+For container execution, install `tines-runner-rs`, Codex CLI, and Git inside
+the image or executor environment. Configure Codex and repository credentials
+there as well. The host directory used by this example must exist before the
+daemon starts:
+
+```toml
+[runner]
+runner_type = "codex"
+executor = [
+  "docker", "run", "--rm", "-i",
+  "--mount", "type=bind,src=/var/lib/tines-runner-rs/workspaces,dst=/workspaces",
+  "runner-image", "tines-runner-rs"
+]
+executor_cwd = "/var/lib/tines-runner-rs"
+workspace_parent = "/workspaces"
+```
+
+Each TOML array item is one argument. The daemon passes the arguments directly
+to the process; it does not parse shell quoting or run a shell. The daemon
+appends the executor mode (`capabilities` or `execute`) to the configured
+arguments. The transport must stay in the foreground, accept stdin, and
+propagate stdout, stderr, exit status, and termination. Podman can use the
+same attached argument pattern. Detached container modes are not supported.
+
+The daemon resolves `executor_cwd` on the host and does not send it to the
+executor. It sends `workspace_parent` and retention settings in the execution
+request. The executor resolves `workspace_parent` in its own filesystem, then
+creates a `run-<UUID>` directory below it for each assignment. A configured
+`~` uses the executor account's home directory. If the setting is omitted, the
+executor uses its platform/XDG default. In a container, paths such as
+`/workspaces` refer to the container filesystem; mount a host directory at
+that path if the workspace must be available outside the container.
+
+The daemon expands `~` in host-side paths such as `executor_cwd` and
+`credentials_file`. Use absolute paths or paths beginning with `~` for
+`workspace_parent` so its meaning does not depend on the executor's working
+directory. The deprecated legacy wrapper path keeps its daemon-side workspace
 resolution. Unknown configuration keys cause startup to fail.
 
 ### Configure execution overrides
@@ -350,6 +410,12 @@ startup and after each settled run. It only deletes direct child directories
 that contain a valid runner retention marker. It leaves unmarked directories
 alone. Set `keep_workspaces_for_hours` or `keep_workspaces_max` to change the
 limits. A maximum of zero removes all marked workspaces during pruning.
+
+Retention applies to the executor's workspace filesystem. A short-lived
+container started with `--rm` loses files from its own filesystem when it
+exits, even if the runner retained them at settlement. Mount the workspace
+parent to persistent storage, as in the example above, or use a persistent
+executor environment to keep retained workspaces available for later review.
 
 Retention is for debugging. It does not resume an interrupted assignment or
 preserve state for Tines to resume. Cancellation cleanup can remove a workspace

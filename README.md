@@ -1,10 +1,11 @@
 # tines-runner-rs
 
 `tines-runner-rs` is a standalone Rust daemon that runs work assigned by a
-Tines instance on a local machine. It polls Tines, prepares an isolated
-workspace, checks out assigned Git repositories with the machine's Git
-credentials, runs the assignment with Codex, and reports logs and status to
-Tines.
+Tines instance. The daemon polls Tines, selects the effective run settings,
+starts an executor, and reports logs and status to Tines. The executor
+prepares the workspace, checks out assigned Git repositories, and runs the
+selected harness. The executor can run on the daemon host or inside a
+container.
 
 Codex is the only supported harness. The runner makes outbound connections to
 Tines and Git remotes; it does not need an inbound connection. It does not
@@ -183,6 +184,72 @@ The main settings are:
 | `[storage].keep_workspaces_for_hours` | Maximum age for retained workspaces. Defaults to `72` hours. |
 | `[storage].keep_workspaces_max` | Maximum number of retained workspaces. Defaults to `20`. |
 
+### Choose native or container execution
+
+`runner_type` selects the harness. `executor` selects the command that starts
+the execution environment. The daemon starts that command directly from
+`executor_cwd`; it does not use a shell. `executor_cwd` is required, has no
+implicit default, and is the daemon-side working directory for the transport
+process. It does not set the workspace path inside the executor.
+
+For native execution, keep the default executor and install
+`tines-runner-rs`, Codex CLI, and Git for the daemon account. Codex and Git
+credentials must also be available to that account:
+
+```toml
+[runner]
+runner_type = "codex"
+executor = ["tines-runner-rs"]
+executor_cwd = "~"
+workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
+```
+
+For Docker execution, install Codex CLI and Git and configure their credentials
+inside the image or executor environment. The image must also contain
+`tines-runner-rs`. This Linux example mounts a host directory for workspaces;
+create the host directory before starting the daemon:
+
+```toml
+[runner]
+runner_type = "codex"
+executor = [
+  "docker", "run", "--rm", "-i",
+  "--mount", "type=bind,src=/var/lib/tines-runner-rs/workspaces,dst=/workspaces",
+  "runner-image", "tines-runner-rs"
+]
+executor_cwd = "/var/lib/tines-runner-rs"
+workspace_parent = "/workspaces"
+```
+
+Each TOML array item is one argument. For example, `--mount` and its value
+are separate arguments. Podman can use the same attached argument pattern.
+Keep the executor in the foreground and pass `-i` so it can read the request
+from stdin and write protocol events to stdout. Do not use detached container
+mode.
+
+The daemon sends `workspace_parent` and retention settings to the executor.
+The executor interprets that path in its own filesystem and creates one
+`run-<UUID>` directory below it for each assignment. A `~` uses the executor
+account's home directory. If the setting is omitted, the executor uses its
+platform/XDG workspace default. `executor_cwd` is resolved by the daemon and
+is not sent to the executor.
+
+The runner applies `keep_workspaces` inside the executor environment after
+Tines accepts the terminal run status. With a short-lived `docker run --rm`
+container, retained files disappear when the container exits unless the
+workspace directory is mounted to persistent storage. A persistent executor
+environment can retain workspaces on its own filesystem, subject to the age
+and count limits. With the example mount, retained workspaces remain on the
+host directory.
+
+Capability discovery also crosses the executor boundary. The daemon invokes
+the configured executor in `capabilities` mode and caches its versioned
+report for ten minutes. The native executor discovers Codex on the daemon
+account's `PATH`; a container executor discovers Codex inside the container.
+The daemon refreshes the report before it accepts assignments with enforced
+effort. An invalid report or unsupported harness or effort causes the daemon
+to decline the incompatible assignment.
+
 Use `[[override]]` entries to change a workspace parent, runner type, executor
 command, or executor working directory for matching assignments.
 Each selector is optional. Every selector in one entry must match. Names match
@@ -216,11 +283,13 @@ retained workspace storage into the container.
 `[runner].wrapper` and `[[override]].wrapper` are deprecated compatibility
 settings for the legacy direct-Codex execution path. The runner keeps their
 old Codex-prefix behavior and logs a warning when either setting is present.
-They do not configure the executor transport, and that legacy path keeps its
-daemon-side workspace resolution. To migrate a Codex profile wrapper, install
-it as the `codex` command in the executor environment, such as in the
-container image or its `PATH`. To move an isolation wrapper such as Docker or
-Podman, put its arguments in `executor` and set `executor_cwd`.
+They are not aliases for `executor`, and the legacy path keeps its daemon-side
+workspace resolution. To migrate a Codex profile wrapper, install it as the
+`codex` command in the executor environment, such as in the container image or
+its `PATH`. To migrate an isolation wrapper such as Docker or Podman, move its
+arguments into `executor`, add `tines-runner-rs` after the image name, and set
+`executor_cwd`. Set `workspace_parent` to a path inside that executor
+environment when needed.
 
 ## Workspace retention
 
@@ -290,6 +359,8 @@ release PR's branch. CI starts automatically for ordinary pull requests.
 ## More documentation
 
 - [Operator guide](docs/operation.md) — service examples and detailed setup.
+- [Split-runner proposal](docs/proposals/split-runner.md) — design rationale
+  for the daemon/executor boundary and local execution protocol.
 - [Project proposal](docs/tines-runner-rs-proposal.md) — design, scope, and
   protocol goals.
 - [Implementation issue map](docs/tines-runner-rs-issues.md) — project issue
