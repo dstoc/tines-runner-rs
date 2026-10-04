@@ -43,7 +43,7 @@ fi
 case "${TRANSPORT_HARNESS_MODE:-success}" in
     cancel|timeout)
         trap '' TERM
-        (trap '' TERM; exec sleep 30) &
+        (trap '' TERM; exec sleep 300) &
         child=$!
         temporary="${TRANSPORT_HARNESS_CHILD_PID_FILE}.tmp"
         printf '%s\n' "$child" > "$temporary"

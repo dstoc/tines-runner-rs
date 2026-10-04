@@ -410,6 +410,13 @@ fn assert_process_stopped(process_id: u32) {
     );
 }
 
+fn assert_process_running(process_id: u32) {
+    assert!(
+        !process_is_stopped(process_id),
+        "process {process_id} stopped before timeout settlement"
+    );
+}
+
 fn wait_for_run_log(fake: &FakeTines, run_id: &str, message: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -713,6 +720,23 @@ fn isolated_transport_covers_capabilities_overrides_protocol_cancellation_and_ti
 
     let timeout = assignment(&paths, "arun_transport_timeout", "Tines", 1, "timeout");
     route_assignment(&fake, timeout);
+    let timeout_harness_pid_file = paths.captures.join("arun_transport_timeout.harness.pid");
+    let timeout_descendant_pid_file = paths.captures.join("arun_transport_timeout.descendant.pid");
+    wait_for_file(&timeout_harness_pid_file, Duration::from_secs(10));
+    wait_for_file(&timeout_descendant_pid_file, Duration::from_secs(10));
+    let timeout_harness_pid = fs::read_to_string(timeout_harness_pid_file)
+        .expect("read timeout harness PID")
+        .trim()
+        .parse::<u32>()
+        .expect("valid timeout harness PID");
+    let timeout_descendant_pid = fs::read_to_string(timeout_descendant_pid_file)
+        .expect("read timeout descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("valid timeout descendant PID");
+    assert_process_running(timeout_harness_pid);
+    assert_process_running(timeout_descendant_pid);
+
     let timeout_finish =
         wait_for_finished_run(&fake, "arun_transport_timeout", Duration::from_secs(90));
     assert_eq!(timeout_finish["status"], "failed");
@@ -728,15 +752,13 @@ fn isolated_transport_covers_capabilities_overrides_protocol_cancellation_and_ti
     );
     let timeout_shim_pid = timeout_transport["pid"].as_u64().unwrap() as u32;
     let timeout_executor_pid = timeout_transport["executor_pid"].as_u64().unwrap() as u32;
-    assert_process_stopped(timeout_shim_pid);
-    assert_process_stopped(timeout_executor_pid);
-    let timeout_harness_pid_file = paths.captures.join("arun_transport_timeout.harness.pid");
-    let timeout_descendant_pid_file = paths.captures.join("arun_transport_timeout.descendant.pid");
-    for pid_file in [timeout_harness_pid_file, timeout_descendant_pid_file] {
-        if let Ok(contents) = fs::read_to_string(pid_file) {
-            let process_id = contents.trim().parse::<u32>().expect("valid timeout PID");
-            assert_process_stopped(process_id);
-        }
+    for process_id in [
+        timeout_shim_pid,
+        timeout_executor_pid,
+        timeout_harness_pid,
+        timeout_descendant_pid,
+    ] {
+        assert_process_stopped(process_id);
     }
 
     assert_eq!(fs::read_dir(&paths.daemon_workspaces).unwrap().count(), 0);
