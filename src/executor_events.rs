@@ -1,6 +1,7 @@
 //! Daemon-side translation of generic executor events into Tines run data.
 
 use serde_json::{Map, Value};
+use std::fmt;
 
 use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionEventParser, ExecutionPricingEvidence,
@@ -26,12 +27,38 @@ impl ExecutorEventStream {
     }
 
     /// Parse one arbitrary stdout chunk and return normalized log text.
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, ProtocolError> {
-        let events = self.parser.push(chunk)?;
-        Ok(events
-            .into_iter()
-            .filter_map(|event| self.report.observe(event))
-            .collect())
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, ExecutorEventPushError> {
+        let mut logs = Vec::new();
+        let mut start = 0;
+        while let Some(offset) = chunk[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + offset + 1;
+            self.push_record(&chunk[start..end], &mut logs)?;
+            start = end;
+        }
+        if start < chunk.len() {
+            self.push_record(&chunk[start..], &mut logs)?;
+        }
+        Ok(logs)
+    }
+
+    fn push_record(
+        &mut self,
+        record: &[u8],
+        logs: &mut Vec<String>,
+    ) -> Result<(), ExecutorEventPushError> {
+        let events = self
+            .parser
+            .push(record)
+            .map_err(|error| ExecutorEventPushError {
+                logs: std::mem::take(logs),
+                error,
+            })?;
+        logs.extend(
+            events
+                .into_iter()
+                .filter_map(|event| self.report.observe(event)),
+        );
+        Ok(())
     }
 
     /// Require a terminal result at EOF and include a final unterminated line.
@@ -50,6 +77,25 @@ impl ExecutorEventStream {
         interrupted: bool,
     ) -> FinishRunRequest {
         self.report.finish_request(failure, stderr, interrupted)
+    }
+}
+
+/// A protocol failure and any logs parsed earlier in the same stdout chunk.
+#[derive(Debug)]
+pub struct ExecutorEventPushError {
+    pub logs: Vec<String>,
+    error: ProtocolError,
+}
+
+impl fmt::Display for ExecutorEventPushError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for ExecutorEventPushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -334,6 +380,38 @@ mod tests {
     use crate::execution_protocol::ExecutionRequest;
     use crate::protocol::{FinishJudgment, FinishStatus};
     use serde_json::{Value, json};
+
+    #[test]
+    fn review_metadata_and_logs_before_protocol_failure_survive_chunk_boundaries() {
+        let mut prefix =
+            line(json!({"version":1,"type":"log","stream":"stdout","message":"before error"}));
+        prefix.extend(line(
+            json!({"version":1,"type":"session","provider":"codex","id":"thread-before-error"}),
+        ));
+        prefix.extend(line(
+            json!({"version":1,"type":"usage","input_tokens":17,"output_tokens":9}),
+        ));
+        prefix.extend(line(json!({"version":1,"type":"rate_limit","resume_at":2_000_000_000_000_u64,"message":"try later"})));
+        let mut together = ExecutorEventStream::new(&request());
+        let mut split = ExecutorEventStream::new(&request());
+        let mut combined = prefix.clone();
+        combined.extend_from_slice(b"not-json\n");
+        let together_error = together.push(&combined).expect_err("malformed suffix");
+        let split_logs = split.push(&prefix).expect("valid event prefix");
+        let split_error = split.push(b"not-json\n").expect_err("malformed suffix");
+        assert_eq!(together_error.logs, split_logs);
+        assert!(split_error.logs.is_empty());
+        assert_eq!(together_error.to_string(), split_error.to_string());
+        let together_finish = together.finish_request(Some("protocol failure"), "", false);
+        let split_finish = split.finish_request(Some("protocol failure"), "", false);
+        assert_eq!(
+            together_finish.provider_session_id,
+            split_finish.provider_session_id
+        );
+        assert_eq!(together_finish.usage, split_finish.usage);
+        assert_eq!(together_finish.judgment, split_finish.judgment);
+        assert_eq!(together_finish.resume_at, split_finish.resume_at);
+    }
 
     fn request() -> ExecutionRequest {
         serde_json::from_value(json!({

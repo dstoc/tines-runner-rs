@@ -233,13 +233,23 @@ fn run_executor(
                     );
                 }
                 Err(error) => {
+                    let error_message = error.to_string();
+                    let run_deadline = deadline.get().unwrap_or_else(|| Instant::now() + timeout);
+                    append_executor_logs(
+                        &run_logs,
+                        client,
+                        &run_id,
+                        &runner_token,
+                        error.logs,
+                        run_deadline,
+                    );
                     tracing::warn!(
                         run_id,
-                        error = %error,
+                        error = %error_message,
                         "executor emitted invalid protocol output"
                     );
                     *protocol_failure.borrow_mut() =
-                        Some(format!("executor protocol failure: {error}"));
+                        Some(format!("executor protocol failure: {error_message}"));
                 }
             }
         },

@@ -475,7 +475,12 @@ fn secret_forms(request: &ExecutionRequest) -> Vec<String> {
         .flat_map(|secret| {
             let escaped =
                 serde_json::to_string(&secret).expect("Rust strings always serialize to JSON");
-            [secret, escaped[1..escaped.len() - 1].to_owned()]
+            let rust_escaped = format!("{secret:?}");
+            [
+                secret,
+                escaped[1..escaped.len() - 1].to_owned(),
+                rust_escaped[1..rust_escaped.len() - 1].to_owned(),
+            ]
         })
         .collect::<Vec<_>>();
     forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
@@ -584,6 +589,38 @@ impl Error for ExecutorTransportError {}
 mod tests {
     use super::{ExecutionRequest, safe_executor_environment};
     use std::ffi::OsString;
+
+    #[test]
+    fn review_debug_escaped_stderr_secret_is_redacted() {
+        let mut request = request();
+        request.assignment.env[0].value = "prefix\u{8}suffix".to_owned();
+        let diagnostic = format!("{:?}", request.assignment.env[0].value);
+        let mut stderr = super::BoundedStderr::new(&request);
+        stderr.push(diagnostic.as_bytes());
+        let diagnostic = stderr.finish();
+        assert!(
+            !diagnostic.contains("prefix\\u{8}suffix"),
+            "escaped secret remains in operator diagnostic: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn truncation_guard_accounts_for_rust_debug_escaped_secrets() {
+        let mut request = request();
+        request.assignment.env[0].value = format!("prefix{}suffix", "\u{8}".repeat(64));
+        let debug_secret = format!("{:?}", request.assignment.env[0].value);
+        let mut output = vec![b'x'; super::MAX_STDERR_DIAGNOSTIC_BYTES - 200];
+        output.extend_from_slice(debug_secret.as_bytes());
+
+        let mut stderr = super::BoundedStderr::new(&request);
+        stderr.push(&output);
+        let diagnostic = stderr.finish();
+        assert!(diagnostic.contains(super::STDERR_TRUNCATION_MARKER));
+        assert!(
+            !diagnostic.contains("prefix"),
+            "truncated secret prefix remains in operator diagnostic"
+        );
+    }
 
     fn request() -> ExecutionRequest {
         serde_json::from_value(serde_json::json!({
