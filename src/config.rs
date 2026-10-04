@@ -30,6 +30,17 @@ pub enum RetentionMode {
     Always,
 }
 
+/// Whether the executor should create working trees for assigned repositories.
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryCheckoutPolicy {
+    /// Clone each assigned repository into the workspace.
+    #[default]
+    Enabled,
+    /// Write repository metadata without creating working trees.
+    MetadataOnly,
+}
+
 /// Bounds and mode for retained assignment workspaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceRetention {
@@ -53,6 +64,7 @@ pub struct Config {
     pub executor: Vec<String>,
     /// Default argv command for assignments using the custom harness.
     pub custom_command: Option<Vec<String>>,
+    pub repository_checkout: RepositoryCheckoutPolicy,
     /// The daemon-side working directory for the executor transport process.
     pub executor_cwd: PathBuf,
     pub max_concurrent: usize,
@@ -74,6 +86,8 @@ pub struct ResolvedRunConfig {
     pub executor: Vec<String>,
     /// Command argv for the semantic custom harness, if configured.
     pub custom_command: Option<Vec<String>>,
+    /// Repository materialization mode selected for this assignment.
+    pub repository_checkout: RepositoryCheckoutPolicy,
     /// Absolute daemon-side working directory for the executor process.
     pub executor_cwd: PathBuf,
 }
@@ -180,6 +194,7 @@ impl Config {
             workspace_parent: self.workspace_parent.clone(),
             executor: self.executor.clone(),
             custom_command: self.custom_command.clone(),
+            repository_checkout: self.repository_checkout,
             executor_cwd: self.executor_cwd.clone(),
         };
         let mut matching_overrides = Vec::new();
@@ -191,6 +206,9 @@ impl Config {
             matching_overrides.push(index);
             if let Some(runner_type) = rule.runner_type {
                 resolved.runner_type = runner_type;
+            }
+            if let Some(repository_checkout) = rule.repository_checkout {
+                resolved.repository_checkout = repository_checkout;
             }
             if let Some(workspace_parent) = &rule.workspace_parent {
                 resolved.workspace_parent = Some(workspace_parent.clone());
@@ -304,6 +322,7 @@ impl Config {
                     && rule.executor.is_none()
                     && rule.executor_cwd.is_none()
                     && rule.custom_command.is_none()
+                    && rule.repository_checkout.is_none()
                 {
                     return Err(ConfigError::Invalid(
                         "each [[override]] must set at least one override value".to_owned(),
@@ -320,6 +339,7 @@ impl Config {
                     runner_type: rule.runner_type,
                     executor: rule.executor,
                     custom_command: rule.custom_command,
+                    repository_checkout: rule.repository_checkout,
                     executor_cwd: rule
                         .executor_cwd
                         .as_deref()
@@ -344,6 +364,7 @@ impl Config {
                 .custom_command
                 .map(|command| validate_custom_command(&command).map(|()| command))
                 .transpose()?,
+            repository_checkout: raw.runner.repository_checkout.unwrap_or_default(),
             executor_cwd,
             max_concurrent,
             allow_remote_concurrency: raw.runner.allow_remote_concurrency,
@@ -382,6 +403,7 @@ struct ConfigOverride {
     runner_type: Option<RunnerType>,
     executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
+    repository_checkout: Option<RepositoryCheckoutPolicy>,
     executor_cwd: Option<PathBuf>,
 }
 
@@ -428,6 +450,7 @@ struct RawRunner {
     workspace_parent: Option<PathBuf>,
     executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
+    repository_checkout: Option<RepositoryCheckoutPolicy>,
     executor_cwd: Option<PathBuf>,
     max_concurrent: Option<usize>,
     #[serde(default)]
@@ -454,6 +477,7 @@ struct RawOverride {
     runner_type: Option<RunnerType>,
     executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
+    repository_checkout: Option<RepositoryCheckoutPolicy>,
     executor_cwd: Option<PathBuf>,
 }
 
@@ -838,6 +862,59 @@ workspace_parent = "/review"
         let resolved = config.resolve(context("Tines", "Implementation", "Review"));
         assert_eq!(resolved.workspace_parent, Some(PathBuf::from("/review")));
         assert_eq!(resolved.executor, ["workflow-executor"]);
+    }
+
+    #[test]
+    fn repository_checkout_policy_defaults_to_enabled_and_overrides_by_selector() {
+        let default_config = parse_with_overrides("");
+        assert_eq!(
+            default_config
+                .resolve(context("Other", "Build", "Ready"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::Enabled
+        );
+
+        let config = parse_with_overrides(
+            r#"repository_checkout = "metadata_only"
+
+[[override]]
+project = "Tines"
+repository_checkout = "enabled"
+
+[[override]]
+workflow = "Implementation"
+repository_checkout = "enabled"
+
+[[override]]
+state = "Review"
+repository_checkout = "enabled"
+"#,
+        );
+
+        assert_eq!(
+            config
+                .resolve(context("Other", "Build", "Ready"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::MetadataOnly
+        );
+        assert_eq!(
+            config
+                .resolve(context("Tines", "Build", "Ready"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::Enabled
+        );
+        assert_eq!(
+            config
+                .resolve(context("Other", "Implementation", "Ready"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::Enabled
+        );
+        assert_eq!(
+            config
+                .resolve(context("Other", "Build", "Review"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::Enabled
+        );
     }
 
     #[test]

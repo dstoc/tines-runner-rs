@@ -45,6 +45,22 @@ fn missing_workspace_parent_selects_the_executor_default() {
 }
 
 #[test]
+fn missing_repository_checkout_policy_keeps_the_existing_clone_behavior() {
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
+    fixture["execution"]
+        .as_object_mut()
+        .unwrap()
+        .remove("repository_checkout");
+
+    let request: ExecutionRequest = serde_json::from_value(fixture).unwrap();
+    assert_eq!(
+        request.execution.repository_checkout,
+        tines_runner_rs::config::RepositoryCheckoutPolicy::Enabled
+    );
+}
+
+#[test]
 fn unsupported_request_versions_are_rejected_during_deserialization() {
     let mut fixture: Value =
         serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();

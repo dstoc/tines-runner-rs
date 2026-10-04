@@ -254,6 +254,7 @@ name = "execution-request-test"
 executor = ["docker", "run", "--rm", "-i", "runner-image"]
 executor_cwd = "/host/daemon"
 workspace_parent = "/executor/workspaces"
+repository_checkout = "metadata_only"
 [storage]
 keep_workspaces = "failed"
 keep_workspaces_for_hours = 36
@@ -274,6 +275,10 @@ keep_workspaces_max = 17
         PathBuf::from("/host/daemon")
     );
     assert_eq!(request.execution.harness, "codex");
+    assert_eq!(
+        request.execution.repository_checkout,
+        tines_runner_rs::config::RepositoryCheckoutPolicy::MetadataOnly
+    );
     assert_eq!(
         request.execution.workspace.parent,
         Some(PathBuf::from("/executor/workspaces"))

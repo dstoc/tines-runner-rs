@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{Value, json};
+use tines_runner_rs::config::RepositoryCheckoutPolicy;
 use tines_runner_rs::execution_protocol::{
     ExecutionEventKind, ExecutionEventParser, ExecutionRequest, TerminalStatus,
 };
@@ -173,6 +174,52 @@ fn executor_materializes_request_files_skills_repositories_and_environment() {
             .environment()
             .secret_values()
             .any(|value| value == "fixture-run-key")
+    );
+}
+
+#[test]
+fn metadata_only_executor_request_writes_repos_json_without_repository_directories() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("workspaces");
+    let request = request_fixture(
+        &workspace_parent,
+        json!({
+            "name": "private-repository",
+            "dir": "checkouts/private",
+            "url": directory.0.join("missing-private-repository").to_string_lossy(),
+            "branch": null
+        }),
+    );
+    let mut request = request;
+    request.execution.repository_checkout = RepositoryCheckoutPolicy::MetadataOnly;
+
+    let workspace = prepare_workspace(&request, |_| {})
+        .expect("metadata-only mode must skip Git and credential checks");
+    let repos: Value = serde_json::from_slice(
+        &fs::read(workspace.path().join("repos.json")).expect("read repository metadata"),
+    )
+    .expect("parse repository metadata");
+    assert_eq!(repos, request.assignment.bundle["repos"]);
+    assert!(!workspace.path().join("checkouts").exists());
+    assert!(!workspace.path().join("checkouts/private").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("prompt.md")).unwrap(),
+        "Implement the assigned issue.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            workspace
+                .path()
+                .join(".agents/skills/fixture-skill/SKILL.md")
+        )
+        .unwrap(),
+        "skill from executor request\n"
+    );
+    assert!(
+        workspace
+            .environment()
+            .variable_names()
+            .any(|name| name == "FIXTURE_TOKEN")
     );
 }
 

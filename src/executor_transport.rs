@@ -55,6 +55,7 @@ pub fn execution_request(
                 RunnerType::Custom => "custom".to_owned(),
             },
             custom_command: policy.custom_command.clone(),
+            repository_checkout: policy.repository_checkout,
             workspace: WorkspacePolicy {
                 parent: policy.workspace_parent.clone(),
             },

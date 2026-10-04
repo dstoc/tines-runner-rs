@@ -17,10 +17,17 @@ use serde_json::Value;
 use url::Url;
 
 use crate::cancellation::CancellationToken;
+use crate::config::RepositoryCheckoutPolicy;
 use crate::process::{ProcessExit, ProcessStream, SupervisedProcess};
 use crate::protocol::{RunnerAssignment, RunnerAssignmentEnv};
 
 const SKILLS_PATH: &str = ".agents/skills";
+
+#[derive(Clone, Copy)]
+struct CheckoutOptions<'a> {
+    policy: RepositoryCheckoutPolicy,
+    git_program: &'a OsStr,
+}
 
 /// A unique workspace and the assignment environment kept in memory for launch.
 #[derive(Clone)]
@@ -46,11 +53,29 @@ impl MaterializedWorkspace {
         api_url: &Url,
         on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
-        Self::create_cancellable_with_git_log(
+        Self::create_with_repository_checkout(
+            parent,
+            assignment,
+            api_url,
+            RepositoryCheckoutPolicy::Enabled,
+            on_git_output,
+        )
+    }
+
+    /// Create a workspace using the selected repository checkout policy.
+    pub fn create_with_repository_checkout(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        repository_checkout: RepositoryCheckoutPolicy,
+        on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
+        Self::create_cancellable_with_repository_checkout(
             parent,
             assignment,
             api_url,
             &CancellationToken::default(),
+            repository_checkout,
             on_git_output,
         )
     }
@@ -64,11 +89,31 @@ impl MaterializedWorkspace {
         cancellation: &CancellationToken,
         on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
-        Self::create_cancellable_with_workspace_hook(
+        Self::create_cancellable_with_repository_checkout(
             parent,
             assignment,
             api_url,
             cancellation,
+            RepositoryCheckoutPolicy::Enabled,
+            on_git_output,
+        )
+    }
+
+    /// Create a workspace and stop Git checkout work when cancellation arrives.
+    pub fn create_cancellable_with_repository_checkout(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        cancellation: &CancellationToken,
+        repository_checkout: RepositoryCheckoutPolicy,
+        on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
+        Self::create_cancellable_with_workspace_hook_and_policy(
+            parent,
+            assignment,
+            api_url,
+            cancellation,
+            repository_checkout,
             |_| Ok(()),
             on_git_output,
         )
@@ -83,12 +128,36 @@ impl MaterializedWorkspace {
         on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
         on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
+        Self::create_cancellable_with_workspace_hook_and_policy(
+            parent,
+            assignment,
+            api_url,
+            cancellation,
+            RepositoryCheckoutPolicy::Enabled,
+            on_workspace_created,
+            on_git_output,
+        )
+    }
+
+    /// Create a workspace and persist its path before materializing files.
+    pub fn create_cancellable_with_workspace_hook_and_policy(
+        parent: impl AsRef<Path>,
+        assignment: &RunnerAssignment,
+        api_url: &Url,
+        cancellation: &CancellationToken,
+        repository_checkout: RepositoryCheckoutPolicy,
+        on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
+        on_git_output: impl FnMut(&str),
+    ) -> Result<Self, WorkspaceError> {
         Self::create_with_git_program_and_hook(
             parent,
             assignment,
             api_url,
             cancellation,
-            OsStr::new("git"),
+            CheckoutOptions {
+                policy: repository_checkout,
+                git_program: OsStr::new("git"),
+            },
             on_workspace_created,
             on_git_output,
         )
@@ -99,7 +168,7 @@ impl MaterializedWorkspace {
         assignment: &RunnerAssignment,
         api_url: &Url,
         cancellation: &CancellationToken,
-        git_program: &OsStr,
+        checkout: CheckoutOptions<'_>,
         mut on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
         mut on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
@@ -108,7 +177,7 @@ impl MaterializedWorkspace {
             assignment,
             api_url,
             cancellation,
-            git_program,
+            checkout,
             |path| on_workspace_created(path),
             |chunk| on_git_output(chunk),
         )
@@ -119,7 +188,7 @@ impl MaterializedWorkspace {
         assignment: &RunnerAssignment,
         api_url: &Url,
         cancellation: &CancellationToken,
-        git_program: &OsStr,
+        checkout: CheckoutOptions<'_>,
         mut on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
         mut on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
@@ -147,7 +216,7 @@ impl MaterializedWorkspace {
                     &path,
                     assignment,
                     cancellation,
-                    git_program,
+                    checkout,
                     &mut on_git_output,
                 )
             });
@@ -428,7 +497,7 @@ fn materialize_contents(
     root: &Path,
     assignment: &RunnerAssignment,
     cancellation: &CancellationToken,
-    git_program: &OsStr,
+    checkout: CheckoutOptions<'_>,
     on_git_output: &mut impl FnMut(&str),
 ) -> Result<(), WorkspaceError> {
     if cancellation.is_cancelled() {
@@ -460,13 +529,16 @@ fn materialize_contents(
         return Err(WorkspaceError::Cancelled);
     }
     materialize_skills(root, &bundle.skills)?;
-    clone_repositories(
-        root,
-        &repositories,
-        cancellation,
-        git_program,
-        on_git_output,
-    )
+    match checkout.policy {
+        RepositoryCheckoutPolicy::Enabled => clone_repositories(
+            root,
+            &repositories,
+            cancellation,
+            checkout.git_program,
+            on_git_output,
+        ),
+        RepositoryCheckoutPolicy::MetadataOnly => Ok(()),
+    }
 }
 
 fn validate_skills(skills: &[Skill]) -> Result<(), WorkspaceError> {
@@ -861,8 +933,12 @@ fn valid_environment_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MaterializedWorkspace, Skill, SkillFile, WorkspaceError, materialize_skills};
+    use super::{
+        CheckoutOptions, MaterializedWorkspace, Skill, SkillFile, WorkspaceError,
+        materialize_skills,
+    };
     use crate::cancellation::CancellationToken;
+    use crate::config::RepositoryCheckoutPolicy;
     use crate::protocol::RunnerAssignment;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -992,7 +1068,10 @@ mod tests {
                 &worker_assignment,
                 &api_url,
                 &worker_cancellation,
-                fake_git_path.as_os_str(),
+                CheckoutOptions {
+                    policy: RepositoryCheckoutPolicy::Enabled,
+                    git_program: fake_git_path.as_os_str(),
+                },
                 |_| Ok(()),
                 |_| {},
             )
@@ -1235,6 +1314,51 @@ mod tests {
         let repos = fs::read_to_string(workspace.path().join("repos.json")).unwrap();
         assert!(repos.contains("checkouts/fixture"));
         assert!(output.iter().any(|chunk| chunk.contains("git [fixture]:")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_only_writes_repository_metadata_without_invoking_git_or_creating_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new();
+        let fake_git = directory.0.join("git-that-must-not-run");
+        fs::write(&fake_git, "#!/bin/sh\nexit 99\n").expect("write fake Git command");
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
+            .expect("make fake Git executable");
+        let assignment = assignment(
+            json!({
+                "skills": [],
+                "repos": [{
+                    "name": "private-repo",
+                    "dir": "checkouts/private",
+                    "url": "https://private.example.test/org/repo.git",
+                    "branch": "review"
+                }]
+            }),
+            json!([]),
+        );
+        let api_url = Url::parse("https://tines.example.test").unwrap();
+        let workspace = MaterializedWorkspace::create_with_git_program(
+            directory.0.join("workspaces"),
+            &assignment,
+            &api_url,
+            &CancellationToken::default(),
+            CheckoutOptions {
+                policy: RepositoryCheckoutPolicy::MetadataOnly,
+                git_program: fake_git.as_os_str(),
+            },
+            |_| Ok(()),
+            |_| {},
+        )
+        .expect("metadata-only workspace does not need Git or repository credentials");
+
+        let repos: serde_json::Value = serde_json::from_slice(
+            &fs::read(workspace.path().join("repos.json")).expect("read repository metadata"),
+        )
+        .expect("parse repository metadata");
+        assert_eq!(repos, assignment.bundle["repos"]);
+        assert!(!workspace.path().join("checkouts").exists());
     }
 
     #[test]

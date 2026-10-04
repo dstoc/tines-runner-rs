@@ -5,6 +5,7 @@
   },
   "execution": {
     "harness": "codex",
+    "repository_checkout": "enabled",
     "workspace": {
       "parent": "/workspace"
     },

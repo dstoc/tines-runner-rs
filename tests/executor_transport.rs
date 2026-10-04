@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tines_runner_rs::config::{Config, MatchContext};
+use tines_runner_rs::config::{Config, MatchContext, RepositoryCheckoutPolicy};
 #[cfg(target_os = "linux")]
 use tines_runner_rs::config::{RetentionMode, WorkspaceRetention};
 use tines_runner_rs::execution_protocol::{
@@ -80,6 +80,7 @@ fn request(prompt: String) -> ExecutionRequest {
         execution: LocalExecutionPolicy {
             harness: "codex".to_owned(),
             custom_command: None,
+            repository_checkout: RepositoryCheckoutPolicy::Enabled,
             workspace: WorkspacePolicy {
                 parent: Some(PathBuf::from("/executor/workspaces")),
             },

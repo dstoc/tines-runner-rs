@@ -42,12 +42,12 @@ The daemon account needs:
 - a Tines user API key for the first registration, if no runner credentials
   file exists.
 
-The executor environment needs Git, credentials for assigned repositories,
-and network access to Git remotes. It also needs the selected harness command.
-For native execution, install and configure Git and that command for the
-daemon account. For container execution, configure them inside the container.
-Service managers and containers often use a different `PATH` and credentials
-than an interactive shell.
+The executor environment needs the selected harness command. When repository
+checkout is enabled, it also needs Git, credentials for assigned repositories,
+and network access to Git remotes. For native execution, install the command
+and, when needed, Git for the daemon account. For container execution, install
+them inside the container. Service managers and containers often use a
+different `PATH` and credentials than an interactive shell.
 
 ## Quick start
 
@@ -177,6 +177,7 @@ The main settings are:
 | `[runner].name` | Name used to register this runner. Required. |
 | `[runner].runner_type` | Harness type: `codex` or `custom`. Defaults to `codex`. |
 | `[runner].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
+| `[runner].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |
 | `[runner].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
 | `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
 | `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
@@ -231,12 +232,21 @@ Keep the executor in the foreground and pass `-i` so it can read the request
 from stdin and write protocol events to stdout. Do not use detached container
 mode.
 
-The executor creates one `run-<UUID>` workspace and checks out the assigned
-repositories there. It resolves `workspace_parent` in its own environment. A
-configured `~` uses the executor account's home. If the setting is omitted,
-the executor uses its platform default. `executor_cwd` is resolved by the
-daemon and is not sent to the executor; it only sets the working directory for
-the transport process.
+The executor creates one `run-<UUID>` workspace and writes the effective
+repository list to `repos.json` at its root. With the default
+`repository_checkout = "enabled"`, it also checks out the assigned
+repositories there. Set `repository_checkout = "metadata_only"` for API-only,
+checking, or review harnesses that use repository URLs and branch metadata
+without reading source files. This mode does not invoke Git or require Git
+credentials. Harnesses can always discover the metadata at
+`{workspace}/repos.json`; no repository working-tree directories are created
+in metadata-only mode.
+
+The executor resolves `workspace_parent` in its own environment. A configured
+`~` uses the executor account's home. If the setting is omitted, the executor
+uses its platform default. `executor_cwd` is resolved by the daemon and is not
+sent to the executor; it only sets the working directory for the transport
+process.
 
 The executor applies `keep_workspaces` to its workspace before it emits the
 terminal result. A short-lived `docker run --rm` container removes files on its
@@ -253,9 +263,9 @@ Codex model effort settings. The daemon refreshes the report before it accepts
 assignments with enforced effort. An invalid report or unsupported harness or
 effort causes the daemon to decline the incompatible assignment.
 
-Use `[[override]]` entries to change a workspace parent, runner type, custom
-harness command, executor command, or executor working directory for matching
-assignments.
+Use `[[override]]` entries to change a workspace parent, repository checkout
+mode, runner type, custom harness command, executor command, or executor
+working directory for matching assignments.
 Each selector is optional. Every selector in one entry must match. Names match
 exactly and without regard to case. Entries apply in file order; later entries
 replace only the fields they set.
@@ -312,6 +322,7 @@ custom_command = ["default-checks", "{prompt_file}"]
 [[override]]
 project = "Payments"
 custom_command = ["github-checks", "--prompt-file", "{prompt_file}", "--workspace", "{workspace}"]
+repository_checkout = "metadata_only"
 
 [[override]]
 state = "Review"
