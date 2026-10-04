@@ -412,6 +412,18 @@ impl ExecutionEvent {
                     return Err(ProtocolError::InvalidEvent);
                 }
             }
+            ExecutionEventKind::ProviderError {
+                provider,
+                code,
+                message,
+            } => {
+                if provider.trim().is_empty()
+                    || code.as_ref().is_some_and(|value| value.trim().is_empty())
+                    || message.trim().is_empty()
+                {
+                    return Err(ProtocolError::InvalidEvent);
+                }
+            }
             ExecutionEventKind::Usage { usage } => {
                 if !usage.has_value() {
                     return Err(ProtocolError::InvalidEvent);
@@ -457,6 +469,12 @@ pub enum ExecutionEventKind {
     Session {
         provider: String,
         id: String,
+    },
+    ProviderError {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        message: String,
     },
     Usage {
         #[serde(flatten)]
@@ -634,7 +652,7 @@ impl ExecutionEventParser {
             .ok_or(ProtocolError::MalformedJson { line: self.line })?;
         if !matches!(
             event_type,
-            "log" | "session" | "usage" | "rate_limit" | "result"
+            "log" | "session" | "provider_error" | "usage" | "rate_limit" | "result"
         ) {
             return Ok(None);
         }

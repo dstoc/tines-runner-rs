@@ -59,13 +59,22 @@ fn main() -> ExitCode {
 
 fn execute_stdin() -> ExitCode {
     match tines_runner_rs::execution_protocol::read_execution_request(std::io::stdin().lock()) {
-        Ok(request) => match tines_runner_rs::executor::prepare_workspace(&request, |_| {}) {
-            Ok(workspace) => match workspace.cleanup() {
-                Ok(()) => ExitCode::SUCCESS,
+        Ok(request) => {
+            let _adapter = match tines_runner_rs::harness::adapter_for(&request.execution.harness) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!("executor request rejected: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match tines_runner_rs::executor::prepare_workspace(&request, |_| {}) {
+                Ok(workspace) => match workspace.cleanup() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => report_preparation_failure(&request, &error),
+                },
                 Err(error) => report_preparation_failure(&request, &error),
-            },
-            Err(error) => report_preparation_failure(&request, &error),
-        },
+            }
+        }
         Err(error) => {
             eprintln!("executor request rejected: {error}");
             ExitCode::FAILURE

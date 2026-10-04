@@ -105,6 +105,32 @@ impl CodexLaunch {
         Ok(launch)
     }
 
+    /// Prepare Codex from the executor's self-contained request.
+    ///
+    /// The executable remains the semantic `codex` command and is resolved
+    /// from the executor process's `PATH`. The daemon does not choose a host
+    /// executable path.
+    pub fn for_execution_request(
+        request: &crate::execution_protocol::ExecutionRequest,
+        workspace: &crate::workspace::MaterializedWorkspace,
+        capabilities: &EffortCapabilities,
+    ) -> Result<Self, CodexLaunchError> {
+        let invocation = build_assignment_invocation(&request.assignment, capabilities, &[])?;
+        let mut launch = Self::new(
+            invocation,
+            workspace.path(),
+            workspace.environment().clone(),
+        );
+        launch.model = request.assignment.run.model.clone();
+        launch.effort = request
+            .assignment
+            .effort
+            .as_ref()
+            .map(|effort| effort.value.clone());
+        launch.timeout_minutes = Some(request.assignment.timeout_minutes);
+        Ok(launch)
+    }
+
     /// Combine an invocation with a working directory and assignment environment.
     pub fn new(
         invocation: CodexInvocation,
@@ -144,53 +170,54 @@ impl CodexLaunch {
 
     /// Format launch information without exposing environment values.
     pub fn format_diagnostics(&self) -> String {
+        let mut secret_values = self
+            .environment
+            .secret_values()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secret_values.dedup();
+
         let argv = std::iter::once(&self.invocation.program)
             .chain(self.invocation.args.iter())
+            .map(|argument| redact_diagnostic_value(argument, &secret_values))
             .collect::<Vec<_>>();
         let mut environment_names = self
             .environment
             .variable_names()
-            .map(str::to_owned)
+            .map(|name| redact_diagnostic_value(name, &secret_values))
             .collect::<Vec<_>>();
         for name in ["TINES_API_KEY", "TINES_API_URL"] {
             if !environment_names.iter().any(|present| present == name) {
                 environment_names.push(name.to_owned());
             }
         }
-        let model = self.model.as_deref().unwrap_or("(fixed)");
-        let effort = self.effort.as_deref().unwrap_or("(provider-default)");
+        let model =
+            redact_diagnostic_value(self.model.as_deref().unwrap_or("(fixed)"), &secret_values);
+        let effort = redact_diagnostic_value(
+            self.effort.as_deref().unwrap_or("(provider-default)"),
+            &secret_values,
+        );
         let timeout = self
             .timeout_minutes
             .map(|minutes| format!("{minutes}m"))
             .unwrap_or_else(|| "(unknown)".to_owned());
-        let mut diagnostic = format!(
-            "$ {argv:?}\n# tines runner: version={} harness=codex model={model} effort={effort} timeout={timeout} workspace={:?} environment_names={environment_names:?}\n",
+        let workspace =
+            redact_diagnostic_value(&self.working_directory.to_string_lossy(), &secret_values);
+        format!(
+            "$ {argv:?}\n# tines runner: version={} harness=codex model={model} effort={effort} timeout={timeout} workspace={workspace:?} environment_names={environment_names:?}\n",
             crate::VERSION,
-            self.working_directory
-        );
-
-        // A secret accidentally repeated in a prompt or wrapper word must not
-        // reappear through the argv portion of diagnostics.
-        let mut secret_forms = self
-            .environment
-            .secret_values()
-            .filter(|value| !value.is_empty())
-            .flat_map(|secret| {
-                let json_escaped =
-                    serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
-                [
-                    secret.to_owned(),
-                    json_escaped[1..json_escaped.len() - 1].to_owned(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        secret_forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
-        secret_forms.dedup();
-        for secret in secret_forms {
-            diagnostic = diagnostic.replace(&secret, "[REDACTED]");
-        }
-        diagnostic
+        )
     }
+}
+
+fn redact_diagnostic_value(value: &str, secret_values: &[String]) -> String {
+    secret_values
+        .iter()
+        .fold(value.to_owned(), |redacted, secret| {
+            redacted.replace(secret, "[REDACTED]")
+        })
 }
 
 fn build_assignment_invocation(

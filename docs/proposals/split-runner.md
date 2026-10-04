@@ -488,6 +488,21 @@ A harness adapter can emit readable normalized log messages regardless of the ha
 }
 ```
 
+### Provider error event
+
+```json
+{
+  "version": 1,
+  "type": "provider_error",
+  "provider": "codex",
+  "code": "usage_limit_exceeded",
+  "message": "Provider quota reached"
+}
+```
+
+`code` is optional. The adapter reports provider error details in a common
+shape and does not pass through a provider's native event object.
+
 ### Usage event
 
 ```json
