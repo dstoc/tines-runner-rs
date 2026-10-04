@@ -58,46 +58,22 @@ fn main() -> ExitCode {
 }
 
 fn execute_stdin() -> ExitCode {
-    match tines_runner_rs::execution_protocol::read_execution_request(std::io::stdin().lock()) {
-        Ok(request) => {
-            let _adapter = match tines_runner_rs::harness::adapter_for(&request.execution.harness) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("executor request rejected: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match tines_runner_rs::executor::prepare_workspace(&request, |_| {}) {
-                Ok(workspace) => match workspace.cleanup() {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(error) => report_preparation_failure(&request, &error),
-                },
-                Err(error) => report_preparation_failure(&request, &error),
-            }
+    let shutdown = match tines_runner_rs::shutdown::ShutdownSignal::install() {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            eprintln!("executor could not install shutdown handler: {error}");
+            return ExitCode::FAILURE;
         }
+    };
+    match tines_runner_rs::execution_protocol::read_execution_request(std::io::stdin().lock()) {
+        Ok(request) => tines_runner_rs::executor::execute_request(
+            &request,
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+            &shutdown,
+        ),
         Err(error) => {
             eprintln!("executor request rejected: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn report_preparation_failure(
-    request: &tines_runner_rs::execution_protocol::ExecutionRequest,
-    error: &dyn std::fmt::Display,
-) -> ExitCode {
-    match tines_runner_rs::executor::render_preparation_failure(request, error) {
-        Ok(event) => {
-            match std::io::Write::write_all(&mut std::io::stdout().lock(), event.as_bytes()) {
-                Ok(()) => ExitCode::FAILURE,
-                Err(_) => {
-                    eprintln!("executor could not write its failure event");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Err(_) => {
-            eprintln!("executor could not encode its failure event");
             ExitCode::FAILURE
         }
     }
