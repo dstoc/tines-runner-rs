@@ -47,7 +47,7 @@ impl Drop for RunnerGuard {
             self.credentials_path.with_file_name("active-runs.json"),
         ) {
             for record in store.records() {
-                if let Some(process) = record.process {
+                if let Some(process) = record.transport {
                     let _ = process.terminate_if_matches(Duration::from_millis(100));
                 }
             }

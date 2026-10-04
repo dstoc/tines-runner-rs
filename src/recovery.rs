@@ -13,15 +13,18 @@ use crate::config::WorkspaceRetention;
 use crate::process::ProcessIdentity;
 use crate::retention;
 
-const STATE_VERSION: u8 = 1;
+const STATE_VERSION: u8 = 2;
 const ORPHAN_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 /// The durable local information needed to recover one active assignment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActiveRunRecord {
     pub run_id: String,
-    #[serde(default)]
-    pub process: Option<ProcessIdentity>,
+    /// The daemon-owned executor transport process group. `process` is
+    /// accepted when reading version-1 state written by earlier runners.
+    #[serde(default, alias = "process")]
+    pub transport: Option<ProcessIdentity>,
+    /// Daemon-side workspace metadata retained for cleanup after recovery.
     pub workspace: PathBuf,
 }
 
@@ -55,7 +58,7 @@ impl ActiveRunStore {
                         format!("invalid active-run state file: {error}"),
                     )
                 })?;
-                if state.version != STATE_VERSION {
+                if !matches!(state.version, 1 | STATE_VERSION) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("unsupported active-run state version {}", state.version),
@@ -86,14 +89,15 @@ impl ActiveRunStore {
         })
     }
 
-    /// Persist a newly launched harness before the caller begins waiting for it.
-    pub fn record(
+    /// Persist the executor transport identity after it starts and before
+    /// waiting for its protocol stream.
+    pub fn record_transport(
         &self,
         run_id: impl Into<String>,
-        process: ProcessIdentity,
+        transport: ProcessIdentity,
         workspace: impl AsRef<Path>,
     ) -> io::Result<()> {
-        self.update_record(run_id.into(), Some(process), workspace.as_ref())
+        self.update_record(run_id.into(), Some(transport), workspace.as_ref())
     }
 
     /// Persist the allocated workspace before repository checkout begins.
@@ -128,7 +132,7 @@ impl ActiveRunStore {
             run_id.clone(),
             ActiveRunRecord {
                 run_id,
-                process,
+                transport: process,
                 workspace,
             },
         );
@@ -171,7 +175,7 @@ impl ActiveRunStore {
     }
 }
 
-/// Stop orphaned harnesses, settle their workspaces, and clear their records.
+/// Stop orphaned executor transports, settle their workspaces, and clear their records.
 ///
 /// The caller must run this before the first poll. The following empty
 /// `owned_runs` list lets Tines reconcile any still-active server runs as
@@ -181,8 +185,8 @@ pub fn recover_active_runs(
     retention: &WorkspaceRetention,
     workspace_roots: &[PathBuf],
 ) -> io::Result<Vec<String>> {
-    recover_active_runs_with(store, retention, workspace_roots, |process, grace| {
-        process.terminate_if_matches(grace)
+    recover_active_runs_with(store, retention, workspace_roots, |transport, grace| {
+        transport.terminate_if_matches(grace)
     })
 }
 
@@ -197,22 +201,22 @@ fn recover_active_runs_with(
     for record in records {
         validate_workspace_root(&record.workspace, workspace_roots)?;
         let terminated = record
-            .process
+            .transport
             .as_ref()
-            .map(|process| terminate(process, ORPHAN_TERMINATION_GRACE))
+            .map(|transport| terminate(transport, ORPHAN_TERMINATION_GRACE))
             .transpose()?
             .unwrap_or(false);
         if terminated {
             tracing::warn!(
                 run_id = %record.run_id,
-                process_id = record.process.as_ref().map(ProcessIdentity::process_id),
-                "terminated an orphaned harness during startup recovery"
+                process_id = record.transport.as_ref().map(ProcessIdentity::process_id),
+                "terminated an orphaned executor transport during startup recovery"
             );
         } else {
             tracing::info!(
                 run_id = %record.run_id,
-                process_id = record.process.as_ref().map(ProcessIdentity::process_id),
-                "no matching orphan harness remained; leaving any reused PID untouched"
+                process_id = record.transport.as_ref().map(ProcessIdentity::process_id),
+                "no matching orphan executor transport remained; leaving any reused PID untouched"
             );
         }
 
@@ -345,6 +349,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn version_one_process_identity_loads_as_transport_and_rewrites_as_version_two() {
+        let directory = TestDirectory::new();
+        let workspace = directory.0.join("legacy-workspace");
+        fs::create_dir_all(&workspace).expect("create legacy workspace");
+        let state_path = directory.0.join("active-runs.json");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "runs": {
+                "arun_legacy": {
+                    "run_id": "arun_legacy",
+                    "process": {
+                        "process_id": 42,
+                        "process_group_id": 42,
+                        "boot_id": "legacy-boot",
+                        "start_time_ticks": 123
+                    },
+                    "workspace": workspace
+                }
+            }
+        });
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&legacy).expect("encode version-one state"),
+        )
+        .expect("write version-one state");
+
+        let store = ActiveRunStore::open(&state_path).expect("load version-one active state");
+        let record = store.records().pop().expect("load legacy record");
+        assert_eq!(record.transport.as_ref().unwrap().process_id(), 42);
+        store
+            .record_transport(
+                "arun_legacy",
+                record.transport.expect("legacy transport identity"),
+                &workspace,
+            )
+            .expect("write current active state");
+        let current: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read current state"))
+                .expect("parse current state");
+        assert_eq!(current["version"], 2);
+        assert!(current["runs"]["arun_legacy"]["transport"].is_object());
+        assert!(current["runs"]["arun_legacy"].get("process").is_none());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn recovery_terminates_orphan_and_clears_active_state() {
@@ -360,7 +409,7 @@ mod tests {
         let state_path = directory.0.join("active-runs.json");
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record("arun_recovery", process_identity, &workspace)
+            .record_transport("arun_recovery", process_identity, &workspace)
             .expect("persist active run");
         drop(store);
         let restarted_store =
@@ -380,6 +429,55 @@ mod tests {
             .expect("reap terminated test harness");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_does_not_kill_unrelated_process_when_pid_generation_changed() {
+        let directory = TestDirectory::new();
+        let workspace = directory.0.join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let state_path = directory.0.join("active-runs.json");
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let process = SupervisedProcess::spawn(&mut command).expect("spawn unrelated process");
+        let store = ActiveRunStore::open(&state_path).expect("open active-run state");
+        store
+            .record_transport("arun_reused_pid", process.identity().clone(), &workspace)
+            .expect("persist transport identity");
+        drop(store);
+
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read active-run state"))
+                .expect("parse active-run state");
+        let recorded_start = state["runs"]["arun_reused_pid"]["transport"]["start_time_ticks"]
+            .as_u64()
+            .expect("recorded process generation");
+        state["runs"]["arun_reused_pid"]["transport"]["start_time_ticks"] =
+            serde_json::Value::from(recorded_start + 1);
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&state).expect("encode mismatched process identity"),
+        )
+        .expect("write mismatched process identity");
+
+        let restarted = ActiveRunStore::open(&state_path).expect("load state after daemon restart");
+        let recovered = recover_active_runs(
+            &restarted,
+            &retention(RetentionMode::Never),
+            std::slice::from_ref(&directory.0),
+        )
+        .expect("recover without signaling a reused PID");
+        assert_eq!(recovered, ["arun_reused_pid"]);
+        assert!(restarted.records().is_empty());
+        assert!(!workspace.exists());
+        assert!(
+            process.identity().matches_live_process(),
+            "the unrelated process generation remains alive"
+        );
+        process
+            .terminate(Duration::from_millis(50))
+            .expect("stop unrelated test process");
+    }
+
     #[cfg(unix)]
     #[test]
     fn recovery_preserves_state_and_workspace_when_termination_is_unconfirmed() {
@@ -394,7 +492,7 @@ mod tests {
         let store = ActiveRunStore::open(directory.0.join("active-runs.json"))
             .expect("open active-run state");
         store
-            .record(
+            .record_transport(
                 "arun_unconfirmed_termination",
                 process.identity().clone(),
                 &workspace,
@@ -442,12 +540,13 @@ mod tests {
             .arg(&ready_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let leader = SupervisedProcess::spawn(&mut command).expect("spawn stub harness group");
+        let leader =
+            SupervisedProcess::spawn(&mut command).expect("spawn stub executor transport group");
         let process_identity = leader.identity().clone();
         let leader_pid = process_identity.process_id();
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record("arun_orphan_group", process_identity, &workspace)
+            .record_transport("arun_orphan_group", process_identity, &workspace)
             .expect("persist active run");
 
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -520,12 +619,14 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let mut leader = command.spawn().expect("spawn stub harness group");
+        let mut leader = command
+            .spawn()
+            .expect("spawn stub executor transport group");
         let _group_cleanup = TestProcessGroup(leader.id());
         let identity = ProcessIdentity::for_test_child(&leader);
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record("arun_orphan_group", identity, &workspace)
+            .record_transport("arun_orphan_group", identity, &workspace)
             .expect("persist active run");
 
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -581,7 +682,7 @@ mod tests {
         let process = SupervisedProcess::spawn(&mut command).expect("spawn test harness");
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record(
+            .record_transport(
                 "arun_uncertain_identity",
                 process.identity().clone(),
                 &workspace,
@@ -592,10 +693,10 @@ mod tests {
         let mut state: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_path).expect("read active-run state"))
                 .expect("parse active-run state");
-        let start_time = state["runs"]["arun_uncertain_identity"]["process"]["start_time_ticks"]
+        let start_time = state["runs"]["arun_uncertain_identity"]["transport"]["start_time_ticks"]
             .as_u64()
             .expect("recorded process start time");
-        state["runs"]["arun_uncertain_identity"]["process"]["start_time_ticks"] =
+        state["runs"]["arun_uncertain_identity"]["transport"]["start_time_ticks"] =
             serde_json::Value::from(start_time + 1);
         fs::write(
             &state_path,
@@ -632,7 +733,7 @@ mod tests {
         let store_path = directory.0.join("active-runs.json");
         let store = ActiveRunStore::open(&store_path).expect("open active-run state");
         store
-            .record("arun_persist", process.identity().clone(), &workspace)
+            .record_transport("arun_persist", process.identity().clone(), &workspace)
             .expect("persist active run");
         drop(store);
 
@@ -719,7 +820,7 @@ mod tests {
         let process = SupervisedProcess::spawn(&mut command).expect("spawn orphan fixture");
         let store = ActiveRunStore::open(state_path).expect("open fixture active state");
         store
-            .record("arun_killed_runner", process.identity().clone(), &workspace)
+            .record_transport("arun_killed_runner", process.identity().clone(), &workspace)
             .expect("persist fixture active run");
         fs::write(ready_path, "ready").expect("signal fixture readiness");
         loop {
@@ -767,7 +868,7 @@ mod tests {
             .next()
             .expect("runner persisted active harness");
         let process_id = orphan
-            .process
+            .transport
             .as_ref()
             .expect("fixture has process identity")
             .process_id();

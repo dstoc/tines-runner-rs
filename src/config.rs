@@ -251,6 +251,14 @@ impl Config {
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| ConfigError::Invalid("missing [runner].name".to_owned()))?;
+        if let Some(executor) = raw.runner.executor.as_deref() {
+            validate_container_executor(executor)?;
+        }
+        for rule in &raw.overrides {
+            if let Some(executor) = rule.executor.as_deref() {
+                validate_container_executor(executor)?;
+            }
+        }
         if raw.runner.wrapper.is_some() {
             tracing::warn!(
                 "[runner].wrapper is deprecated and applies only to the legacy direct-Codex path; configure the executor environment instead"
@@ -369,6 +377,35 @@ impl Config {
             overrides,
         })
     }
+}
+
+fn validate_container_executor(argv: &[String]) -> Result<(), ConfigError> {
+    let Some(program) = argv
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+    else {
+        return Ok(());
+    };
+    let program = program.to_string_lossy().to_ascii_lowercase();
+    let program = program.strip_suffix(".exe").unwrap_or(&program);
+    if !matches!(program, "docker" | "podman") {
+        return Ok(());
+    }
+
+    let Some(run_index) = argv.iter().position(|argument| argument == "run") else {
+        return Ok(());
+    };
+    if argv[run_index + 1..].iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "-d" | "-d=true" | "--detach" | "--detach=true"
+        )
+    }) {
+        return Err(ConfigError::Invalid(
+            "docker and podman executor commands must run containers in the foreground; remove -d or --detach so the daemon can supervise container termination".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Effective settings and the override entries that matched one assignment.
@@ -882,6 +919,44 @@ executor_cwd = "~/executor"
         let fallback = config.resolve(context("Other", "Build", "Implement"));
         assert_eq!(fallback.executor, ["tines-runner-rs"]);
         assert_eq!(fallback.executor_cwd, PathBuf::from("/host/default"));
+    }
+
+    #[test]
+    fn docker_and_podman_executor_runs_must_remain_attached() {
+        for executor in [
+            r#"["docker", "run", "--rm", "-d", "runner-image"]"#,
+            r#"["/usr/bin/podman", "run", "--detach=true", "runner-image"]"#,
+        ] {
+            let contents = format!(
+                "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test-runner\"\nexecutor_cwd = \"/daemon\"\nexecutor = {executor}\n"
+            );
+            let error = Config::from_toml_str_with_defaults(&contents, defaults())
+                .expect_err("detached container executor must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("run containers in the foreground")
+            );
+        }
+
+        let error = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+executor_cwd = "/daemon"
+[[override]]
+project = "Payments"
+executor = ["docker", "run", "--detach", "runner-image"]
+"#,
+            defaults(),
+        )
+        .expect_err("detached override must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("run containers in the foreground")
+        );
     }
 
     #[test]
