@@ -264,3 +264,46 @@ fn repository_clone_and_branch_failures_remove_partial_workspaces() {
         );
     }
 }
+
+#[test]
+fn clone_failure_protocol_results_redact_escaped_secret_directories() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("workspaces");
+    fs::create_dir_all(&workspace_parent).expect("create workspace parent");
+
+    for secret in ["private\"value", "private\nvalue"] {
+        let mut request = request_fixture(
+            &workspace_parent,
+            json!({
+                "name": "missing-repo",
+                "dir": secret,
+                "url": directory.0.join("missing-repository").to_string_lossy(),
+                "branch": null
+            }),
+        );
+        request.assignment.env[0].value = secret.to_owned();
+
+        let error = prepare_workspace(&request, |_| {}).expect_err("clone should fail");
+        let line = render_preparation_failure(&request, &error).expect("render failure result");
+        let event: Value = serde_json::from_str(line.trim_end()).unwrap();
+        let error = event["error"].as_str().expect("failure result has error");
+        let rust_escaped = format!("{secret:?}");
+        let rust_escaped = &rust_escaped[1..rust_escaped.len() - 1];
+
+        assert!(error.contains("git clone failed"));
+        assert!(error.contains("***"));
+        assert!(!error.contains(secret), "raw secret leaked for {secret:?}");
+        assert!(
+            !error.contains(rust_escaped),
+            "escaped secret leaked for {secret:?}"
+        );
+        assert!(!line.contains(rust_escaped));
+        assert!(
+            fs::read_dir(&workspace_parent)
+                .expect("read workspace parent")
+                .next()
+                .is_none(),
+            "failed clone removes its partial workspace"
+        );
+    }
+}

@@ -483,7 +483,18 @@ pub fn render_event_jsonl(
     request.validate()?;
     event.validate()?;
     let mut value = serde_json::to_value(event).map_err(|_| ProtocolError::Serialization)?;
-    let mut secrets = request.secret_values();
+    let mut secrets = request
+        .secret_values()
+        .into_iter()
+        .flat_map(|secret| {
+            let json_escaped =
+                serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
+            [
+                secret.to_owned(),
+                json_escaped[1..json_escaped.len() - 1].to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     redact_value(&mut value, &secrets);
@@ -498,7 +509,7 @@ pub fn render_event_jsonl(
     Ok(line)
 }
 
-fn redact_value(value: &mut Value, secrets: &[&str]) {
+fn redact_value(value: &mut Value, secrets: &[String]) {
     match value {
         Value::String(text) => {
             for secret in secrets {

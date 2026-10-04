@@ -358,6 +358,60 @@ fn execute_reports_workspace_failures_as_protocol_results_without_tines_calls() 
 }
 
 #[test]
+fn execute_redacts_escaped_secret_values_in_clone_failure_results() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("executor-workspaces");
+
+    for secret in ["private\"value", "private\nvalue"] {
+        let mut fixture: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/execution-request-v1.json"))
+                .expect("valid execution request fixture");
+        fixture["execution"]["workspace"]["parent"] =
+            serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
+        fixture["assignment"]["env"][0]["value"] = serde_json::Value::String(secret.to_owned());
+        fixture["assignment"]["bundle"]["repos"] = serde_json::json!([{
+            "name": "missing-repo",
+            "dir": secret,
+            "url": directory.0.join("missing-repository").to_string_lossy(),
+            "branch": null
+        }]);
+
+        let output = run_executor(fixture.to_string().as_bytes());
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        let mut parser = ExecutionEventParser::default();
+        let events = parser
+            .push(&output.stdout)
+            .expect("executor failure should be JSONL");
+        assert!(parser.finish().unwrap().is_none());
+        assert_eq!(events.len(), 1);
+        let ExecutionEventKind::Result { result } = &events[0].kind else {
+            panic!("workspace failure should produce a result event");
+        };
+        let error = result.error.as_deref().expect("failure result has error");
+        let rust_escaped = format!("{secret:?}");
+        let rust_escaped = &rust_escaped[1..rust_escaped.len() - 1];
+
+        assert!(error.contains("git clone failed"));
+        assert!(error.contains("***"));
+        assert!(!error.contains(secret), "raw secret leaked for {secret:?}");
+        assert!(
+            !error.contains(rust_escaped),
+            "escaped secret leaked for {secret:?}"
+        );
+        let line = String::from_utf8(output.stdout).expect("protocol result is UTF-8");
+        assert!(!line.contains(rust_escaped));
+        assert!(
+            fs::read_dir(&workspace_parent)
+                .expect("read workspace parent")
+                .next()
+                .is_none(),
+            "failed setup removes its incomplete workspace"
+        );
+    }
+}
+
+#[test]
 fn execute_rejects_bad_requests_without_echoing_secret_content() {
     let malformed =
         run_executor(br#"{"version":1,"assignment":{"run_key":"raw-run-key-secret",not-json}}"#);
