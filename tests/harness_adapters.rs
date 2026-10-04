@@ -5,8 +5,8 @@ use tines_runner_rs::effort::{EffortCapabilities, EffortModelCapability};
 use tines_runner_rs::execution_protocol::{
     ExecutionEventKind, ExecutionEventParser, ExecutionRequest, TerminalStatus, render_event_jsonl,
 };
-use tines_runner_rs::harness::{HarnessExit, adapter_for};
-use tines_runner_rs::workspace::MaterializedWorkspace;
+use tines_runner_rs::executor::harness::{HarnessExit, adapter_for};
+use tines_runner_rs::executor::workspace::MaterializedWorkspace;
 use url::Url;
 use uuid::Uuid;
 

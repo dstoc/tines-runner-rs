@@ -188,19 +188,6 @@ impl MaterializedWorkspace {
     }
 }
 
-impl WorkspaceError {
-    /// Whether workspace removal failed while handling a materialization error.
-    pub(crate) fn workspace_cleanup_failed(&self) -> bool {
-        matches!(
-            self,
-            Self::Io {
-                operation: "remove incomplete assignment workspace",
-                ..
-            }
-        )
-    }
-}
-
 impl fmt::Debug for MaterializedWorkspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MaterializedWorkspace")

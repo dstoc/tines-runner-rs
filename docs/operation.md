@@ -5,11 +5,11 @@ The runner supports the `codex` harness.
 
 ## How execution is split
 
-The daemon polls Tines, resolves assignment settings, creates a host-side
-staging workspace, starts the configured executor, and sends logs and the
-terminal status to Tines. The executor creates its own workspace, checks out
-the assigned repositories again, and runs the selected harness. The executor
-can be the local runner binary or a command that starts a container.
+The daemon polls Tines, resolves assignment settings, sends an execution
+request to the configured executor, and sends logs and the terminal status to
+Tines. The executor creates the workspace, checks out the assigned
+repositories, and runs the selected harness. The executor can be the local
+runner binary or a command that starts a container.
 `runner_type` selects the harness; `executor` selects the transport command.
 
 For design rationale and the local executor protocol, see the
@@ -18,24 +18,18 @@ For design rationale and the local executor protocol, see the
 ## Requirements
 
 Install the configured executor command for the operating-system account that
-runs the daemon. In every mode, that account also needs:
+runs the daemon. That account also needs:
 
 - `tines-runner-rs`;
-- Git, with access to every repository assigned to the runner;
-- write access to the host-side workspace parent;
-- network access to the Tines server and assigned Git remotes.
+- network access to the Tines server.
 
-The daemon creates a host-side staging workspace and clones the assigned
-repositories before it starts the executor. The executor then checks out those
-repositories again in its own workspace. Both environments need Git,
-repository credentials, and access to the assigned Git remotes. With the
-native executor, both workspaces use the daemon account. With a container
-executor, keep the container command on the daemon account's `PATH`, and
-install `tines-runner-rs`, Codex CLI, Git, and repository credentials in the
-executor environment. Codex must be installed and authenticated where the
-selected executor runs: on the daemon account for native execution and in the
-container for container execution. Service managers and containers may use
-different `PATH` values and credentials than an interactive terminal.
+The executor environment needs Codex, Git, credentials for assigned
+repositories, and network access to Git remotes. With the native executor,
+that is the daemon account. With a container executor, configure these inside
+the container. Keep the container command on the daemon account's `PATH`, and
+install `tines-runner-rs` in the executor environment. Service managers and
+containers may use different `PATH` values and credentials than an interactive
+terminal.
 
 Check native commands as the service account:
 
@@ -48,10 +42,9 @@ git --version
 
 For native execution, the runner uses the service account's Codex configuration
 and Git credentials. For private repositories with container execution,
-configure Git credentials for the daemon account and inside the executor.
-Confirm access to each remote from both environments before starting the
-daemon. The runner makes outbound requests; it does not require inbound
-network access.
+configure Git credentials inside the executor. Confirm access to each remote
+from the executor environment before starting the daemon. The runner makes
+outbound requests; it does not require inbound network access.
 
 With a container or another isolated executor, install Codex and Git and
 configure repository credentials inside that executor environment as well.
@@ -147,8 +140,8 @@ with Tines using the configured name and concurrency. Tines and this local
 configuration must agree about which work the runner can accept.
 
 `max_concurrent` must be between 1 and 100. `poll_interval_seconds` must be
-greater than zero. A configured workspace parent must be writable by the
-daemon account and in the executor environment.
+greater than zero. A configured workspace parent must be writable in the
+executor environment.
 
 ### Choose an executor environment
 
@@ -173,9 +166,8 @@ workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
 
 For container execution, install `tines-runner-rs`, Codex CLI, and Git inside
 the image or executor environment. Configure Codex and repository credentials
-there as well. The daemon also needs Git and repository credentials to prepare
-its host-side staging workspace. This example mounts a writable host directory
-at the same path inside the container; create it before the daemon starts:
+there as well. If you retain executor workspaces, mount persistent storage at
+the workspace parent, as in this example:
 
 ```toml
 [runner]
@@ -198,17 +190,13 @@ same attached argument pattern. Detached container modes are not supported.
 
 The daemon resolves `executor_cwd` on the host and uses it only as the
 executor transport process's working directory. It does not send this path to
-the executor. The daemon also resolves `workspace_parent` on the host and
-creates a staging `run-<UUID>` workspace there before starting the executor.
-It sends the configured `workspace_parent` value and retention settings in the
-execution request. The executor resolves that value in its own filesystem and
-creates a separate `run-<UUID>` workspace there. In container mode, use a
-workspace path that is writable on the host and mount it at the same path
-inside the container. A configured `~` resolves under the daemon account's
-home for staging and under the executor account's home for execution. If
-`workspace_parent` is omitted, each side uses its platform default. The daemon
-expands `~` in its own paths, including `executor_cwd` and `credentials_file`.
-Unknown configuration keys cause startup to fail.
+the executor. The request carries the configured `workspace_parent` and
+retention settings. The executor resolves that value in its own filesystem
+and creates one `run-<UUID>` workspace there. A configured `~` resolves under
+the executor account's home. If `workspace_parent` is omitted, the executor
+uses its platform default. The daemon expands `~` in its own paths, including
+`executor_cwd` and `credentials_file`. Unknown configuration keys cause
+startup to fail.
 
 ### Configure execution overrides
 
@@ -241,15 +229,9 @@ execution and propagate stdin, stdout, stderr, exit status, and termination.
 Detached Docker and Podman modes are unsupported; use attached commands such as
 `docker run --rm -i ...`.
 
-`[runner].wrapper` and `[[override]].wrapper` are deprecated settings that the
-configuration parser still accepts with a warning. Executor-based runs ignore
-them. Remove these settings from the base configuration and every override as
-part of migration. To migrate a Codex profile wrapper, install it as the
-`codex` command in the executor environment, such as in the container image or
-its `PATH`. To migrate an isolation wrapper such as Docker or Podman, move its
-arguments into `executor` and set `executor_cwd`. Set `workspace_parent` to a
-path writable by the daemon and executor; for containers, mount the host path
-at that same path.
+The `wrapper` setting is no longer supported. Move transport arguments such
+as Docker or Podman into `executor` and set `executor_cwd`. To use a Codex
+profile command, install it as `codex` in the executor environment.
 
 The runner resolves the workflow name with an extra request for each
 assignment: `GET /api/v1/issues/{issue_id}`, authenticated with that
@@ -411,11 +393,9 @@ start the agent again.
 
 ## Workspace retention
 
-The `keep_workspaces` policy applies to both the daemon's host-side staging
-workspace and the executor workspace. The executor settles its workspace
-before it emits the terminal result. The daemon settles its staging workspace
-after Tines accepts that result. Set `keep_workspaces` to retain workspaces
-for debugging:
+The `keep_workspaces` policy applies to the executor workspace. The executor
+settles its workspace before it emits the terminal result. Set
+`keep_workspaces` to retain workspaces for debugging:
 
 | Value | Workspaces retained |
 | --- | --- |
@@ -423,18 +403,17 @@ for debugging:
 | `"failed"` | Failed runs only. |
 | `"always"` | All runs with an accepted terminal status. |
 
-The defaults are 72 hours and 20 retained workspaces for each workspace
-parent. Each side prunes expired or over-limit workspaces. It only deletes
-direct child directories that contain a valid runner retention marker. It
-leaves unmarked directories alone. Set `keep_workspaces_for_hours` or
-`keep_workspaces_max` to change the limits. A maximum of zero removes all
-marked workspaces during pruning.
+The defaults are 72 hours and 20 retained workspaces. The executor prunes
+expired or over-limit workspaces. It only deletes direct child directories
+that contain a valid runner retention marker. It leaves unmarked directories
+alone. Set `keep_workspaces_for_hours` or `keep_workspaces_max` to change the
+limits. A maximum of zero removes all marked workspaces during pruning.
 
-The daemon's staging workspace stays on the host. A short-lived container
-started with `--rm` loses files from its own filesystem when it exits, even if
-the executor retained them at settlement. Mount the executor workspace path to
-persistent storage, as in the example above, or use a persistent executor
-environment to keep retained workspaces available for later review.
+A short-lived container started with `--rm` loses files from its own
+filesystem when it exits, even if the executor retained them at settlement.
+Mount the executor workspace path to persistent storage, as in the example
+above, or use a persistent executor environment to keep retained workspaces
+available for later review.
 
 Retention is for debugging. It does not resume an interrupted assignment or
 preserve state for Tines to resume. Cancellation cleanup can remove a workspace
@@ -444,8 +423,8 @@ without retaining it.
 
 The runner writes structured JSON events to stderr. The default log level is
 `info`. Use the service manager's journal or configured stderr destination to
-read daemon logs. Assignment logs also include workspace preparation output and
-Codex output when Tines accepts those log requests.
+read daemon logs. Assignment logs include executor output when Tines accepts
+those log requests.
 
 ### Configuration or credential file errors
 
@@ -482,17 +461,16 @@ per credentials file unless you intend Tines to replace the earlier daemon.
 
 ### Assignments fail before Codex starts
 
-- Check that the daemon account can run `git --version` and access each
+- Check that the executor environment can run `git --version` and access each
   assigned repository remote using its Git credentials.
 - For native execution, check that the daemon account can run `codex --version`
   and has valid Codex authentication. For container execution, check the same
   inside the container.
-- Check the daemon account's `PATH` for the executor command and its write
-  access to the host workspace parent. For container execution, also check
-  Git access and write access to the workspace path inside the container.
+- Check the daemon account's `PATH` for the executor command. In the executor
+  environment, check write access to the workspace parent.
 - Read the assignment log for issue-detail lookup or repository clone errors.
   Workflow resolution makes an extra authenticated issue-detail request
-  before workspace preparation.
+  before the executor starts workspace preparation.
 
 ## Operational boundaries
 

@@ -2,54 +2,32 @@
 
 use std::error::Error;
 use std::fmt;
-use std::time::Instant;
 
 use crate::config::{Config, ConfigResolution, MatchContext};
-use crate::protocol::AppendRunLogResponse;
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::{Client, ClientError, RunLogBuffer};
-use crate::workspace::MaterializedWorkspace;
 
-/// A resolved assignment with its cold-run workspace ready for process launch.
+/// A resolved assignment ready to send to the configured executor.
 #[derive(Clone)]
 pub struct PreparedAssignment {
     resolved: ResolvedAssignment,
-    workspace: MaterializedWorkspace,
     run_logs: RunLogBuffer,
 }
 
 impl PreparedAssignment {
-    pub fn new(resolved: ResolvedAssignment, workspace: MaterializedWorkspace) -> Self {
+    pub fn new(resolved: ResolvedAssignment) -> Self {
         let run_logs = RunLogBuffer::for_assignment(resolved.assignment());
-        Self {
-            resolved,
-            workspace,
-            run_logs,
-        }
+        Self { resolved, run_logs }
     }
 
-    /// Keep workspace preparation output for delivery once the harness starts.
+    /// Share the ordered run-log stream with the poll loop and executor worker.
     pub fn with_run_log_buffer(mut self, run_logs: RunLogBuffer) -> Self {
         self.run_logs = run_logs;
         self
     }
 
-    /// Move the preparation log buffer to a concurrent start-log request.
-    pub fn take_run_log_buffer(&mut self) -> RunLogBuffer {
-        std::mem::take(&mut self.run_logs)
-    }
-
-    /// Restore the sequence state after a concurrent start-log request.
-    pub fn restore_run_log_buffer(&mut self, run_logs: RunLogBuffer) {
-        self.run_logs = run_logs;
-    }
-
     pub fn resolved(&self) -> &ResolvedAssignment {
         &self.resolved
-    }
-
-    pub fn workspace(&self) -> &MaterializedWorkspace {
-        &self.workspace
     }
 
     pub fn assignment(&self) -> &RunnerAssignment {
@@ -63,103 +41,6 @@ impl PreparedAssignment {
 
     pub fn log_delivery_cancelled(&self) -> bool {
         self.run_logs.is_cancelled()
-    }
-
-    /// Flush workspace logs after the process launcher confirms a successful
-    /// harness start. Call this before waiting for output so quiet processes
-    /// leave `launching` even when checkout produced no logs.
-    pub fn harness_started(
-        &self,
-        client: &Client,
-        runner_token: &str,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs.harness_started(client, &run_id, runner_token)
-    }
-
-    /// Flush workspace logs after launch without extending the run deadline.
-    pub fn harness_started_until(
-        &mut self,
-        client: &Client,
-        runner_token: &str,
-        deadline: Instant,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs
-            .harness_started_until(client, &run_id, runner_token, deadline)
-    }
-
-    /// Append harness output and flush buffered workspace output first.
-    pub fn append_harness_output(
-        &self,
-        client: &Client,
-        runner_token: &str,
-        chunk: &str,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs
-            .append_harness_output(client, &run_id, runner_token, chunk)
-    }
-
-    /// Append live harness output without retrying past the harness deadline.
-    pub fn append_harness_output_until(
-        &self,
-        client: &Client,
-        runner_token: &str,
-        chunk: &str,
-        deadline: Instant,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs
-            .append_harness_output_until(client, &run_id, runner_token, chunk, deadline)
-    }
-
-    /// Add the safe launch banner to the preparation output queue.
-    pub fn buffer_launch_diagnostic(&self, diagnostic: &str) {
-        self.run_logs.buffer_preparation_output(diagnostic);
-    }
-
-    /// Add the safe exit line to the ordered harness output stream.
-    pub fn append_exit_diagnostic(
-        &self,
-        client: &Client,
-        runner_token: &str,
-        diagnostic: &str,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        self.append_harness_output(client, runner_token, diagnostic)
-    }
-
-    /// Flush a live partial batch, for use by the run-log timer.
-    pub fn flush_logs(
-        &self,
-        client: &Client,
-        runner_token: &str,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs.flush(client, &run_id, runner_token)
-    }
-
-    /// Flush live output without retrying past the harness deadline.
-    pub fn flush_logs_until(
-        &self,
-        client: &Client,
-        runner_token: &str,
-        deadline: Instant,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs
-            .flush_until(client, &run_id, runner_token, deadline)
-    }
-
-    /// Flush and close logs before the ordinary run finish request.
-    pub fn flush_logs_before_finish(
-        &self,
-        client: &Client,
-        runner_token: &str,
-    ) -> Result<Option<AppendRunLogResponse>, ClientError> {
-        let run_id = self.assignment().run.id.clone();
-        self.run_logs
-            .flush_before_finish(client, &run_id, runner_token)
     }
 
     /// Stop delivery when the supervisor has already canceled or settled the run.
@@ -180,7 +61,6 @@ impl fmt::Debug for PreparedAssignment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreparedAssignment")
             .field("resolved", &self.resolved)
-            .field("workspace", &self.workspace)
             .field("run_logs", &self.run_logs)
             .finish()
     }

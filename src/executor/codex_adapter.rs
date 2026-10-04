@@ -3,17 +3,17 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-use crate::codex::CodexLaunch;
-use crate::codex_stream::{CodexEvent, CodexRateLimit, CodexStreamParser};
 use crate::effort::EffortCapabilities;
 use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionRateLimit, ExecutionRequest, ExecutionUsage,
     TerminalResult, TerminalStatus,
 };
-use crate::harness::{
+use crate::executor::codex::CodexLaunch;
+use crate::executor::codex_stream::{CodexEvent, CodexRateLimit, CodexStreamParser};
+use crate::executor::harness::{
     HarnessAdapter, HarnessAdapterError, HarnessEventParser, HarnessExit, HarnessLaunch,
 };
-use crate::workspace::MaterializedWorkspace;
+use crate::executor::workspace::MaterializedWorkspace;
 
 /// Initial executor-side adapter for the Codex CLI.
 #[derive(Clone, Copy, Debug, Default)]

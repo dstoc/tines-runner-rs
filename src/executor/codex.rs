@@ -5,9 +5,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::assignment::PreparedAssignment;
 use crate::effort::{EffortCapabilities, assignment_effort_rejection};
-use crate::workspace::LaunchEnvironment;
+use crate::executor::workspace::LaunchEnvironment;
 
 /// The native-equivalent Codex executable and argv.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,15 +25,11 @@ impl CodexInvocation {
     }
 }
 
-/// Build the native runner's structured-output Codex argv.
-///
-/// `wrapper` is an argv prefix. Its first word becomes the executable and the
-/// remaining words precede `codex` in the argument vector. No shell parses it.
+/// Build Codex's structured-output argv inside the executor environment.
 pub fn build_invocation(
     prompt: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    wrapper: &[String],
 ) -> Result<CodexInvocation, serde_json::Error> {
     let mut codex_args = vec![
         "exec".to_owned(),
@@ -52,20 +47,10 @@ pub fn build_invocation(
     }
     codex_args.push(prompt.to_owned());
 
-    if let Some((program, wrapper_args)) = wrapper.split_first() {
-        let mut args = wrapper_args.to_vec();
-        args.push("codex".to_owned());
-        args.extend(codex_args);
-        Ok(CodexInvocation {
-            program: program.clone(),
-            args,
-        })
-    } else {
-        Ok(CodexInvocation {
-            program: "codex".to_owned(),
-            args: codex_args,
-        })
-    }
+    Ok(CodexInvocation {
+        program: "codex".to_owned(),
+        args: codex_args,
+    })
 }
 
 /// A ready-to-spawn Codex command and its assignment launch context.
@@ -79,32 +64,6 @@ pub struct CodexLaunch {
 }
 
 impl CodexLaunch {
-    /// Prepare a direct Codex or wrapper command for a resolved assignment.
-    pub fn for_assignment(
-        assignment: &PreparedAssignment,
-        capabilities: &EffortCapabilities,
-    ) -> Result<Self, CodexLaunchError> {
-        let invocation = build_assignment_invocation(
-            assignment.assignment(),
-            capabilities,
-            &assignment.resolution().config.wrapper,
-        )?;
-
-        let mut launch = Self::new(
-            invocation,
-            assignment.workspace().path(),
-            assignment.workspace().environment().clone(),
-        );
-        launch.model = assignment.assignment().run.model.clone();
-        launch.effort = assignment
-            .assignment()
-            .effort
-            .as_ref()
-            .map(|effort| effort.value.clone());
-        launch.timeout_minutes = Some(assignment.assignment().timeout_minutes);
-        Ok(launch)
-    }
-
     /// Prepare Codex from the executor's self-contained request.
     ///
     /// The executable remains the semantic `codex` command and is resolved
@@ -112,10 +71,10 @@ impl CodexLaunch {
     /// executable path.
     pub fn for_execution_request(
         request: &crate::execution_protocol::ExecutionRequest,
-        workspace: &crate::workspace::MaterializedWorkspace,
+        workspace: &crate::executor::workspace::MaterializedWorkspace,
         capabilities: &EffortCapabilities,
     ) -> Result<Self, CodexLaunchError> {
-        let invocation = build_assignment_invocation(&request.assignment, capabilities, &[])?;
+        let invocation = build_assignment_invocation(&request.assignment, capabilities)?;
         let mut launch = Self::new(
             invocation,
             workspace.path(),
@@ -158,7 +117,7 @@ impl CodexLaunch {
     /// Create the child command with argv, cwd, and environment set.
     ///
     /// The caller can spawn this command directly. It must not route it through
-    /// a shell, including when a wrapper is configured.
+    /// a shell.
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.invocation.program);
         command
@@ -223,7 +182,6 @@ fn redact_diagnostic_value(value: &str, secret_values: &[String]) -> String {
 fn build_assignment_invocation(
     assignment: &crate::protocol::RunnerAssignment,
     capabilities: &EffortCapabilities,
-    wrapper: &[String],
 ) -> Result<CodexInvocation, CodexLaunchError> {
     if let Some(reason) = assignment_effort_rejection(assignment, capabilities) {
         return Err(CodexLaunchError::UnsupportedEffort(reason));
@@ -235,13 +193,8 @@ fn build_assignment_invocation(
         Some(effort) => Some(effort.value.as_str()),
         None => None,
     };
-    build_invocation(
-        &assignment.prompt,
-        assignment.run.model.as_deref(),
-        effort,
-        wrapper,
-    )
-    .map_err(CodexLaunchError::SerializeEffort)
+    build_invocation(&assignment.prompt, assignment.run.model.as_deref(), effort)
+        .map_err(CodexLaunchError::SerializeEffort)
 }
 
 impl fmt::Debug for CodexLaunch {
@@ -297,7 +250,7 @@ impl From<serde_json::Error> for CodexLaunchError {
 mod tests {
     use super::{CodexLaunch, build_assignment_invocation, build_invocation};
     use crate::effort::{EffortCapabilities, EffortModelCapability};
-    use crate::workspace::MaterializedWorkspace;
+    use crate::executor::workspace::MaterializedWorkspace;
     use serde_json::json;
     use url::Url;
 
@@ -323,7 +276,7 @@ mod tests {
 
     #[test]
     fn codex_invocation_matches_native_structured_output_arguments() {
-        let invocation = build_invocation("Implement this issue", Some("gpt-5.1-codex"), None, &[])
+        let invocation = build_invocation("Implement this issue", Some("gpt-5.1-codex"), None)
             .expect("build invocation");
 
         assert_eq!(invocation.program(), "codex");
@@ -341,32 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_argv_is_a_direct_prefix_to_the_codex_invocation() {
-        let wrapper = vec!["/opt/wrappers/codex proxy".to_owned(), "--trace".to_owned()];
-        let invocation = build_invocation("prompt", Some("codex-model"), None, &wrapper)
-            .expect("build invocation");
-
-        assert_eq!(invocation.program(), "/opt/wrappers/codex proxy");
-        assert_eq!(
-            invocation.args(),
-            [
-                "--trace",
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--model",
-                "codex-model",
-                "prompt"
-            ]
-        );
-        assert_ne!(invocation.program(), "sh");
-    }
-
-    #[test]
     fn resolved_effort_uses_the_codex_config_override_syntax() {
         let invocation =
-            build_invocation("prompt", Some("model"), Some("high"), &[]).expect("build invocation");
+            build_invocation("prompt", Some("model"), Some("high")).expect("build invocation");
 
         assert_eq!(
             invocation.args(),
@@ -409,7 +339,7 @@ mod tests {
             discovery_error: None,
         };
 
-        let error = build_assignment_invocation(&assignment, &capabilities, &[])
+        let error = build_assignment_invocation(&assignment, &capabilities)
             .expect_err("unsupported effort must not create an invocation");
 
         assert!(error.to_string().contains("does not support effort ultra"));
@@ -441,7 +371,7 @@ mod tests {
             discovery_error: None,
         };
 
-        let invocation = build_assignment_invocation(&assignment, &capabilities, &[])
+        let invocation = build_assignment_invocation(&assignment, &capabilities)
             .expect("supported effort should create an invocation");
 
         assert!(
@@ -459,13 +389,8 @@ mod tests {
     #[test]
     fn command_uses_workspace_and_assignment_environment_without_logging_secrets() {
         let (_directory, workspace) = launch_environment();
-        let invocation = build_invocation(
-            "sensitive-run-key",
-            Some("gpt-5.6-codex"),
-            Some("high"),
-            &["wrapper".to_owned()],
-        )
-        .expect("build invocation");
+        let invocation = build_invocation("sensitive-run-key", Some("gpt-5.6-codex"), Some("high"))
+            .expect("build invocation");
         assert!(
             invocation
                 .args()
@@ -482,8 +407,7 @@ mod tests {
         launch.effort = Some("high".to_owned());
         let command = launch.command();
 
-        assert_eq!(command.get_program(), "wrapper");
-        assert_eq!(command.get_args().next().unwrap(), "codex");
+        assert_eq!(command.get_program(), "codex");
         assert_eq!(command.get_current_dir(), Some(workspace.path()));
         let environment = command
             .get_envs()
@@ -517,7 +441,7 @@ mod tests {
         assert!(diagnostics.contains("timeout=30m"));
         assert!(diagnostics.contains("workspace="));
         assert!(diagnostics.contains("version="));
-        assert!(diagnostics.contains("$ [\"wrapper\""));
+        assert!(diagnostics.contains("$ [\"codex\""));
         assert!(!format!("{launch:?}").contains("sensitive-run-key"));
     }
 

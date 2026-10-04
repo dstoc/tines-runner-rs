@@ -661,7 +661,7 @@ fn crash_recovery_waits_for_native_executor_to_kill_term_resistant_harness() {
                         store.record_transport(
                             fixture.request.assignment.run.id.clone(),
                             identity,
-                            &workspace,
+                            Some(&workspace),
                         )?;
                         recover_active_runs(
                             &store,

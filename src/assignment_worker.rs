@@ -10,7 +10,6 @@ use crate::executor_transport::ExecutorTransport;
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::Client;
 use crate::runner::RunnerConnection;
-use crate::workspace::{MaterializedWorkspace, WorkspaceError};
 
 /// Result of preparing and running one assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,7 +19,7 @@ pub enum AssignmentTaskOutcome {
     Declined(String),
 }
 
-/// Enrich metadata, materialize the workspace, and execute one assignment.
+/// Enrich assignment metadata and execute one assignment through the executor.
 /// The poll loop remains free to receive cancellation while these steps run.
 #[allow(clippy::too_many_arguments)]
 pub fn run_assignment(
@@ -157,100 +156,23 @@ fn run_assignment_inner(
         }
         return Ok(AssignmentTaskOutcome::Declined(reason));
     }
-    let run_id = assignment.run.id.clone();
-    let workspace = match MaterializedWorkspace::create_cancellable_with_workspace_hook(
-        &resolved.resolution().config.workspace_parent,
-        resolved.assignment(),
-        &config.server_url,
-        cancellation,
-        |path| context.active_runs.record_workspace(run_id.clone(), path),
-        |chunk| {
-            tracing::info!(
-                run_id = %assignment.run.id,
-                git_output = %chunk.trim_end(),
-                "repository checkout progress"
-            );
-            run_logs.buffer_preparation_output(chunk);
-        },
-    ) {
-        Ok(workspace) => workspace,
-        Err(WorkspaceError::Cancelled) => {
-            context
-                .active_runs
-                .remove(&run_id)
-                .map_err(|error| error.to_string())?;
-            return Ok(AssignmentTaskOutcome::Cancelled);
-        }
-        Err(error) if cancellation.is_cancelled() => {
-            if error.workspace_cleanup_failed() {
-                return Err(format!(
-                    "assignment was canceled, but workspace cleanup failed; active state was retained: {error}"
-                ));
-            }
-            context
-                .active_runs
-                .remove(&run_id)
-                .map_err(|error| error.to_string())?;
-            return Ok(AssignmentTaskOutcome::Cancelled);
-        }
-        Err(error) => {
-            let output = run_logs.preparation_output();
-            let failure = if output.is_empty() {
-                error.to_string()
-            } else {
-                format!("{error}\nRepository checkout output:\n{output}")
-            };
-            let outcome = execution::report_preparation_failure(
-                connection,
-                &assignment.run.id,
-                &run_logs,
-                &failure,
-                cancellation,
-                context,
-            )
-            .map_err(|error| error.to_string())?;
-            if error.workspace_cleanup_failed() {
-                return Err(format!(
-                    "assignment finish was reported, but workspace cleanup failed; active state was retained: {error}"
-                ));
-            }
-            context
-                .active_runs
-                .remove(&run_id)
-                .map_err(|error| error.to_string())?;
-            return Ok(match outcome {
-                ExecutionOutcome::Finished => AssignmentTaskOutcome::Finished,
-                ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
-            });
-        }
-    };
     if cancellation.is_cancelled() {
-        workspace
-            .cleanup()
-            .map_err(|error| format!("could not clean canceled workspace: {error}"))?;
-        context
-            .active_runs
-            .remove(&run_id)
-            .map_err(|error| error.to_string())?;
         return Ok(AssignmentTaskOutcome::Cancelled);
     }
-
     tracing::info!(
         run_id = %assignment.run.id,
         project = resolved.context().project(),
         workflow = resolved.context().workflow(),
         state = resolved.context().state(),
         matched_overrides = ?resolved.resolution().matching_overrides(),
-        workspace = %workspace.path().display(),
-        "assignment workspace materialized and queued"
+        "assignment resolved for executor"
     );
-    let prepared = crate::assignment::PreparedAssignment::new(resolved, workspace)
-        .with_run_log_buffer(run_logs);
+    let prepared =
+        crate::assignment::PreparedAssignment::new(resolved).with_run_log_buffer(run_logs);
     execution::execute_assignment_cancellable(
         prepared,
         connection,
         issue_client,
-        &effort_capabilities,
         &config.workspace_retention,
         cancellation,
         context,

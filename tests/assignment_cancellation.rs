@@ -27,7 +27,6 @@ use tines_runner_rs::protocol::client::Client;
 use tines_runner_rs::recovery::ActiveRunStore;
 use tines_runner_rs::runner::RunnerConnection;
 use tines_runner_rs::shutdown::ShutdownSignal;
-use tines_runner_rs::workspace::MaterializedWorkspace;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -241,23 +240,16 @@ printf '%s\n' '{"version":1,"type":"result","status":"completed","exit_code":0,"
 
 fn prepared(config: &Config, client: &Client, assignment: &RunnerAssignment) -> PreparedAssignment {
     let resolved = resolve_assignment(config, client, assignment).expect("resolve issue metadata");
-    let workspace = MaterializedWorkspace::create(
-        &resolved.resolution().config.workspace_parent,
-        resolved.assignment(),
-        &config.server_url,
-    )
-    .expect("create workspace");
-    PreparedAssignment::new(resolved, workspace)
+    PreparedAssignment::new(resolved)
 }
 
 #[test]
-fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
+fn cancellation_before_spawn_settles_without_logs_or_finish() {
     let directory = TestDirectory::new();
     let (server_url, server, _log_seen) = cancellation_server(1);
     let (config, client, connection) = configured(&directory, &server_url, None);
     let assignment = assignment(None);
     let prepared = prepared(&config, &client, &assignment);
-    let workspace_path = prepared.workspace().path().to_path_buf();
     let cancellation = CancellationToken::default();
     cancellation.cancel();
     let shutdown = ShutdownSignal::inactive();
@@ -269,7 +261,6 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
         prepared,
         &connection,
         &client,
-        &capabilities(),
         &config.workspace_retention,
         &cancellation,
         &context,
@@ -277,7 +268,10 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
     .expect("cancel before launch");
 
     assert_eq!(outcome, ExecutionOutcome::Cancelled);
-    assert!(!workspace_path.exists(), "canceled workspace is cleaned");
+    assert!(
+        !directory.0.join("workspaces").exists(),
+        "the daemon does not create a workspace"
+    );
     let requests = server.join().expect("join fake Tines server");
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
@@ -305,7 +299,6 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
         prepared,
         &connection,
         &client,
-        &capabilities(),
         &config.workspace_retention,
         &CancellationToken::default(),
         &context,
@@ -349,7 +342,6 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
     let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let assignment = assignment(Some(&pid_file));
     let prepared = prepared(&config, &client, &assignment);
-    let workspace_path = prepared.workspace().path().to_path_buf();
     let cancellation = CancellationToken::default();
     let worker_token = cancellation.clone();
     let worker_retention = config.workspace_retention.clone();
@@ -362,7 +354,6 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
             prepared,
             &connection,
             &client,
-            &capabilities(),
             &worker_retention,
             &worker_token,
             &context,
@@ -374,7 +365,7 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
         thread::sleep(Duration::from_millis(5));
     }
     let descendant = fs::read_to_string(&pid_file)
-        .expect("wrapper wrote descendant PID")
+        .expect("executor stub wrote descendant PID")
         .trim()
         .parse::<u32>()
         .expect("parse descendant PID");
@@ -390,7 +381,10 @@ fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
             .expect("cancel run"),
         ExecutionOutcome::Cancelled
     );
-    assert!(!workspace_path.exists(), "canceled workspace is cleaned");
+    assert!(
+        !directory.0.join("workspaces").exists(),
+        "the stub executor did not create a workspace"
+    );
     assert_process_stopped(descendant);
     let requests = server.join().expect("join fake Tines server");
     assert_eq!(

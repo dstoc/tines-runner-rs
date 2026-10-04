@@ -5,13 +5,13 @@ use std::process::Command;
 
 use crate::effort::EffortCapabilities;
 use crate::execution_protocol::{ExecutionEvent, ExecutionRequest};
-use crate::workspace::MaterializedWorkspace;
+use crate::executor::workspace::MaterializedWorkspace;
 
 /// Select an adapter from the semantic harness identifier in an execution
 /// request. The identifier never contains a machine-specific executable path.
 pub fn adapter_for(identifier: &str) -> Result<Box<dyn HarnessAdapter>, UnsupportedHarness> {
     match identifier {
-        "codex" => Ok(Box::new(crate::codex_adapter::CodexAdapter)),
+        "codex" => Ok(Box::new(crate::executor::codex_adapter::CodexAdapter)),
         _ => Err(UnsupportedHarness),
     }
 }

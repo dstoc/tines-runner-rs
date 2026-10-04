@@ -13,7 +13,7 @@ use crate::config::WorkspaceRetention;
 use crate::process::{EXECUTOR_TRANSPORT_TERMINATION_GRACE, ProcessIdentity};
 use crate::retention;
 
-const STATE_VERSION: u8 = 2;
+const STATE_VERSION: u8 = 3;
 const ORPHAN_TERMINATION_GRACE: Duration = EXECUTOR_TRANSPORT_TERMINATION_GRACE;
 
 /// The durable local information needed to recover one active assignment.
@@ -24,8 +24,10 @@ pub struct ActiveRunRecord {
     /// accepted when reading version-1 state written by earlier runners.
     #[serde(default, alias = "process")]
     pub transport: Option<ProcessIdentity>,
-    /// Daemon-side workspace metadata retained for cleanup after recovery.
-    pub workspace: PathBuf,
+    /// A workspace written by an older daemon. New runs leave workspace
+    /// creation and recovery cleanup to the executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,7 +60,7 @@ impl ActiveRunStore {
                         format!("invalid active-run state file: {error}"),
                     )
                 })?;
-                if !matches!(state.version, 1 | STATE_VERSION) {
+                if !matches!(state.version, 1 | 2 | STATE_VERSION) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("unsupported active-run state version {}", state.version),
@@ -67,7 +69,10 @@ impl ActiveRunStore {
                 for (run_id, record) in &state.runs {
                     if run_id != &record.run_id
                         || run_id.is_empty()
-                        || !record.workspace.is_absolute()
+                        || record
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|workspace| !workspace.is_absolute())
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -95,27 +100,18 @@ impl ActiveRunStore {
         &self,
         run_id: impl Into<String>,
         transport: ProcessIdentity,
-        workspace: impl AsRef<Path>,
+        legacy_workspace: Option<&Path>,
     ) -> io::Result<()> {
-        self.update_record(run_id.into(), Some(transport), workspace.as_ref())
-    }
-
-    /// Persist the allocated workspace before repository checkout begins.
-    pub fn record_workspace(
-        &self,
-        run_id: impl Into<String>,
-        workspace: impl AsRef<Path>,
-    ) -> io::Result<()> {
-        self.update_record(run_id.into(), None, workspace.as_ref())
+        self.update_record(run_id.into(), Some(transport), legacy_workspace)
     }
 
     fn update_record(
         &self,
         run_id: String,
         process: Option<ProcessIdentity>,
-        workspace: &Path,
+        workspace: Option<&Path>,
     ) -> io::Result<()> {
-        let workspace = fs::canonicalize(workspace)?;
+        let workspace = workspace.map(fs::canonicalize).transpose()?;
         if run_id.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -175,7 +171,7 @@ impl ActiveRunStore {
     }
 }
 
-/// Stop orphaned executor transports, settle their workspaces, and clear their records.
+/// Stop orphaned transports, clean legacy daemon workspaces, and clear records.
 ///
 /// The caller must run this before the first poll. The following empty
 /// `owned_runs` list lets Tines reconcile any still-active server runs as
@@ -199,7 +195,9 @@ fn recover_active_runs_with(
     let records = store.records();
     let mut recovered = Vec::with_capacity(records.len());
     for record in records {
-        validate_workspace_root(&record.workspace, workspace_roots)?;
+        if let Some(workspace) = &record.workspace {
+            validate_workspace_root(workspace, workspace_roots)?;
+        }
         let terminated = record
             .transport
             .as_ref()
@@ -220,10 +218,12 @@ fn recover_active_runs_with(
             );
         }
 
-        retention::settle_recovered_workspace(&record.workspace, retention, &record.run_id)
-            .map_err(io::Error::other)?;
-        if let Some(parent) = record.workspace.parent() {
-            retention::prune_retained(parent, retention).map_err(io::Error::other)?;
+        if let Some(workspace) = &record.workspace {
+            retention::settle_recovered_workspace(workspace, retention, &record.run_id)
+                .map_err(io::Error::other)?;
+            if let Some(parent) = workspace.parent() {
+                retention::prune_retained(parent, retention).map_err(io::Error::other)?;
+            }
         }
         store.remove(&record.run_id)?;
         recovered.push(record.run_id);
@@ -383,13 +383,13 @@ mod tests {
             .record_transport(
                 "arun_legacy",
                 record.transport.expect("legacy transport identity"),
-                &workspace,
+                Some(&workspace),
             )
             .expect("write current active state");
         let current: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_path).expect("read current state"))
                 .expect("parse current state");
-        assert_eq!(current["version"], 2);
+        assert_eq!(current["version"], 3);
         assert!(current["runs"]["arun_legacy"]["transport"].is_object());
         assert!(current["runs"]["arun_legacy"].get("process").is_none());
     }
@@ -409,7 +409,7 @@ mod tests {
         let state_path = directory.0.join("active-runs.json");
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record_transport("arun_recovery", process_identity, &workspace)
+            .record_transport("arun_recovery", process_identity, Some(&workspace))
             .expect("persist active run");
         drop(store);
         let restarted_store =
@@ -441,7 +441,11 @@ mod tests {
         let process = SupervisedProcess::spawn(&mut command).expect("spawn unrelated process");
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record_transport("arun_reused_pid", process.identity().clone(), &workspace)
+            .record_transport(
+                "arun_reused_pid",
+                process.identity().clone(),
+                Some(&workspace),
+            )
             .expect("persist transport identity");
         drop(store);
 
@@ -495,7 +499,7 @@ mod tests {
             .record_transport(
                 "arun_unconfirmed_termination",
                 process.identity().clone(),
-                &workspace,
+                Some(&workspace),
             )
             .expect("persist active run");
 
@@ -546,7 +550,7 @@ mod tests {
         let leader_pid = process_identity.process_id();
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record_transport("arun_orphan_group", process_identity, &workspace)
+            .record_transport("arun_orphan_group", process_identity, Some(&workspace))
             .expect("persist active run");
 
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -626,7 +630,7 @@ mod tests {
         let identity = ProcessIdentity::for_test_child(&leader);
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record_transport("arun_orphan_group", identity, &workspace)
+            .record_transport("arun_orphan_group", identity, Some(&workspace))
             .expect("persist active run");
 
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -685,7 +689,7 @@ mod tests {
             .record_transport(
                 "arun_uncertain_identity",
                 process.identity().clone(),
-                &workspace,
+                Some(&workspace),
             )
             .expect("persist active run");
         drop(store);
@@ -733,7 +737,7 @@ mod tests {
         let store_path = directory.0.join("active-runs.json");
         let store = ActiveRunStore::open(&store_path).expect("open active-run state");
         store
-            .record_transport("arun_persist", process.identity().clone(), &workspace)
+            .record_transport("arun_persist", process.identity().clone(), Some(&workspace))
             .expect("persist active run");
         drop(store);
 
@@ -746,6 +750,37 @@ mod tests {
             .expect("stop test harness");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn new_active_records_track_transport_without_a_daemon_workspace() {
+        let directory = TestDirectory::new();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let process = SupervisedProcess::spawn(&mut command).expect("spawn executor transport");
+        let state_path = directory.0.join("active-runs.json");
+        let store = ActiveRunStore::open(&state_path).expect("open active-run state");
+        store
+            .record_transport("arun_executor_workspace", process.identity().clone(), None)
+            .expect("persist transport without a daemon workspace");
+
+        let raw_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read active state"))
+                .expect("parse active state");
+        assert!(
+            raw_state["runs"]["arun_executor_workspace"]
+                .get("workspace")
+                .is_none()
+        );
+
+        let recovered = recover_active_runs(&store, &retention(RetentionMode::Never), &[])
+            .expect("recover executor transport without a daemon workspace");
+        assert_eq!(recovered, ["arun_executor_workspace"]);
+        assert!(store.records().is_empty());
+        process
+            .wait_timeout(Duration::from_secs(1), Duration::from_millis(50))
+            .expect("reap recovered executor transport");
+    }
+
     #[test]
     fn recovery_cleans_workspace_abandoned_before_harness_spawn() {
         let directory = TestDirectory::new();
@@ -756,8 +791,8 @@ mod tests {
         let state_path = directory.0.join("active-runs.json");
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record_workspace("arun_preparing", &workspace)
-            .expect("persist workspace before checkout");
+            .update_record("arun_preparing".to_owned(), None, Some(&workspace))
+            .expect("persist legacy workspace before checkout");
         drop(store);
 
         let restarted_store =
@@ -782,8 +817,8 @@ mod tests {
         let state_path = directory.0.join("active-runs.json");
         let store = ActiveRunStore::open(&state_path).expect("open active-run state");
         store
-            .record_workspace("arun_outside_root", &workspace)
-            .expect("persist workspace");
+            .update_record("arun_outside_root".to_owned(), None, Some(&workspace))
+            .expect("persist legacy workspace");
 
         let configured_root = directory.0.join("configured-workspaces");
         fs::create_dir_all(&configured_root).expect("create configured workspace root");
@@ -820,7 +855,11 @@ mod tests {
         let process = SupervisedProcess::spawn(&mut command).expect("spawn orphan fixture");
         let store = ActiveRunStore::open(state_path).expect("open fixture active state");
         store
-            .record_transport("arun_killed_runner", process.identity().clone(), &workspace)
+            .record_transport(
+                "arun_killed_runner",
+                process.identity().clone(),
+                Some(&workspace),
+            )
             .expect("persist fixture active run");
         fs::write(ready_path, "ready").expect("signal fixture readiness");
         loop {

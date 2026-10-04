@@ -13,14 +13,12 @@ use serde_json::{Value, json};
 use tines_runner_rs::assignment::{PreparedAssignment, resolve_assignment};
 use tines_runner_rs::config::Config;
 use tines_runner_rs::credentials::{CredentialStore, RunnerCredentials};
-use tines_runner_rs::effort::EffortCapabilities;
 use tines_runner_rs::execution::execute_assignment;
 use tines_runner_rs::protocol::RunnerAssignment;
 use tines_runner_rs::protocol::client::Client;
 use tines_runner_rs::recovery::ActiveRunStore;
 use tines_runner_rs::runner::RunnerConnection;
 use tines_runner_rs::shutdown::ShutdownSignal;
-use tines_runner_rs::workspace::MaterializedWorkspace;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -106,7 +104,10 @@ fn fake_server(workspace_parent: PathBuf) -> (String, JoinHandle<Vec<String>>) {
                     .expect("read workspace parent")
                     .collect::<Result<Vec<_>, _>>()
                     .expect("list workspaces");
-                assert_eq!(workspaces.len(), 1, "workspace remains through finish");
+                assert!(
+                    workspaces.is_empty(),
+                    "the daemon does not materialize an executor workspace"
+                );
                 if finish_requests == 1 {
                     respond(
                         &mut stream,
@@ -149,19 +150,6 @@ fn assignment() -> Value {
         "timeout_minutes": 5,
         "env": []
     })
-}
-
-fn capabilities() -> EffortCapabilities {
-    EffortCapabilities {
-        version: 1,
-        daemon_version: "test-runner".to_owned(),
-        harness: "codex".to_owned(),
-        harness_version: "stub".to_owned(),
-        catalog_digest: "empty".to_owned(),
-        models: Vec::new(),
-        accepts_asserted_effort: Some(false),
-        discovery_error: None,
-    }
 }
 
 fn run_case(exit_code: i32, expected_status: &str) {
@@ -241,10 +229,11 @@ fn run_case(exit_code: i32, expected_status: &str) {
         .expect("write runner credentials");
     let executor = serde_json::to_string(&vec![script_path.to_string_lossy().into_owned()])
         .expect("encode executor config");
-    let workspace_parent = serde_json::to_string(&workspace_parent.to_string_lossy().as_ref())
-        .expect("encode workspace path");
+    let workspace_parent_value =
+        serde_json::to_string(&workspace_parent.to_string_lossy().as_ref())
+            .expect("encode workspace path");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nexecutor = {executor}\nworkspace_parent = {workspace_parent}\n[storage]\ncredentials_file = {}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nexecutor = {executor}\nworkspace_parent = {workspace_parent_value}\n[storage]\ncredentials_file = {}\n",
         serde_json::to_string(&credentials_path.to_string_lossy().as_ref())
             .expect("encode credentials path")
     ))
@@ -255,14 +244,7 @@ fn run_case(exit_code: i32, expected_status: &str) {
         serde_json::from_value(assignment()).expect("decode assignment");
     let resolved = resolve_assignment(&config, &client, &protocol_assignment)
         .expect("resolve assignment metadata");
-    let workspace = MaterializedWorkspace::create(
-        &resolved.resolution().config.workspace_parent,
-        resolved.assignment(),
-        &config.server_url,
-    )
-    .expect("create assignment workspace");
-    let workspace_path = workspace.path().to_path_buf();
-    let prepared = PreparedAssignment::new(resolved, workspace);
+    let prepared = PreparedAssignment::new(resolved);
     let active_runs =
         ActiveRunStore::open(config.credentials_file.with_file_name("active-runs.json"))
             .expect("load active-run state");
@@ -273,15 +255,21 @@ fn run_case(exit_code: i32, expected_status: &str) {
         prepared,
         &connection,
         &client,
-        &capabilities(),
         &config.workspace_retention,
         &context,
     )
     .expect("execute and settle assignment");
     assert!(active_runs.records().is_empty());
+    assert_eq!(fs::read_dir(&workspace_parent).unwrap().count(), 0);
+    let execution_request = fs::read(directory.0.join("capture.request"))
+        .expect("read request delivered to generic executor");
+    let execution_request: Value =
+        serde_json::from_slice(&execution_request).expect("decode execution request");
+    assert_eq!(execution_request["assignment"]["run_key"], "issue-run-key");
+    assert!(execution_request.get("runner_token").is_none());
     assert!(
-        !workspace_path.exists(),
-        "workspace is removed after finish"
+        !execution_request.to_string().contains("runner-token"),
+        "long-lived runner credentials do not cross the executor boundary"
     );
 
     let requests = server.join().expect("join fake Tines server");
