@@ -120,6 +120,68 @@ fn oversized_jsonl_lines_are_rejected_at_the_fixed_bound() {
 }
 
 #[test]
+fn rendered_event_at_the_line_limit_is_accepted_by_the_parser() {
+    let (request, _) = request_fixture();
+    let empty = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stdout,
+        message: String::new(),
+    });
+    let empty_line = render_event_jsonl(&empty, &request).unwrap();
+    let message_len = MAX_EXECUTION_EVENT_LINE_BYTES - (empty_line.len() - 1);
+    let event = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stdout,
+        message: "x".repeat(message_len),
+    });
+
+    let line = render_event_jsonl(&event, &request).expect("exact-limit event renders");
+    assert_eq!(line.len() - 1, MAX_EXECUTION_EVENT_LINE_BYTES);
+
+    let mut parser = ExecutionEventParser::default();
+    let parsed = parser
+        .push(line.as_bytes())
+        .expect("exact-limit line parses");
+    assert_eq!(parsed.len(), 1);
+    parser
+        .push(b"{\"version\":1,\"type\":\"result\",\"status\":\"completed\",\"exit_code\":0}\n")
+        .unwrap();
+    parser.finish().unwrap();
+}
+
+#[test]
+fn rendered_events_over_the_line_limit_are_rejected_after_json_escaping() {
+    let (request, _) = request_fixture();
+    let empty = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stdout,
+        message: String::new(),
+    });
+    let empty_line = render_event_jsonl(&empty, &request).unwrap();
+    let allowed_message_len = MAX_EXECUTION_EVENT_LINE_BYTES - (empty_line.len() - 1);
+    let one_byte_over = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stdout,
+        message: "x".repeat(allowed_message_len + 1),
+    });
+    let expected_error = ProtocolError::OversizedLine {
+        line: 1,
+        max_bytes: MAX_EXECUTION_EVENT_LINE_BYTES,
+    };
+    assert_eq!(
+        render_event_jsonl(&one_byte_over, &request).unwrap_err(),
+        expected_error
+    );
+
+    let escaped_message = "\n".repeat(MAX_EXECUTION_EVENT_LINE_BYTES / 2);
+    let event = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stdout,
+        message: escaped_message,
+    });
+
+    assert_eq!(
+        render_event_jsonl(&event, &request).unwrap_err(),
+        expected_error
+    );
+}
+
+#[test]
 fn unsupported_event_versions_are_rejected_deterministically() {
     let mut parser = ExecutionEventParser::default();
     assert_eq!(
@@ -226,6 +288,26 @@ fn request_debug_and_rendered_events_redact_the_run_key_and_secret_environment_v
     let rendered = render_event_jsonl(&result, &request).unwrap();
     assert!(!rendered.contains("fixture-run-key"));
     assert!(!rendered.contains("fixture-secret"));
+}
+
+#[test]
+fn request_debug_redacts_secrets_before_rust_escapes_them() {
+    let (mut request, _) = request_fixture();
+    for secret in ["private\nvalue", "private\"value", "private\\value"] {
+        request.assignment.run_key = secret.into();
+        request.assignment.env[0].value = secret.into();
+        request.execution.workspace.parent = format!("/workspace/{secret}").into();
+
+        let debug = format!("{request:?}");
+        let rust_escaped = format!("{secret:?}");
+        let rust_escaped = &rust_escaped[1..rust_escaped.len() - 1];
+        assert!(!debug.contains(secret), "raw secret leaked for {secret:?}");
+        assert!(
+            !debug.contains(rust_escaped),
+            "escaped secret leaked for {secret:?}"
+        );
+        assert!(debug.contains("[REDACTED]"));
+    }
 }
 
 #[test]

@@ -69,30 +69,123 @@ impl ExecutionRequest {
 
 impl fmt::Debug for ExecutionRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut rendered = format!(
-            "ExecutionRequest {{ version: {}, tines: [REDACTED], execution: {:?}, assignment: {:?} }}",
-            self.version,
-            self.execution,
-            RedactedAssignment(&self.assignment)
-        );
         let mut secrets = self.secret_values();
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         secrets.dedup();
-        for secret in secrets {
-            rendered = rendered.replace(secret, "[REDACTED]");
-        }
-        f.write_str(&rendered)
+        f.debug_struct("ExecutionRequest")
+            .field("version", &self.version)
+            .field("tines", &RedactedMarker)
+            .field(
+                "execution",
+                &RedactedExecution {
+                    policy: &self.execution,
+                    secrets: &secrets,
+                },
+            )
+            .field(
+                "assignment",
+                &RedactedAssignment {
+                    assignment: &self.assignment,
+                    secrets: &secrets,
+                },
+            )
+            .finish()
     }
 }
 
-struct RedactedAssignment<'a>(&'a RunnerAssignment);
+struct RedactedMarker;
+
+impl fmt::Debug for RedactedMarker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+struct RedactedDebugString<'a> {
+    value: &'a str,
+    secrets: &'a [&'a str],
+}
+
+impl fmt::Debug for RedactedDebugString<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut rendered = self.value.to_owned();
+        for secret in self.secrets {
+            rendered = rendered.replace(secret, "[REDACTED]");
+        }
+        fmt::Debug::fmt(&rendered, f)
+    }
+}
+
+struct RedactedExecution<'a> {
+    policy: &'a LocalExecutionPolicy,
+    secrets: &'a [&'a str],
+}
+
+impl fmt::Debug for RedactedExecution<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalExecutionPolicy")
+            .field(
+                "harness",
+                &RedactedDebugString {
+                    value: &self.policy.harness,
+                    secrets: self.secrets,
+                },
+            )
+            .field(
+                "workspace",
+                &RedactedWorkspace {
+                    policy: &self.policy.workspace,
+                    secrets: self.secrets,
+                },
+            )
+            .field("retention", &self.policy.retention)
+            .finish()
+    }
+}
+
+struct RedactedWorkspace<'a> {
+    policy: &'a WorkspacePolicy,
+    secrets: &'a [&'a str],
+}
+
+impl fmt::Debug for RedactedWorkspace<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parent = self.policy.parent.to_string_lossy();
+        f.debug_struct("WorkspacePolicy")
+            .field(
+                "parent",
+                &RedactedDebugString {
+                    value: &parent,
+                    secrets: self.secrets,
+                },
+            )
+            .finish()
+    }
+}
+
+struct RedactedAssignment<'a> {
+    assignment: &'a RunnerAssignment,
+    secrets: &'a [&'a str],
+}
 
 impl fmt::Debug for RedactedAssignment<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let assignment = self.0;
+        let assignment = self.assignment;
         f.debug_struct("Assignment")
-            .field("run_id", &assignment.run.id)
-            .field("issue_id", &assignment.run.issue_id)
+            .field(
+                "run_id",
+                &RedactedDebugString {
+                    value: &assignment.run.id,
+                    secrets: self.secrets,
+                },
+            )
+            .field(
+                "issue_id",
+                &RedactedDebugString {
+                    value: &assignment.run.issue_id,
+                    secrets: self.secrets,
+                },
+            )
             .field("run_key", &"[REDACTED]")
             .field("prompt", &"[REDACTED]")
             .field("bundle", &"[REDACTED]")
@@ -347,6 +440,12 @@ pub fn render_event_jsonl(
     secrets.dedup();
     redact_value(&mut value, &secrets);
     let mut line = serde_json::to_string(&value).map_err(|_| ProtocolError::Serialization)?;
+    if line.len() > MAX_EXECUTION_EVENT_LINE_BYTES {
+        return Err(ProtocolError::OversizedLine {
+            line: 1,
+            max_bytes: MAX_EXECUTION_EVENT_LINE_BYTES,
+        });
+    }
     line.push('\n');
     Ok(line)
 }
