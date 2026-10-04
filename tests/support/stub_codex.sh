@@ -53,7 +53,9 @@ fi
 
 if [ -n "${FAKE_CODEX_CHILD_PID_FILE:-}" ]; then
     (trap '' TERM; exec sleep 30) &
-    printf '%s\n' "$!" > "$FAKE_CODEX_CHILD_PID_FILE"
+    child_pid_file_tmp="${FAKE_CODEX_CHILD_PID_FILE}.tmp"
+    printf '%s\n' "$!" > "$child_pid_file_tmp"
+    mv "$child_pid_file_tmp" "$FAKE_CODEX_CHILD_PID_FILE"
 fi
 
 if [ -n "${FAKE_CODEX_SLEEP_SECONDS:-}" ]; then
