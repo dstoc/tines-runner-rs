@@ -15,7 +15,7 @@ use crate::protocol::{RunnerAssignment, RunnerAssignmentEffort};
 
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_STDOUT: usize = 1024 * 1024;
-const MAX_EFFORT_CAPABILITIES_AGE: Duration = Duration::from_secs(10 * 60);
+pub const MAX_EFFORT_CAPABILITIES_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_MODELS: usize = 256;
 const MAX_EFFORTS_PER_MODEL: usize = 16;
 const RECOGNIZED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -57,19 +57,37 @@ impl EffortCapabilities {
             Err(error) => return Self::failure(daemon_version, &error),
         };
 
-        match discover_models(program, daemon_version, harness_version) {
+        match discover_models(program, daemon_version, harness_version.clone()) {
             Ok(capabilities) => capabilities,
-            Err(error) => Self::failure(daemon_version, &error),
+            Err(error) => Self::catalog_failure(daemon_version, &harness_version, &error),
         }
     }
 
     fn failure(daemon_version: &str, reason: &str) -> Self {
+        Self::unavailable(daemon_version, "codex", reason)
+    }
+
+    /// Build a valid empty report when an executor cannot verify a harness.
+    pub fn unavailable(daemon_version: &str, harness: &str, reason: &str) -> Self {
+        Self::unavailable_with_version(daemon_version, harness, "unknown", reason)
+    }
+
+    fn catalog_failure(daemon_version: &str, harness_version: &str, reason: &str) -> Self {
+        Self::unavailable_with_version(daemon_version, "codex", harness_version, reason)
+    }
+
+    fn unavailable_with_version(
+        daemon_version: &str,
+        harness: &str,
+        harness_version: &str,
+        reason: &str,
+    ) -> Self {
         let models = Vec::new();
         Self {
             version: 1,
             daemon_version: truncate(daemon_version, 100),
-            harness: "codex".to_owned(),
-            harness_version: "unknown".to_owned(),
+            harness: truncate(harness, 100),
+            harness_version: truncate(harness_version, 100),
             catalog_digest: catalog_digest(&models),
             models,
             accepts_asserted_effort: None,
@@ -81,6 +99,25 @@ impl EffortCapabilities {
     pub fn refresh_due(&self, refreshed_at: Option<Instant>, now: Instant) -> bool {
         refreshed_at
             .is_none_or(|at| now.saturating_duration_since(at) >= MAX_EFFORT_CAPABILITIES_AGE)
+    }
+
+    /// Check that this report has a valid catalog and belongs to `harness`.
+    pub fn validate_for_harness(&self, harness: &str) -> Result<(), String> {
+        if self.version != 1 || self.harness != harness {
+            return Err("unsupported effort capability report".to_owned());
+        }
+        if self.harness_version.trim().is_empty()
+            || self.harness_version.len() > 100
+            || self.daemon_version.len() > 100
+            || self.catalog_digest.len() > 100
+        {
+            return Err("malformed effort capability report".to_owned());
+        }
+        validate_catalog(&self.models)?;
+        if catalog_digest(&self.models) != self.catalog_digest {
+            return Err("effort capability catalog digest is invalid".to_owned());
+        }
+        Ok(())
     }
 }
 

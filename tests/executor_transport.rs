@@ -88,6 +88,84 @@ fn result_event() -> &'static str {
     "{\"version\":1,\"type\":\"result\",\"status\":\"completed\",\"exit_code\":0}\n"
 }
 
+fn codex_capabilities_document() -> &'static str {
+    r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#
+}
+
+#[test]
+fn discovers_capabilities_through_the_configured_executor_command() {
+    let directory = TestDirectory::new();
+    let args_path = directory.0.join("capability-args");
+    let stub = directory.0.join("capability-executor");
+    write_executable(
+        &stub,
+        &format!(
+            "#!/bin/sh\nif [ -n \"${{TINES_API_KEY:-}}${{TINES_API_URL:-}}${{TINES_RUNNER_TOKEN:-}}${{TYPESAFE_API_KEY:-}}\" ]; then exit 27; fi\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'\n",
+            args_path.display(),
+            codex_capabilities_document()
+        ),
+    );
+    let working_directory = directory.0.join("executor-cwd");
+    fs::create_dir_all(&working_directory).expect("create executor cwd");
+    let transport = configured_transport(
+        vec![
+            stub.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "-i".to_owned(),
+            "runner-image".to_owned(),
+        ],
+        &working_directory,
+    );
+
+    let capabilities = transport
+        .discover_capabilities()
+        .expect("read capability document from executor");
+
+    assert!(capabilities.supports("codex"));
+    assert_eq!(capabilities.harnesses["codex"].version, "codex-fake 0.1.0");
+    assert_eq!(
+        fs::read_to_string(args_path).unwrap(),
+        "run\n--rm\n-i\nrunner-image\ncapabilities\n"
+    );
+}
+
+#[test]
+fn malformed_executor_capability_response_fails_closed() {
+    let directory = TestDirectory::new();
+    let stub = directory.0.join("malformed-capability-executor");
+    write_executable(&stub, "#!/bin/sh\nprintf '%s\\n' '{not-json}'\n");
+    let transport = ExecutorTransport::new(vec![stub.to_string_lossy().into_owned()], &directory.0);
+
+    assert!(matches!(
+        transport.discover_capabilities(),
+        Err(ExecutorTransportError::Capabilities(_))
+    ));
+}
+
+#[test]
+fn valid_document_without_configured_harness_is_unsupported() {
+    let directory = TestDirectory::new();
+    let stub = directory.0.join("unsupported-capability-executor");
+    write_executable(
+        &stub,
+        "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"harnesses\":{},\"discovery_error\":\"Codex is not installed\"}'\n",
+    );
+    let transport = ExecutorTransport::new(vec![stub.to_string_lossy().into_owned()], &directory.0);
+
+    let capabilities = transport
+        .discover_capabilities()
+        .expect("parse valid unsupported capability document");
+
+    assert!(!capabilities.supports("codex"));
+    assert!(
+        capabilities
+            .effort_report("codex", "0.1.0")
+            .discovery_error
+            .is_some()
+    );
+}
+
 #[test]
 fn sends_large_request_on_stdin_with_explicit_cwd_and_direct_argv() {
     let directory = TestDirectory::new();

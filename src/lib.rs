@@ -12,6 +12,7 @@ pub mod effort;
 pub mod execution;
 pub mod execution_protocol;
 pub mod executor;
+pub mod executor_capabilities;
 pub mod executor_transport;
 pub mod finish;
 pub mod harness;

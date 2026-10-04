@@ -400,7 +400,13 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
             &worker_client,
             assignment(None),
             tines_runner_rs::protocol::client::RunLogBuffer::new(),
-            &capabilities(),
+            &tines_runner_rs::executor_transport::ExecutorTransport::new(
+                worker_config.executor.clone(),
+                worker_config.executor_cwd.clone(),
+            ),
+            &tines_runner_rs::executor_capabilities::ExecutorCapabilities::unavailable(
+                "test cancellation",
+            ),
             &worker_token,
             &context,
         )
@@ -424,6 +430,47 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
     );
     let request = server.join().expect("join fake Tines server");
     assert!(request.starts_with("GET /api/v1/issues/iss_cancel "));
+}
+
+#[test]
+fn unsupported_executor_declines_before_workspace_materialization() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let (config, client, connection) = configured(&directory, &server_url, None);
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment(None),
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &tines_runner_rs::executor_capabilities::ExecutorCapabilities::unavailable(
+            "Codex is not installed in the executor",
+        ),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline an assignment without harness support");
+
+    assert!(
+        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("does not verify support"))
+    );
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
+    assert!(
+        !directory.0.join("workspaces").exists(),
+        "unsupported harnesses do not create workspaces"
+    );
 }
 
 #[cfg(target_os = "linux")]

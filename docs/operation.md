@@ -39,6 +39,19 @@ configure repository credentials inside that executor environment. The
 executor runs `tines-runner-rs execute`; `runner_type` selects the semantic
 harness, while `executor` selects the local command that starts the executor.
 
+The runner discovers capabilities by invoking the configured executor command
+with `capabilities`. The executor writes one versioned JSON document to stdout.
+The document reports semantic harness support, harness versions, and effort
+catalogs. The runner caches it for ten minutes and refreshes it before it
+processes an assignment with enforced effort.
+
+The default executor uses the local runner binary, so Codex must be available
+in the daemon account's `PATH`. A container executor discovers Codex inside the
+container. If the executor fails, returns malformed data, or cannot verify the
+configured harness or requested effort, the runner declines incompatible
+assignments. Tines receives the verified effort catalog and can route only a
+model and effort pair that the executor reports as supported.
+
 ## Install the binary
 
 The repository provides a Cargo-built executable. Install it from the source

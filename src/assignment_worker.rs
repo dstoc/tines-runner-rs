@@ -3,8 +3,10 @@
 use crate::assignment::resolve_assignment;
 use crate::cancellation::CancellationToken;
 use crate::config::Config;
-use crate::effort::{EffortCapabilities, assignment_effort_rejection};
+use crate::effort::assignment_effort_rejection;
 use crate::execution::{self, ExecutionOutcome};
+use crate::executor_capabilities::ExecutorCapabilities;
+use crate::executor_transport::ExecutorTransport;
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::Client;
 use crate::runner::RunnerConnection;
@@ -27,7 +29,8 @@ pub fn run_assignment(
     issue_client: &Client,
     assignment: RunnerAssignment,
     run_logs: crate::protocol::client::RunLogBuffer,
-    advertised_capabilities: &EffortCapabilities,
+    default_executor: &ExecutorTransport,
+    advertised_capabilities: &ExecutorCapabilities,
     cancellation: &CancellationToken,
     context: &execution::ExecutionContext<'_>,
 ) -> Result<AssignmentTaskOutcome, String> {
@@ -36,6 +39,7 @@ pub fn run_assignment(
             config,
             connection,
             issue_client,
+            default_executor,
             advertised_capabilities,
             cancellation,
             context,
@@ -49,7 +53,8 @@ struct AssignmentContext<'a> {
     config: &'a Config,
     connection: &'a RunnerConnection,
     issue_client: &'a Client,
-    advertised_capabilities: &'a EffortCapabilities,
+    default_executor: &'a ExecutorTransport,
+    advertised_capabilities: &'a ExecutorCapabilities,
     cancellation: &'a CancellationToken,
     context: &'a execution::ExecutionContext<'a>,
 }
@@ -63,6 +68,7 @@ fn run_assignment_inner(
         config,
         connection,
         issue_client,
+        default_executor,
         advertised_capabilities,
         cancellation,
         context,
@@ -78,24 +84,6 @@ fn run_assignment_inner(
             cancellation,
             context,
         );
-    }
-
-    let capabilities = if assignment.effort.is_some() {
-        EffortCapabilities::discover(crate::VERSION)
-    } else {
-        advertised_capabilities.clone()
-    };
-    if let Some(reason) = assignment_effort_rejection(&assignment, &capabilities) {
-        if context.shutdown.is_requested() {
-            return report_interrupted_before_execution(
-                connection,
-                &assignment.run.id,
-                &run_logs,
-                cancellation,
-                context,
-            );
-        }
-        return Ok(AssignmentTaskOutcome::Declined(reason));
     }
 
     let resolved = match resolve_assignment(config, issue_client, &assignment) {
@@ -126,6 +114,48 @@ fn run_assignment_inner(
             cancellation,
             context,
         );
+    }
+
+    let executor = ExecutorTransport::from_resolved(&resolved.resolution().config);
+    let capabilities = if &executor == default_executor {
+        advertised_capabilities.clone()
+    } else {
+        executor
+            .discover_capabilities()
+            .unwrap_or_else(|error| ExecutorCapabilities::unavailable(error.to_string()))
+    };
+    if cancellation.is_cancelled() {
+        return Ok(AssignmentTaskOutcome::Cancelled);
+    }
+    if context.shutdown.is_requested() {
+        return report_interrupted_before_execution(
+            connection,
+            &assignment.run.id,
+            &run_logs,
+            cancellation,
+            context,
+        );
+    }
+    let harness = match resolved.resolution().config.runner_type {
+        crate::config::RunnerType::Codex => "codex",
+    };
+    if !capabilities.supports(harness) {
+        return Ok(AssignmentTaskOutcome::Declined(format!(
+            "configured executor does not verify support for the {harness} harness"
+        )));
+    }
+    let effort_capabilities = capabilities.effort_report(harness, crate::VERSION);
+    if let Some(reason) = assignment_effort_rejection(&assignment, &effort_capabilities) {
+        if context.shutdown.is_requested() {
+            return report_interrupted_before_execution(
+                connection,
+                &assignment.run.id,
+                &run_logs,
+                cancellation,
+                context,
+            );
+        }
+        return Ok(AssignmentTaskOutcome::Declined(reason));
     }
 
     let run_id = assignment.run.id.clone();
@@ -221,7 +251,7 @@ fn run_assignment_inner(
         prepared,
         connection,
         issue_client,
-        &capabilities,
+        &effort_capabilities,
         &config.workspace_retention,
         cancellation,
         context,

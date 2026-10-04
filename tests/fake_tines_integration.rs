@@ -57,6 +57,8 @@ impl TestDirectory {
         let credentials = self.path.join("credentials.toml");
         let workspaces = self.path.join("workspaces");
         let default_wrapper = wrapper(stub, "default");
+        let executor = serde_json::to_string(&[env!("CARGO_BIN_EXE_tines-runner-rs")])
+            .expect("serialize native executor command");
         let override_section = if selected_override {
             format!(
                 "\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nwrapper = {}\n",
@@ -66,7 +68,7 @@ impl TestDirectory {
             String::new()
         };
         let config = format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nwrapper = {default_wrapper}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor = {executor}\nexecutor_cwd = \"~\"\nwrapper = {default_wrapper}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
             workspaces, credentials
         );
         fs::write(config_dir.join("config.toml"), config).expect("write runner config");
