@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_json::{Map, Value};
 
-use crate::config::RetentionMode;
+use crate::config::{RepositoryCheckoutPolicy, RetentionMode};
 use crate::protocol::RunnerAssignment;
 
 /// The current daemon/executor protocol version.
@@ -234,6 +234,7 @@ impl fmt::Debug for RedactedExecution<'_> {
                 },
             )
             .field("retention", &self.policy.retention)
+            .field("repository_checkout", &self.policy.repository_checkout)
             .field(
                 "custom_command",
                 &self.policy.custom_command.as_ref().map(|_| "[REDACTED]"),
@@ -311,6 +312,10 @@ pub struct LocalExecutionPolicy {
     /// Resolved argv for the custom harness. This is not interpreted by a shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_command: Option<Vec<String>>,
+    /// Whether repository working trees should be cloned into the workspace.
+    /// Missing values from older protocol-v1 requests keep the previous behavior.
+    #[serde(default)]
+    pub repository_checkout: RepositoryCheckoutPolicy,
     pub workspace: WorkspacePolicy,
     pub retention: ExecutionRetentionPolicy,
 }

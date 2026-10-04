@@ -76,10 +76,11 @@ pub fn prepare_workspace(
     let workspace_parent =
         config::resolve_workspace_parent(request.execution.workspace.parent.as_deref())
             .map_err(PreparationError::WorkspacePolicy)?;
-    MaterializedWorkspace::create_with_git_log(
+    MaterializedWorkspace::create_with_repository_checkout(
         &workspace_parent,
         &request.assignment,
         &api_url,
+        request.execution.repository_checkout,
         on_git_output,
     )
     .map_err(PreparationError::Workspace)
