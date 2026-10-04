@@ -831,7 +831,7 @@ mod tests {
             .expect("make wrapper executable");
         let workspace_parent = directory.0.join("workspaces");
         let config = Config::from_toml_str(&format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"timeout-test\"\nwrapper = [{}]\nworkspace_parent = {:?}\n",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"timeout-test\"\nexecutor_cwd = \"~\"\nwrapper = [{}]\nworkspace_parent = {:?}\n",
             serde_json::to_string(&wrapper_path.to_string_lossy().as_ref())
                 .expect("encode wrapper path"),
             workspace_parent

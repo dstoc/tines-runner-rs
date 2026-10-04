@@ -66,7 +66,7 @@ impl TestDirectory {
             String::new()
         };
         let config = format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nwrapper = {default_wrapper}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nwrapper = {default_wrapper}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
             workspaces, credentials
         );
         fs::write(config_dir.join("config.toml"), config).expect("write runner config");

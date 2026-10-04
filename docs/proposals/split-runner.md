@@ -428,7 +428,22 @@ executor = [
 
 This retains the policy mechanism currently served by `wrapper`, but applies it at the correct isolation boundary.
 
-A compatibility period may continue accepting `wrapper` as a deprecated configuration name if migration cost warrants it.
+The daemon requires `[runner].executor_cwd`. It does not infer this value from
+the home directory or the workspace policy. The daemon expands `~` and resolves
+relative paths under the daemon account's home directory, then uses the
+resulting path as the executor transport process's working directory. This is a
+host-side setting and is not included in `ExecutionRequest`. The
+`workspace_parent` value remains executor-side and is interpreted in the
+executor environment. `executor_cwd` can be changed by project, workflow, and
+state overrides.
+
+For migration, the existing `wrapper` setting remains temporarily available
+for the legacy direct-Codex path and emits a deprecation warning. It does not
+change the executor argv. Operators can move a Codex profile wrapper into the
+executor environment as the `codex` command, for example through the container
+image or its `PATH`. Operators can move an isolation wrapper such as Docker or
+Podman into `executor` and set `executor_cwd`. This compatibility path will be
+removed when the legacy direct-Codex path is removed.
 
 The implementation must not use a shell to interpret executor argv.
 
@@ -935,7 +950,12 @@ executor → tines-runner-rs execute → codex
 
 The daemon resolves the effective harness and executor before launching a run and places the harness identity into the execution request.
 
-If backward compatibility is desirable, `wrapper` may temporarily be accepted as a deprecated alias or migrated with a clear configuration error and documentation.
+During migration, `wrapper` remains accepted only by the legacy direct-Codex
+path and produces a deprecation warning. It is not an alias for `executor`:
+the old setting wrapped the Codex process, while the new setting starts
+`tines-runner-rs execute` and can wrap the full execution environment. The
+configuration guide must show how to move Codex-specific setup into that
+environment and how to express Docker or Podman in `executor`.
 
 The implementation should avoid maintaining two subtly different long-term execution models.
 

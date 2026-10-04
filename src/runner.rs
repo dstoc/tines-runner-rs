@@ -332,7 +332,7 @@ mod tests {
 
     fn config(server_url: &str, credentials_file: &std::path::Path) -> Config {
         Config::from_toml_str(&format!(
-            "[server]\nurl = \"{server_url}\"\n[runner]\nname = \"codex-test\"\nmax_concurrent = 3\n[storage]\ncredentials_file = \"{}\"\n",
+            "[server]\nurl = \"{server_url}\"\n[runner]\nname = \"codex-test\"\nexecutor_cwd = \"~\"\nmax_concurrent = 3\n[storage]\ncredentials_file = \"{}\"\n",
             credentials_file.display()
         ))
         .expect("valid runner config")

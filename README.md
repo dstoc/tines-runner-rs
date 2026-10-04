@@ -33,19 +33,18 @@ the daemon account's `PATH`.
 
 ## Requirements
 
-The operating-system account that runs the daemon needs:
+The daemon account needs:
 
-- Git, available on `PATH`;
-- Codex CLI, available on `PATH` and authenticated for that account;
-- Git credentials that can read every assigned repository;
+- the configured executor command on `PATH` or at its configured path;
 - network access to the Tines instance and assigned Git remotes;
 - a Tines user API key for the first registration, if no runner credentials
   file exists.
 
-For private repositories, configure the daemon account's Git credential
-helper or SSH key and host-key settings. Confirm that Codex and Git work as
-that account. Service managers often use a different `PATH` and credentials
-than an interactive shell.
+With the native executor, the daemon account also needs Git, Codex CLI, and
+Git credentials for the assigned repositories. With a container or another
+isolated executor, install Codex and Git and configure repository credentials
+inside that executor environment. Service managers and containers often use a
+different `PATH` and credentials than an interactive shell.
 
 ## Quick start
 
@@ -126,14 +125,17 @@ url = "https://tines.example.com"
 [runner]
 name = "build-codex"
 workspace_parent = "/var/lib/tines-runner-rs/build/workspaces"
+executor_cwd = "/var/lib/tines-runner-rs/build"
 
 [storage]
 credentials_file = "/var/lib/tines-runner-rs/build/credentials.toml"
 ```
 
 Save a second config as `/etc/tines-runner-rs/review.toml` with its own
-`[runner].name`, `workspace_parent`, and `[storage].credentials_file`, such as
-`review-codex`, `/var/lib/tines-runner-rs/review/workspaces`, and
+`[runner].name`, `[runner].workspace_parent`, required
+`[runner].executor_cwd`, and `[storage].credentials_file`, such as
+`review-codex`, `/var/lib/tines-runner-rs/review/workspaces`,
+`/var/lib/tines-runner-rs/review`, and
 `/var/lib/tines-runner-rs/review/credentials.toml`. Register and start each
 runner with its selected file:
 
@@ -169,9 +171,8 @@ The main settings are:
 | `[runner].name` | Name used to register this runner. Required. |
 | `[runner].runner_type` | Harness type. Only `codex` is supported. |
 | `[runner].workspace_parent` | Parent directory for assignment workspaces. |
-| `[runner].wrapper` | Optional argument array prepended to the Codex command. It is run directly, without a shell. |
 | `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
-| `[runner].executor_cwd` | Required working directory for the daemon-side executor process. Defaults to the daemon account's home directory. Relative paths resolve from that directory. |
+| `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
 | `[runner].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
 | `[runner].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |
 | `[runner].allow_remote_concurrency` | Allow Tines to change the runner's concurrency. Defaults to `false`. |
@@ -180,28 +181,38 @@ The main settings are:
 | `[storage].keep_workspaces_for_hours` | Maximum age for retained workspaces. Defaults to `72` hours. |
 | `[storage].keep_workspaces_max` | Maximum number of retained workspaces. Defaults to `20`. |
 
-Use `[[override]]` entries to change a workspace parent, runner type, wrapper,
-executor command, or executor working directory for matching assignments.
+Use `[[override]]` entries to change a workspace parent, runner type, executor
+command, or executor working directory for matching assignments.
 Each selector is optional. Every selector in one entry must match. Names match
 exactly and without regard to case. Entries apply in file order; later entries
 replace only the fields they set.
 
 ```toml
-# Use a separate workspace root and wrapper for matching assignments.
+# Use a container executor for matching assignments.
 [[override]]
 project = "Payments"
 workflow = "Implementation"
 state = "Ready"
 workspace_parent = "~/work/payments"
-wrapper = ["/usr/local/bin/codex-profile", "--name", "implementation"]
-executor = ["docker", "run", "--rm", "-i", "runner-image"]
+executor = ["docker", "run", "--rm", "-i", "runner-image", "tines-runner-rs"]
 executor_cwd = "/var/lib/tines-runner-rs"
 ```
 
-Every selector in this entry must match. A wrapper is an argument array, not
-a shell command string. The executor working directory belongs to the daemon
-transport; it is not sent in the execution request. `workspace_parent` is sent
-to the executor and is interpreted in the executor environment.
+Every selector in this entry must match. The executor is an argument array,
+not a shell command string. The runner appends `execute` and launches it
+directly from the resolved `executor_cwd`. The executor working directory is
+a daemon-side transport setting; it is not sent in the execution request.
+`workspace_parent` and workspace-retention settings are sent to the executor
+and use paths and retention policy in the executor environment. For Docker or
+Podman, mount any retained workspace storage into the container.
+
+`[runner].wrapper` and `[[override]].wrapper` are deprecated compatibility
+settings for the legacy direct-Codex execution path. The runner keeps their
+old Codex-prefix behavior and logs a warning when either setting is present.
+They do not configure the executor transport. To migrate a Codex profile
+wrapper, install it as the `codex` command in the executor environment, such as
+in the container image or its `PATH`. To move an isolation wrapper such as
+Docker or Podman, put its arguments in `executor` and set `executor_cwd`.
 
 ## Workspace retention
 

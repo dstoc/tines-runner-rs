@@ -151,11 +151,13 @@ fn launches_container_style_argv_and_redacts_bounded_stderr() {
     let working_directory = directory.0.join("container-cwd");
     fs::create_dir_all(&working_directory).expect("create executor cwd");
     let args_path = directory.0.join("container-args");
+    let cwd_path = directory.0.join("container-cwd-seen");
     let stub = directory.0.join("container-command-stub");
     write_executable(
         &stub,
         &format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\nprintf 'run key=%s token=%s\\n' 'ephemeral-run-key' 'assignment-secret' >&2\nhead -c 40000 /dev/zero | tr '\\000' x >&2\n",
+            "#!/bin/sh\ncat >/dev/null\npwd > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\nprintf 'run key=%s token=%s\\n' 'ephemeral-run-key' 'assignment-secret' >&2\nhead -c 40000 /dev/zero | tr '\\000' x >&2\n",
+            cwd_path.display(),
             args_path.display(),
             result_event()
         ),
@@ -184,6 +186,14 @@ fn launches_container_style_argv_and_redacts_bounded_stderr() {
     assert_eq!(
         fs::read_to_string(args_path).unwrap(),
         "run\n--rm\n-i\nrunner-image\nexecute\n"
+    );
+    assert_eq!(
+        fs::read_to_string(cwd_path).unwrap().trim(),
+        working_directory.canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!(
+        request.execution.workspace.parent,
+        PathBuf::from("/executor/workspaces")
     );
     assert!(!output.stderr.contains("ephemeral-run-key"));
     assert!(!output.stderr.contains("assignment-secret"));

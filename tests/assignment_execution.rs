@@ -197,7 +197,7 @@ fn run_case(exit_code: i32, expected_status: &str) {
     let workspace_parent = serde_json::to_string(&workspace_parent.to_string_lossy().as_ref())
         .expect("encode workspace path");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nwrapper = {wrapper}\nworkspace_parent = {workspace_parent}\n[storage]\ncredentials_file = {}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nwrapper = {wrapper}\nworkspace_parent = {workspace_parent}\n[storage]\ncredentials_file = {}\n",
         serde_json::to_string(&credentials_path.to_string_lossy().as_ref())
             .expect("encode credentials path")
     ))

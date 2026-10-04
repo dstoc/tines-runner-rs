@@ -5,16 +5,21 @@ The runner supports the `codex` harness.
 
 ## Requirements
 
-Install these tools for the operating-system account that runs the daemon:
+Install the configured executor command for the operating-system account that
+runs the daemon. With the native executor, that account also needs:
 
 - `tines-runner-rs`;
 - Codex CLI, authenticated for that account;
 - Git, with access to every repository assigned to the runner;
 - network access to the Tines server and assigned Git remotes.
 
-Codex and Git must be available in the daemon's `PATH`. A service manager does
-not usually load the same shell startup files as an interactive terminal.
-Check the commands as the service account:
+For a container executor, keep the container command on the daemon account's
+`PATH`. Install `tines-runner-rs`, Codex, Git, and repository credentials in
+the executor environment. The daemon and executor need access to Tines and
+the assigned Git remotes, respectively. Service managers and containers may
+use different `PATH` values and credentials than an interactive terminal.
+
+Check native commands as the service account:
 
 ```sh
 command -v codex
@@ -29,11 +34,10 @@ SSH key and host-key settings. Confirm access to each remote as that account
 before starting the daemon. The runner makes outbound requests; it does not
 require inbound network access.
 
-The runner starts Codex with `codex exec --json`. It also reads `codex
---version` and queries Codex's model and reasoning-effort catalog when it
-advertises capabilities to Tines. Keep a compatible Codex CLI installed. Tines
-can only route a required model and effort pair that the installed Codex
-reports as supported.
+With a container or another isolated executor, install Codex and Git and
+configure repository credentials inside that executor environment. The
+executor runs `tines-runner-rs execute`; `runner_type` selects the semantic
+harness, while `executor` selects the local command that starts the executor.
 
 ## Install the binary
 
@@ -75,9 +79,9 @@ directories are:
 On Windows, if `APPDATA` or `LOCALAPPDATA` is not set, the runner uses the
 equivalent directories under `%USERPROFILE%\AppData\Roaming` and
 `%USERPROFILE%\AppData\Local`. XDG directory variables are used only when
-they contain absolute paths. The runner has no `--config` option. Set
-`XDG_CONFIG_HOME` before starting the process if you need a different default
-configuration directory.
+they contain absolute paths. Set `XDG_CONFIG_HOME` before starting the
+process if you need a different default configuration directory. Use
+`--config` to select another file.
 
 The following example shows the supported settings and their defaults:
 
@@ -89,7 +93,8 @@ url = "https://tines.tbuckley.dev"
 name = "workstation-codex"
 runner_type = "codex"
 workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
-wrapper = []
+executor = ["tines-runner-rs"]
+executor_cwd = "~"
 max_concurrent = 1
 allow_remote_concurrency = false
 poll_interval_seconds = 15
@@ -101,8 +106,10 @@ keep_workspaces_for_hours = 72
 keep_workspaces_max = 20
 ```
 
-`[server].url` and `[runner].name` are required. The server URL must use HTTP
-or HTTPS. The only supported `runner_type` is `codex`. The runner registers
+`[server].url`, `[runner].name`, and `[runner].executor_cwd` are required. The
+server URL must use HTTP or HTTPS. The only supported `runner_type` is
+`codex`. `executor_cwd` has no default. The runner expands `~` and resolves a
+relative path under the daemon account's home directory. The runner registers
 with Tines using the configured name and concurrency. Tines and this local
 configuration must agree about which work the runner can accept.
 
@@ -112,12 +119,16 @@ service account.
 
 The runner expands `~` at the start of configured paths. Use absolute paths
 or paths beginning with `~` so a service does not depend on its working
-directory. Unknown configuration keys cause startup to fail.
+directory. `executor_cwd` belongs to the daemon transport and is not sent to
+the executor. `workspace_parent` and retention settings are sent to the
+executor and use its filesystem and retention policy. Unknown configuration
+keys cause startup to fail.
 
 ### Configure execution overrides
 
-An override can select a different workspace parent or wrapper for assignments
-that match its project, workflow, and state names:
+An override can select a different workspace parent, executor command, or
+executor working directory for assignments that match its project, workflow,
+and state names:
 
 ```toml
 [[override]]
@@ -125,20 +136,23 @@ project = "Payments"
 workflow = "Implementation"
 state = "Ready"
 workspace_parent = "~/work/payments"
-wrapper = ["/usr/local/bin/codex-profile", "--name", "payments"]
+executor = ["docker", "run", "--rm", "-i", "runner-image", "tines-runner-rs"]
+executor_cwd = "/var/lib/tines-runner-rs"
 ```
 
 Each selector is optional. All selectors in one entry must match. Name
 matching is exact and case-insensitive. The runner applies matching entries in
 file order; a later entry replaces earlier values only for fields it sets.
-Overrides can set `workspace_parent`, `runner_type`, or `wrapper`.
+Overrides can set `workspace_parent`, `runner_type`, `executor`, or
+`executor_cwd`. Executor entries are arguments, not a shell command string.
+The runner appends `execute` and starts the command from the resolved
+`executor_cwd`.
 
-`wrapper` is an array of arguments, not a shell command string. The runner
-starts its first item as the executable, then passes the remaining items
-followed by `codex exec --json --skip-git-repo-check`, optional model and
-reasoning-effort arguments, and the assignment prompt. It does not parse the
-wrapper through a shell. Use separate array entries for each argument and use
-an absolute executable path when the service `PATH` is not predictable.
+`wrapper` remains as a deprecated compatibility setting for the legacy
+direct-Codex path. It keeps its Codex-prefix behavior and logs a warning, but
+it does not configure the executor transport. Move Codex-specific setup into
+the executor environment. Move Docker or Podman isolation arguments into
+`executor` and set `executor_cwd`.
 
 The runner resolves the workflow name with an extra request for each
 assignment: `GET /api/v1/issues/{issue_id}`, authenticated with that
