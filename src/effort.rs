@@ -47,16 +47,6 @@ impl EffortCapabilities {
         Self::discover_with_program("codex", daemon_version)
     }
 
-    /// Discover Codex capabilities through the legacy launcher's argv prefix.
-    pub fn discover_with_wrapper(wrapper: &[String], daemon_version: &str) -> Self {
-        let Some((program, arguments)) = wrapper.split_first() else {
-            return Self::discover(daemon_version);
-        };
-        let mut prefix = arguments.to_vec();
-        prefix.push("codex".to_owned());
-        Self::discover_with_prefix(program, &prefix, daemon_version)
-    }
-
     fn discover_with_program(program: &str, daemon_version: &str) -> Self {
         Self::discover_with_prefix(program, &[], daemon_version)
     }
@@ -850,45 +840,5 @@ exit 2
         assert_eq!(report.discovery_error, None);
 
         fs::remove_dir_all(root).expect("remove fake Codex directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn discovery_runs_through_the_legacy_wrapper_prefix() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "tines-runner-codex-wrapper-capabilities-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).expect("create fake Codex wrapper directory");
-        let wrapper = root.join("codex-wrapper");
-        fs::write(
-            &wrapper,
-            "#!/bin/sh\n[ \"$1\" = \"--profile\" ] || exit 8\nshift\n[ \"$1\" = \"codex\" ] || exit 9\nshift\nif [ \"$1\" = \"--version\" ]; then printf 'wrapped-codex 1.2.3\\n'; exit 0; fi\nexit 10\n",
-        )
-        .expect("write fake Codex wrapper");
-        let mut permissions = fs::metadata(&wrapper)
-            .expect("stat fake Codex wrapper")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
-
-        let report = EffortCapabilities::discover_with_wrapper(
-            &[
-                wrapper.to_string_lossy().into_owned(),
-                "--profile".to_owned(),
-            ],
-            "0.1.0",
-        );
-
-        assert_eq!(report.harness_version, "wrapped-codex 1.2.3");
-        assert!(report.discovery_error.is_some());
-        assert!(report.supports_harness("codex"));
-        fs::remove_dir_all(root).expect("remove fake Codex wrapper directory");
     }
 }

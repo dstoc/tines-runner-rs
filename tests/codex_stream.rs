@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use tines_runner_rs::codex_stream::{CodexEvent, CodexStreamParser};
+use tines_runner_rs::executor::codex_stream::{CodexEvent, CodexStreamParser};
 
 fn fixture(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -443,13 +443,10 @@ host-side setting and is not included in `ExecutionRequest`. The
 executor environment. `executor_cwd` can be changed by project, workflow, and
 state overrides.
 
-For migration, the existing `wrapper` setting remains temporarily available
-for the legacy direct-Codex path and emits a deprecation warning. It does not
-change the executor argv. Operators can move a Codex profile wrapper into the
-executor environment as the `codex` command, for example through the container
-image or its `PATH`. Operators can move an isolation wrapper such as Docker or
-Podman into `executor` and set `executor_cwd`. This compatibility path will be
-removed when the legacy direct-Codex path is removed.
+The wrapper migration period is complete. The configuration parser rejects
+`wrapper` settings. Operators use `executor` for a container or isolation
+transport and install any Codex profile command as `codex` in the executor
+environment.
 
 The implementation must not use a shell to interpret executor argv.
 
@@ -962,12 +959,9 @@ executor → tines-runner-rs execute → codex
 
 The daemon resolves the effective harness and executor before launching a run and places the harness identity into the execution request.
 
-During migration, `wrapper` remains accepted only by the legacy direct-Codex
-path and produces a deprecation warning. It is not an alias for `executor`:
-the old setting wrapped the Codex process, while the new setting starts
-`tines-runner-rs execute` and can wrap the full execution environment. The
-configuration guide must show how to move Codex-specific setup into that
-environment and how to express Docker or Podman in `executor`.
+The wrapper compatibility period is complete. The configuration parser
+rejects `wrapper` fields. Operators use `executor` to start or isolate the
+full execution environment, and configure Codex inside that environment.
 
 The implementation should avoid maintaining two subtly different long-term execution models.
 

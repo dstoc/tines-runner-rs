@@ -68,7 +68,6 @@ fn config(overrides: &str) -> Config {
             [runner]
             name = "assignment-test"
             executor_cwd = "~"
-            wrapper = ["base-wrapper"]
             {overrides}
         "#
     ))
@@ -177,13 +176,13 @@ fn poll_queue_retains_resolved_context_config_and_original_assignment() {
             [runner]
             name = "assignment-test"
             executor_cwd = "~"
-            wrapper = ["base-wrapper"]
+            executor = ["base-executor"]
             workspace_parent = {:?}
             [[override]]
             project = "TINES"
             workflow = "IMPLEMENTATION"
             state = "IMPLEMENT"
-            wrapper = ["combined-wrapper"]
+            executor = ["combined-executor"]
             [storage]
             credentials_file = {:?}
         "#,
@@ -202,13 +201,7 @@ fn poll_queue_retains_resolved_context_config_and_original_assignment() {
                 for assignment in &response.assignments {
                     let resolved = resolve_assignment(&config, &issue_client, assignment)
                         .expect("resolve assignment before queueing");
-                    let workspace = tines_runner_rs::workspace::MaterializedWorkspace::create(
-                        &resolved.resolution().config.workspace_parent,
-                        resolved.assignment(),
-                        &config.server_url,
-                    )
-                    .expect("materialize assignment workspace");
-                    state.queue_assignment(PreparedAssignment::new(resolved, workspace));
+                    state.queue_assignment(PreparedAssignment::new(resolved));
                 }
                 polls.set(polls.get() + 1);
             },
@@ -237,7 +230,7 @@ fn poll_queue_retains_resolved_context_config_and_original_assignment() {
     assert_eq!(queued.context().project(), "Tines");
     assert_eq!(queued.context().workflow(), "Implementation");
     assert_eq!(queued.context().state(), "Implement");
-    assert_eq!(queued.resolution().config.wrapper, ["combined-wrapper"]);
+    assert_eq!(queued.resolution().config.executor, ["combined-executor"]);
     assert_eq!(queued.resolution().matching_overrides(), [0]);
     assert!(!format!("{queued:?}").contains("ephemeral-run-key"));
 
@@ -328,105 +321,6 @@ fn execution_request_preserves_executor_tilde_paths_and_omits_its_default() {
 }
 
 #[test]
-fn workspace_materialization_failure_finishes_only_the_assignment() {
-    let directory = TestDirectory::new();
-    let store = CredentialStore::at(directory.credentials_path());
-    store
-        .save(&RunnerCredentials::new(
-            "rnr_materialization_test",
-            "runner-token",
-        ))
-        .expect("store runner token");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Tines server");
-    let address = listener.local_addr().expect("read mock address");
-    let server = thread::spawn(move || {
-        let responses = [
-            (
-                r#"{"assignments":[{"run":{"id":"arun_materialization_failure","issue_id":"iss_assignment_test","issue_ref":{"project_name":"Tines","number":7,"title":"Workspace"},"state_at_start_name":"Implement"},"prompt":"work","bundle":{},"run_key":"ephemeral-run-key","timeout_minutes":30}],"cancels":[]}"#,
-                "poll",
-            ),
-            (
-                r#"{"id":"iss_assignment_test","workflow":{"name":"Implementation"}}"#,
-                "issue",
-            ),
-            (
-                r#"{"id":"arun_materialization_failure","status":"failed"}"#,
-                "finish",
-            ),
-        ];
-        responses
-            .into_iter()
-            .map(|(body, _)| {
-                let (mut stream, _) = listener.accept().expect("accept Tines request");
-                let request = read_request(&mut stream);
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .expect("write response");
-                request
-            })
-            .collect::<Vec<_>>()
-    });
-    let server_url = format!("http://{address}");
-    let config = Config::from_toml_str(&format!(
-        r#"
-            [server]
-            url = "{server_url}"
-            [runner]
-            name = "materialization-test"
-            executor_cwd = "~"
-            workspace_parent = {:?}
-            [storage]
-            credentials_file = {:?}
-        "#,
-        directory.0.join("workspaces"),
-        store.path()
-    ))
-    .expect("parse runner config");
-    let connection = RunnerConnection::connect(&config).expect("load runner connection");
-    let issue_client =
-        Client::with_timeout(&server_url, Duration::from_secs(5)).expect("create issue client");
-    let mut poller = PollLoop::new(connection, &config);
-    let polls = std::cell::Cell::new(0);
-    poller
-        .run_with(
-            |response, state| {
-                for assignment in &response.assignments {
-                    let resolved = resolve_assignment(&config, &issue_client, assignment)
-                        .expect("resolve assignment metadata");
-                    let error = tines_runner_rs::workspace::MaterializedWorkspace::create(
-                        &resolved.resolution().config.workspace_parent,
-                        resolved.assignment(),
-                        &config.server_url,
-                    )
-                    .expect_err("fixture bundle is missing workspace data");
-                    state.fail_assignment(assignment.run.id.clone(), error.to_string());
-                }
-                polls.set(polls.get() + 1);
-            },
-            || polls.get() == 0,
-            |_| panic!("one poll should finish without sleeping"),
-        )
-        .expect("report assignment failure");
-
-    let requests = server.join().expect("join mock Tines server");
-    assert!(requests[0].starts_with("POST /api/v1/runners/rnr_materialization_test/poll "));
-    assert!(requests[1].starts_with("GET /api/v1/issues/iss_assignment_test "));
-    assert!(requests[2].starts_with("POST /api/v1/runs/arun_materialization_failure/finish "));
-    assert!(requests[2].contains("\"status\":\"failed\""));
-    assert!(
-        requests[2].contains("\"error\":\"assignment bundle has invalid skills or repositories\"")
-    );
-    assert!(
-        requests[2]
-            .to_ascii_lowercase()
-            .contains("authorization: bearer runner-token")
-    );
-}
-
-#[test]
 fn issue_workflow_and_assignment_snapshot_select_case_insensitive_overrides() {
     let (server_url, server) = issue_server(4);
     let client =
@@ -434,24 +328,24 @@ fn issue_workflow_and_assignment_snapshot_select_case_insensitive_overrides() {
     let assignment = assignment();
     let cases = [
         (
-            "project = \"tInEs\"\nwrapper = [\"project-wrapper\"]",
-            "project-wrapper",
+            "project = \"tInEs\"\nexecutor = [\"project-executor\"]",
+            "project-executor",
         ),
         (
-            "workflow = \"iMpLeMeNtAtIoN\"\nwrapper = [\"workflow-wrapper\"]",
-            "workflow-wrapper",
+            "workflow = \"iMpLeMeNtAtIoN\"\nexecutor = [\"workflow-executor\"]",
+            "workflow-executor",
         ),
         (
-            "state = \"iMpLeMeNt\"\nwrapper = [\"state-wrapper\"]",
-            "state-wrapper",
+            "state = \"iMpLeMeNt\"\nexecutor = [\"state-executor\"]",
+            "state-executor",
         ),
         (
-            "project = \"TINES\"\nworkflow = \"IMPLEMENTATION\"\nstate = \"IMPLEMENT\"\nwrapper = [\"combined-wrapper\"]",
-            "combined-wrapper",
+            "project = \"TINES\"\nworkflow = \"IMPLEMENTATION\"\nstate = \"IMPLEMENT\"\nexecutor = [\"combined-executor\"]",
+            "combined-executor",
         ),
     ];
 
-    for (override_body, expected_wrapper) in cases {
+    for (override_body, expected_executor) in cases {
         let config = config(&format!("[[override]]\n{override_body}"));
         let resolved = resolve_assignment(&config, &client, &assignment)
             .expect("resolve assignment configuration");
@@ -459,7 +353,7 @@ fn issue_workflow_and_assignment_snapshot_select_case_insensitive_overrides() {
         assert_eq!(resolved.context().project(), "Tines");
         assert_eq!(resolved.context().workflow(), "Implementation");
         assert_eq!(resolved.context().state(), "Implement");
-        assert_eq!(resolved.resolution().config.wrapper, [expected_wrapper]);
+        assert_eq!(resolved.resolution().config.executor, [expected_executor]);
         assert_eq!(resolved.resolution().matching_overrides(), [0]);
     }
 

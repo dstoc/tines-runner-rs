@@ -2,7 +2,7 @@
 //!
 //! On Unix, each command runs in a fresh process group. On Windows, the
 //! suspended child is assigned to a Job Object before its main thread resumes.
-//! Both mechanisms contain wrappers and their descendants. Linux identities
+//! Both mechanisms contain the transport and its descendants. Linux identities
 //! include the boot ID and start time; macOS identities include the process
 //! start time; Windows identities include process creation time to reject a
 //! reused PID.

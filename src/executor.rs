@@ -14,14 +14,20 @@ use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionRequest, LogStream, ProtocolError, TerminalResult,
     TerminalStatus, render_event_jsonl,
 };
-use crate::harness::{HarnessExit, adapter_for};
+use crate::executor::harness::{HarnessExit, adapter_for};
+use crate::executor::workspace::{MaterializedWorkspace, WorkspaceError};
 use crate::process::{
     PROCESS_TREE_TERMINATION_GRACE, ProcessExit, ProcessStream, SupervisedProcess,
 };
 use crate::protocol::FinishStatus;
 use crate::retention;
 use crate::shutdown::ShutdownSignal;
-use crate::workspace::{MaterializedWorkspace, WorkspaceError};
+
+pub mod codex;
+pub mod codex_adapter;
+pub mod codex_stream;
+pub mod harness;
+pub mod workspace;
 
 /// A failure while preparing an execution request inside the executor.
 #[derive(Debug)]
@@ -67,7 +73,7 @@ pub fn prepare_workspace(
     let api_url = Url::parse(&request.tines.api_url)
         .map_err(|_| PreparationError::InvalidRequest(ProtocolError::InvalidRequest))?;
     let workspace_parent =
-        config::resolve_executor_workspace_parent(request.execution.workspace.parent.as_deref())
+        config::resolve_workspace_parent(request.execution.workspace.parent.as_deref())
             .map_err(PreparationError::WorkspacePolicy)?;
     MaterializedWorkspace::create_with_git_log(
         &workspace_parent,
@@ -122,19 +128,18 @@ pub fn execute_request(
     };
     let mut parser = events.event_parser();
     let retention = retention_policy(request);
-    let workspace_parent = match config::resolve_executor_workspace_parent(
-        request.execution.workspace.parent.as_deref(),
-    ) {
-        Ok(parent) => parent,
-        Err(error) => {
-            return emit_failure(
-                request,
-                output,
-                diagnostics,
-                format!("could not resolve executor workspace parent: {error}"),
-            );
-        }
-    };
+    let workspace_parent =
+        match config::resolve_workspace_parent(request.execution.workspace.parent.as_deref()) {
+            Ok(parent) => parent,
+            Err(error) => {
+                return emit_failure(
+                    request,
+                    output,
+                    diagnostics,
+                    format!("could not resolve executor workspace parent: {error}"),
+                );
+            }
+        };
     if retention::prune_retained(&workspace_parent, &retention).is_err() {
         return emit_failure(
             request,

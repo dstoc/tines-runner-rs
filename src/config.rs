@@ -44,12 +44,11 @@ pub struct Config {
     pub server_url: Url,
     pub runner_name: String,
     pub runner_type: RunnerType,
-    pub workspace_parent: PathBuf,
-    /// Unexpanded workspace path for the executor environment. `None` asks
-    /// the executor to use its platform/XDG default.
-    pub executor_workspace_parent: Option<PathBuf>,
-    /// Deprecated argv prefix for the legacy direct-Codex execution path.
-    pub wrapper: Vec<String>,
+    /// Executor workspace parent configured for new runs. `None` uses the
+    /// executor environment's platform/XDG default.
+    pub workspace_parent: Option<PathBuf>,
+    /// Roots used only to recover workspace state written by older daemons.
+    legacy_workspace_roots: Vec<PathBuf>,
     /// The argv prefix used to reach the local or isolated executor.
     pub executor: Vec<String>,
     /// The daemon-side working directory for the executor transport process.
@@ -66,12 +65,9 @@ pub struct Config {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedRunConfig {
     pub runner_type: RunnerType,
-    pub workspace_parent: PathBuf,
-    /// Unexpanded workspace path for the executor environment. `None` asks
-    /// the executor to use its platform/XDG default.
-    pub executor_workspace_parent: Option<PathBuf>,
-    /// Deprecated argv prefix for the legacy direct-Codex execution path.
-    pub wrapper: Vec<String>,
+    /// Executor workspace parent configured for this assignment. `None` uses
+    /// the executor environment's platform/XDG default.
+    pub workspace_parent: Option<PathBuf>,
     /// The argv prefix used to reach the executor; `execute` is appended.
     pub executor: Vec<String>,
     /// Absolute daemon-side working directory for the executor process.
@@ -127,19 +123,9 @@ impl Error for ConfigError {
 }
 
 impl Config {
-    /// Return each distinct workspace parent configured by the default or an override.
-    pub fn workspace_parents(&self) -> Vec<PathBuf> {
-        let mut parents = vec![self.workspace_parent.clone()];
-        for parent in self
-            .overrides
-            .iter()
-            .filter_map(|rule| rule.workspace_parent.as_ref())
-        {
-            if !parents.contains(parent) {
-                parents.push(parent.clone());
-            }
-        }
-        parents
+    /// Return workspace roots needed to recover state from older daemons.
+    pub fn legacy_workspace_roots(&self) -> Vec<PathBuf> {
+        self.legacy_workspace_roots.clone()
     }
 
     /// Return the platform/XDG default location for `config.toml`.
@@ -188,8 +174,6 @@ impl Config {
         let mut resolved = ResolvedRunConfig {
             runner_type: self.runner_type,
             workspace_parent: self.workspace_parent.clone(),
-            executor_workspace_parent: self.executor_workspace_parent.clone(),
-            wrapper: self.wrapper.clone(),
             executor: self.executor.clone(),
             executor_cwd: self.executor_cwd.clone(),
         };
@@ -204,13 +188,7 @@ impl Config {
                 resolved.runner_type = runner_type;
             }
             if let Some(workspace_parent) = &rule.workspace_parent {
-                resolved.workspace_parent.clone_from(workspace_parent);
-            }
-            if let Some(workspace_parent) = &rule.executor_workspace_parent {
-                resolved.executor_workspace_parent = Some(workspace_parent.clone());
-            }
-            if let Some(wrapper) = &rule.wrapper {
-                resolved.wrapper.clone_from(wrapper);
+                resolved.workspace_parent = Some(workspace_parent.clone());
             }
             if let Some(executor) = &rule.executor {
                 resolved.executor.clone_from(executor);
@@ -251,27 +229,25 @@ impl Config {
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| ConfigError::Invalid("missing [runner].name".to_owned()))?;
-        if raw.runner.wrapper.is_some() {
-            tracing::warn!(
-                "[runner].wrapper is deprecated and applies only to the legacy direct-Codex path; configure the executor environment instead"
-            );
-        }
-        for (index, rule) in raw.overrides.iter().enumerate() {
-            if rule.wrapper.is_some() {
-                tracing::warn!(
-                    override_index = index + 1,
-                    "[[override]].wrapper is deprecated and applies only to the legacy direct-Codex path; configure the executor environment instead"
-                );
-            }
-        }
-        let workspace_parent = expand_path(
+        let legacy_workspace_parent = expand_path(
             raw.runner
                 .workspace_parent
                 .as_deref()
                 .unwrap_or(&defaults.workspace_parent),
             &defaults.home,
         )?;
-        let executor_workspace_parent = raw.runner.workspace_parent.clone();
+        let workspace_parent = raw.runner.workspace_parent.clone();
+        let mut legacy_workspace_roots = vec![legacy_workspace_parent];
+        for workspace_parent in raw
+            .overrides
+            .iter()
+            .filter_map(|rule| rule.workspace_parent.as_deref())
+        {
+            let workspace_parent = expand_path(workspace_parent, &defaults.home)?;
+            if !legacy_workspace_roots.contains(&workspace_parent) {
+                legacy_workspace_roots.push(workspace_parent);
+            }
+        }
         let executor_cwd = resolve_executor_cwd(
             raw.runner.executor_cwd.as_deref().ok_or_else(|| {
                 ConfigError::Invalid(
@@ -315,7 +291,6 @@ impl Config {
             .map(|rule| {
                 if rule.workspace_parent.is_none()
                     && rule.runner_type.is_none()
-                    && rule.wrapper.is_none()
                     && rule.executor.is_none()
                     && rule.executor_cwd.is_none()
                 {
@@ -327,14 +302,8 @@ impl Config {
                     project: rule.project,
                     workflow: rule.workflow,
                     state: rule.state,
-                    workspace_parent: rule
-                        .workspace_parent
-                        .as_deref()
-                        .map(|path| expand_path(path, &defaults.home))
-                        .transpose()?,
-                    executor_workspace_parent: rule.workspace_parent,
+                    workspace_parent: rule.workspace_parent,
                     runner_type: rule.runner_type,
-                    wrapper: rule.wrapper,
                     executor: rule.executor,
                     executor_cwd: rule
                         .executor_cwd
@@ -350,8 +319,7 @@ impl Config {
             runner_name,
             runner_type: raw.runner.runner_type.unwrap_or(RunnerType::Codex),
             workspace_parent,
-            executor_workspace_parent,
-            wrapper: raw.runner.wrapper.unwrap_or_default(),
+            legacy_workspace_roots,
             executor: raw
                 .runner
                 .executor
@@ -391,9 +359,7 @@ struct ConfigOverride {
     workflow: Option<String>,
     state: Option<String>,
     workspace_parent: Option<PathBuf>,
-    executor_workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
-    wrapper: Option<Vec<String>>,
     executor: Option<Vec<String>>,
     executor_cwd: Option<PathBuf>,
 }
@@ -439,7 +405,6 @@ struct RawRunner {
     name: Option<String>,
     runner_type: Option<RunnerType>,
     workspace_parent: Option<PathBuf>,
-    wrapper: Option<Vec<String>>,
     executor: Option<Vec<String>>,
     executor_cwd: Option<PathBuf>,
     max_concurrent: Option<usize>,
@@ -465,7 +430,6 @@ struct RawOverride {
     state: Option<String>,
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
-    wrapper: Option<Vec<String>>,
     executor: Option<Vec<String>>,
     executor_cwd: Option<PathBuf>,
 }
@@ -502,7 +466,7 @@ fn default_paths() -> Result<DefaultPaths, ConfigError> {
 /// An absent path selects the executor's platform/XDG default. A configured
 /// path is kept unexpanded by the daemon so that `~` resolves against the
 /// executor's home directory.
-pub fn resolve_executor_workspace_parent(path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+pub fn resolve_workspace_parent(path: Option<&Path>) -> Result<PathBuf, ConfigError> {
     if let Some(path) = path
         && path != Path::new("~")
         && path.strip_prefix("~").is_err()
@@ -510,10 +474,10 @@ pub fn resolve_executor_workspace_parent(path: Option<&Path>) -> Result<PathBuf,
         return Ok(path.to_path_buf());
     }
     let defaults = default_paths()?;
-    resolve_executor_workspace_parent_with_defaults(path, &defaults)
+    resolve_workspace_parent_with_defaults(path, &defaults)
 }
 
-fn resolve_executor_workspace_parent_with_defaults(
+fn resolve_workspace_parent_with_defaults(
     path: Option<&Path>,
     defaults: &DefaultPaths,
 ) -> Result<PathBuf, ConfigError> {
@@ -614,7 +578,6 @@ mod tests {
                 name = "test-runner"
                 workspace_parent = "/default/workspaces"
                 executor_cwd = "/host/default"
-                wrapper = ["base-wrapper", "--"]
 
                 {overrides}
             "#
@@ -623,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_parents_include_distinct_override_roots() {
+    fn legacy_workspace_roots_include_distinct_override_roots() {
         let config = parse_with_overrides(
             r#"[[override]]
 project = "Tines"
@@ -640,7 +603,7 @@ workspace_parent = "/project/workspaces"
         );
 
         assert_eq!(
-            config.workspace_parents(),
+            config.legacy_workspace_roots(),
             [
                 PathBuf::from("/default/workspaces"),
                 PathBuf::from("/project/workspaces"),
@@ -666,21 +629,17 @@ workspace_parent = "~/work/payments"
         )
         .unwrap();
 
+        assert_eq!(config.workspace_parent, Some(PathBuf::from("~/work/base")));
         assert_eq!(
-            config.workspace_parent,
-            PathBuf::from("/home/tester/work/base")
-        );
-        assert_eq!(
-            config.executor_workspace_parent,
-            Some(PathBuf::from("~/work/base"))
+            config.legacy_workspace_roots(),
+            [
+                PathBuf::from("/home/tester/work/base"),
+                PathBuf::from("/home/tester/work/payments"),
+            ]
         );
         let resolved = config.resolve(context("Payments", "Build", "Ready"));
         assert_eq!(
             resolved.workspace_parent,
-            PathBuf::from("/home/tester/work/payments")
-        );
-        assert_eq!(
-            resolved.executor_workspace_parent,
             Some(PathBuf::from("~/work/payments"))
         );
 
@@ -692,16 +651,16 @@ workspace_parent = "~/work/payments"
             None,
         );
         assert_eq!(
-            resolve_executor_workspace_parent_with_defaults(
-                config.executor_workspace_parent.as_deref(),
+            resolve_workspace_parent_with_defaults(
+                config.workspace_parent.as_deref(),
                 &executor_defaults,
             )
             .unwrap(),
             PathBuf::from("/executor/home/work/base")
         );
         assert_eq!(
-            resolve_executor_workspace_parent_with_defaults(
-                resolved.executor_workspace_parent.as_deref(),
+            resolve_workspace_parent_with_defaults(
+                resolved.workspace_parent.as_deref(),
                 &executor_defaults,
             )
             .unwrap(),
@@ -718,9 +677,9 @@ executor_cwd = "/daemon/transport"
             defaults(),
         )
         .unwrap();
-        assert_eq!(default_config.executor_workspace_parent, None);
+        assert_eq!(default_config.workspace_parent, None);
         assert_eq!(
-            resolve_executor_workspace_parent_with_defaults(None, &executor_defaults).unwrap(),
+            resolve_workspace_parent_with_defaults(None, &executor_defaults).unwrap(),
             PathBuf::from("/executor/xdg-data/tines-runner-rs/workspaces")
         );
     }
@@ -746,13 +705,13 @@ workspace_parent = "/project"
             config
                 .resolve(context("tInEs", "Build", "Implement"))
                 .workspace_parent,
-            PathBuf::from("/project")
+            Some(PathBuf::from("/project"))
         );
         assert_eq!(
             config
                 .resolve(context("Tines Tools", "Build", "Implement"))
                 .workspace_parent,
-            PathBuf::from("/default/workspaces")
+            Some(PathBuf::from("/default/workspaces"))
         );
     }
 
@@ -761,21 +720,21 @@ workspace_parent = "/project"
         let config = parse_with_overrides(
             r#"[[override]]
 workflow = "Implementation"
-wrapper = ["impl-wrapper", "--"]
+executor = ["implementation-executor"]
 "#,
         );
 
         assert_eq!(
             config
                 .resolve(context("Other", "implementation", "Review"))
-                .wrapper,
-            ["impl-wrapper", "--"]
+                .executor,
+            ["implementation-executor"]
         );
         assert_eq!(
             config
                 .resolve(context("Other", "Implement", "Review"))
-                .wrapper,
-            ["base-wrapper", "--"]
+                .executor,
+            ["tines-runner-rs"]
         );
     }
 
@@ -803,21 +762,21 @@ runner_type = "codex"
 project = "Tines"
 workflow = "Implementation"
 state = "Review"
-wrapper = ["review-wrapper"]
+executor = ["review-executor"]
 "#,
         );
 
         assert_eq!(
             config
                 .resolve(context("tines", "implementation", "review"))
-                .wrapper,
-            ["review-wrapper"]
+                .executor,
+            ["review-executor"]
         );
         assert_eq!(
             config
                 .resolve(context("Tines", "Implementation", "Implement"))
-                .wrapper,
-            ["base-wrapper", "--"]
+                .executor,
+            ["tines-runner-rs"]
         );
     }
 
@@ -827,11 +786,11 @@ wrapper = ["review-wrapper"]
             r#"[[override]]
 project = "Tines"
 workspace_parent = "/project"
-wrapper = ["project-wrapper"]
+executor = ["project-executor"]
 
 [[override]]
 workflow = "Implementation"
-wrapper = ["workflow-wrapper"]
+executor = ["workflow-executor"]
 
 [[override]]
 state = "Review"
@@ -840,23 +799,23 @@ workspace_parent = "/review"
         );
 
         let resolved = config.resolve(context("Tines", "Implementation", "Review"));
-        assert_eq!(resolved.workspace_parent, PathBuf::from("/review"));
-        assert_eq!(resolved.wrapper, ["workflow-wrapper"]);
+        assert_eq!(resolved.workspace_parent, Some(PathBuf::from("/review")));
+        assert_eq!(resolved.executor, ["workflow-executor"]);
     }
 
     #[test]
-    fn resolved_settings_are_owned_and_wrapper_is_kept_as_argv() {
+    fn resolved_executor_settings_are_owned_and_kept_as_argv() {
         let mut config = parse_with_overrides(
             r#"[[override]]
 project = "Tines"
-wrapper = ["bin/wrapper", "; echo should-not-run"]
+executor = ["bin/executor", "; literal argument"]
 "#,
         );
         let resolved = config.resolve(context("Tines", "Build", "Implement"));
-        config.wrapper.clear();
+        config.executor.clear();
         config.overrides.clear();
 
-        assert_eq!(resolved.wrapper, ["bin/wrapper", "; echo should-not-run"]);
+        assert_eq!(resolved.executor, ["bin/executor", "; literal argument"]);
     }
 
     #[test]
@@ -1037,9 +996,10 @@ executor_cwd = "/srv/tines-runner"
         )
         .unwrap();
 
+        assert_eq!(config.workspace_parent, Some(PathBuf::from("~/workspaces")));
         assert_eq!(
-            config.workspace_parent,
-            PathBuf::from("/home/tester/workspaces")
+            config.legacy_workspace_roots(),
+            [PathBuf::from("/home/tester/workspaces")]
         );
         assert_eq!(
             config.credentials_file,
@@ -1067,7 +1027,6 @@ executor_cwd = "/srv/tines-runner"
                 runner_type = "codex"
                 workspace_parent = "~/runner-workspaces"
                 executor_cwd = "~/daemon"
-                wrapper = ["/usr/local/bin/codex-wrapper", "--trace"]
                 max_concurrent = 4
                 poll_interval_seconds = 9
                 allow_remote_concurrency = true
@@ -1090,10 +1049,9 @@ executor_cwd = "/srv/tines-runner"
         assert_eq!(config.runner_type, RunnerType::Codex);
         assert_eq!(
             config.workspace_parent,
-            PathBuf::from("/home/tester/runner-workspaces")
+            Some(PathBuf::from("~/runner-workspaces"))
         );
         assert_eq!(config.executor_cwd, PathBuf::from("/home/tester/daemon"));
-        assert_eq!(config.wrapper, ["/usr/local/bin/codex-wrapper", "--trace"]);
         assert_eq!(config.max_concurrent, 4);
         assert!(config.allow_remote_concurrency);
         assert_eq!(config.poll_interval, Duration::from_secs(9));
@@ -1145,7 +1103,7 @@ executor_cwd = "/srv/tines-runner"
             defaults.clone(),
         )
         .unwrap();
-        assert_eq!(config.workspace_parent, defaults.workspace_parent);
+        assert_eq!(config.legacy_workspace_roots(), [defaults.workspace_parent]);
         assert_eq!(config.credentials_file, defaults.credentials_file);
     }
 
@@ -1189,5 +1147,21 @@ executor_cwd = "/srv/tines-runner"
             max_concurrent = 0
         "#;
         assert!(Config::from_toml_str_with_defaults(zero_concurrency, defaults()).is_err());
+    }
+
+    #[test]
+    fn legacy_wrapper_settings_are_rejected_after_executor_migration() {
+        for legacy_setting in [
+            "wrapper = [\"codex-wrapper\"]",
+            "[[override]]\nproject = \"Tines\"\nwrapper = [\"codex-wrapper\"]",
+        ] {
+            let config = format!(
+                "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test-runner\"\nexecutor_cwd = \"~/daemon\"\n{legacy_setting}\n"
+            );
+            assert!(
+                Config::from_toml_str_with_defaults(&config, defaults()).is_err(),
+                "legacy setting was accepted: {legacy_setting}"
+            );
+        }
     }
 }

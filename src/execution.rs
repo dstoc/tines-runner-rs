@@ -9,13 +9,11 @@ use std::time::{Duration, Instant};
 use crate::assignment::PreparedAssignment;
 use crate::cancellation::CancellationToken;
 use crate::config::WorkspaceRetention;
-use crate::effort::EffortCapabilities;
 use crate::executor_events::ExecutorEventStream;
 use crate::executor_transport::{ExecutorTransport, execution_request};
 use crate::protocol::client::{Client, ErrorCategory, RunLogBuffer};
 use crate::protocol::{FinishJudgment, FinishRunRequest, FinishStatus};
 use crate::recovery::ActiveRunStore;
-use crate::retention::{self, RetentionError};
 use crate::runner::{RunnerConnection, RunnerError};
 use crate::shutdown::ShutdownSignal;
 
@@ -41,15 +39,13 @@ impl<'a> ExecutionContext<'a> {
     }
 }
 
-/// Execute one assignment, report its outcome, then remove its workspace.
+/// Execute one assignment and report its outcome to Tines.
 ///
-/// A retryable finish error keeps the workspace in place until Tines accepts
-/// the report. A non-retryable error also leaves it in place for recovery.
+/// The executor owns workspace creation, retention, and cleanup.
 pub fn execute_assignment(
     assignment: PreparedAssignment,
     connection: &RunnerConnection,
     client: &Client,
-    capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
     context: &ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
@@ -57,7 +53,6 @@ pub fn execute_assignment(
         assignment,
         connection,
         client,
-        capabilities,
         retention,
         &CancellationToken::default(),
         context,
@@ -71,7 +66,6 @@ pub fn execute_assignment_cancellable(
     assignment: PreparedAssignment,
     connection: &RunnerConnection,
     client: &Client,
-    capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
     context: &ExecutionContext<'_>,
@@ -80,7 +74,6 @@ pub fn execute_assignment_cancellable(
         assignment,
         connection,
         client,
-        capabilities,
         retention,
         cancellation,
         context,
@@ -91,7 +84,6 @@ fn execute_assignment_cancellable_inner(
     assignment: PreparedAssignment,
     connection: &RunnerConnection,
     client: &Client,
-    _capabilities: &EffortCapabilities,
     retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
     context: &ExecutionContext<'_>,
@@ -132,21 +124,6 @@ fn execute_assignment_cancellable_inner(
     )? {
         return settle_canceled_assignment(&assignment, context.active_runs);
     }
-    let issue_ref = assignment
-        .assignment()
-        .run
-        .issue_ref
-        .as_ref()
-        .map(|issue| format!("{}/{}", issue.project_name, issue.number));
-    retention::settle_workspace(
-        assignment.workspace().path(),
-        retention,
-        &run_id,
-        issue_ref,
-        finish_request.status,
-        finish_request.error.as_deref(),
-    )
-    .map_err(ExecutionError::WorkspaceRetention)?;
     context
         .active_runs
         .remove(&run_id)
@@ -181,7 +158,6 @@ fn run_executor(
     let run_id = assignment.assignment().run.id.clone();
     let runner_token = connection.credentials().runner_token().to_owned();
     let run_logs = assignment.run_log_buffer();
-    let workspace = assignment.workspace().path().to_path_buf();
     let deadline = Cell::new(None::<Instant>);
     let last_flush = Cell::new(Instant::now());
     let protocol_failure = RefCell::new(None::<String>);
@@ -199,7 +175,7 @@ fn run_executor(
         || shutdown.is_requested(),
         |identity, run_deadline| {
             active_runs
-                .record_transport(run_id.clone(), identity.clone(), &workspace)
+                .record_transport(run_id.clone(), identity.clone(), None)
                 .map_err(|error| error.to_string())?;
             deadline.set(Some(run_deadline));
             last_flush.set(Instant::now());
@@ -364,10 +340,6 @@ fn settle_canceled_assignment(
     active_runs: &ActiveRunStore,
 ) -> Result<ExecutionOutcome, ExecutionError> {
     assignment.stop_log_delivery();
-    assignment
-        .workspace()
-        .cleanup()
-        .map_err(ExecutionError::WorkspaceCleanup)?;
     active_runs
         .remove(&assignment.assignment().run.id)
         .map_err(ExecutionError::ActiveStateCleanup)?;
@@ -381,8 +353,7 @@ pub enum ExecutionOutcome {
     Cancelled,
 }
 
-/// Report a workspace-preparation failure unless supervisor cancellation has
-/// already settled the run.
+/// Report a pre-execution interruption unless cancellation has settled the run.
 pub fn report_preparation_failure(
     connection: &RunnerConnection,
     run_id: &str,
@@ -453,8 +424,6 @@ fn retry_delay(failures: u32) -> Duration {
 #[derive(Debug)]
 pub enum ExecutionError {
     FinishReport(RunnerError),
-    WorkspaceCleanup(io::Error),
-    WorkspaceRetention(RetentionError),
     ActiveStateCleanup(io::Error),
 }
 
@@ -462,16 +431,6 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FinishReport(error) => write!(f, "could not report run finish: {error}"),
-            Self::WorkspaceCleanup(error) => {
-                write!(
-                    f,
-                    "run finish was accepted, but workspace cleanup failed: {error}"
-                )
-            }
-            Self::WorkspaceRetention(error) => write!(
-                f,
-                "run finish was accepted, but workspace retention failed: {error}"
-            ),
             Self::ActiveStateCleanup(error) => {
                 write!(
                     f,
@@ -486,8 +445,6 @@ impl Error for ExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::FinishReport(error) => Some(error),
-            Self::WorkspaceCleanup(error) => Some(error),
-            Self::WorkspaceRetention(error) => Some(error),
             Self::ActiveStateCleanup(error) => Some(error),
         }
     }

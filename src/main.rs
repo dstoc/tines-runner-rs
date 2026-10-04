@@ -119,10 +119,6 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
         return Ok(());
     }
 
-    tines_runner_rs::retention::prune_retained_roots(
-        config.workspace_parents(),
-        &config.workspace_retention,
-    )?;
     let shutdown = shutdown.ok_or_else(|| {
         std::io::Error::other("daemon shutdown handler was not installed before polling")
     })?;
@@ -132,7 +128,7 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
     let recovered_runs = tines_runner_rs::recovery::recover_active_runs(
         &active_runs,
         &config.workspace_retention,
-        &config.workspace_parents(),
+        &config.legacy_workspace_roots(),
     )?;
     for run_id in recovered_runs {
         tracing::info!(run_id, "recovered interrupted assignment before polling");

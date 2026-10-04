@@ -785,9 +785,9 @@ fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
         "transient finish failure was retried"
     );
     assert_eq!(finish_attempts[0].json(), finish_attempts[1].json());
-    assert_eq!(
-        fs::read_dir(directory.workspace_parent()).unwrap().count(),
-        0
+    assert!(
+        !directory.workspace_parent().exists(),
+        "generic executor runs do not create a daemon workspace"
     );
     assert!(
         fake.unexpected_requests().is_empty(),
