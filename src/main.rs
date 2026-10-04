@@ -2,6 +2,7 @@ use clap::Parser;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -21,6 +22,10 @@ struct AssignmentWorker {
     about = "An independent Rust runner for Tines assignments"
 )]
 struct Cli {
+    /// Load configuration from this file instead of the platform default.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     /// Validate configuration and stored credentials, then exit without polling.
     #[arg(long)]
     check: bool,
@@ -30,7 +35,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     tines_runner_rs::logging::init();
 
-    match start_runner(cli.check) {
+    match start_runner(cli.check, cli.config.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "runner startup failed");
@@ -39,8 +44,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn start_runner(check: bool) -> Result<(), Box<dyn Error>> {
-    let config = tines_runner_rs::config::Config::load_default()?;
+fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    let config = match config_path {
+        Some(path) => tines_runner_rs::config::Config::load(path)?,
+        None => tines_runner_rs::config::Config::load_default()?,
+    };
     let shutdown = if check {
         None
     } else {

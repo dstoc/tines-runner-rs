@@ -263,6 +263,104 @@ fn version_flag_reports_package_version() {
 }
 
 #[test]
+fn explicit_configs_register_separate_runners_and_credentials() {
+    let directory = TestDirectory::new();
+
+    for (runner_name, config_name) in [("build-codex", "build"), ("review-codex", "review")] {
+        let config_path = directory.0.join(format!("{config_name}.toml"));
+        let credentials_path = directory.0.join(config_name).join("credentials.toml");
+        let (server_url, server) = registration_server();
+        let credentials_value =
+            toml::Value::String(credentials_path.to_string_lossy().into_owned());
+        fs::write(
+            &config_path,
+            format!(
+                "[server]\nurl = {server_url:?}\n[runner]\nname = {runner_name:?}\n[storage]\ncredentials_file = {credentials_value}\n"
+            ),
+        )
+        .expect("write selected runner config");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+        command.args([
+            "--config",
+            config_path.to_str().expect("config path should be UTF-8"),
+            "--check",
+        ]);
+        directory.configure_command(&mut command);
+        let output = command
+            .env("TINES_API_KEY", "bootstrap-key-test")
+            .output()
+            .expect("check selected runner config");
+        let requests = server.join().expect("registration and token check");
+
+        assert!(
+            output.status.success(),
+            "--check should use {}: {}",
+            config_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, body) = requests[0]
+            .split_once("\r\n\r\n")
+            .expect("registration request headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("registration JSON");
+        assert_eq!(body["name"], runner_name);
+        assert!(
+            credentials_path.is_file(),
+            "selected config should save credentials to {}",
+            credentials_path.display()
+        );
+    }
+}
+
+#[test]
+fn selected_config_errors_name_the_file() {
+    let directory = TestDirectory::new();
+    let missing_path = directory.0.join("missing.toml");
+    let mut missing_command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    missing_command.args([
+        "--config",
+        missing_path.to_str().expect("config path should be UTF-8"),
+        "--check",
+    ]);
+    directory.configure_command(&mut missing_command);
+    let missing_output = missing_command.output().expect("run with a missing config");
+    let missing_diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&missing_output.stdout),
+        String::from_utf8_lossy(&missing_output.stderr)
+    );
+    assert!(!missing_output.status.success());
+    assert!(
+        missing_diagnostic.contains(&format!(
+            "could not read config file {}",
+            missing_path.display()
+        )),
+        "unexpected missing-config diagnostic: {missing_diagnostic}"
+    );
+
+    let invalid_path = directory.0.join("invalid.toml");
+    fs::write(&invalid_path, "[server\nurl = [broken").expect("write invalid TOML");
+    let mut invalid_command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    invalid_command.args([
+        "--config",
+        invalid_path.to_str().expect("config path should be UTF-8"),
+        "--check",
+    ]);
+    directory.configure_command(&mut invalid_command);
+    let invalid_output = invalid_command.output().expect("run with invalid config");
+    let invalid_diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&invalid_output.stdout),
+        String::from_utf8_lossy(&invalid_output.stderr)
+    );
+    assert!(!invalid_output.status.success());
+    assert!(
+        invalid_diagnostic.contains(&format!("invalid config file {}", invalid_path.display())),
+        "unexpected invalid-config diagnostic: {invalid_diagnostic}"
+    );
+}
+
+#[test]
 fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     let directory = TestDirectory::new();
     let config_dir = directory.config_dir().join("tines-runner-rs");
