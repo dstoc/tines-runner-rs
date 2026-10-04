@@ -98,6 +98,56 @@ fn semantic_selection_builds_codex_command_in_executor_path_with_safe_diagnostic
 }
 
 #[test]
+fn codex_adapter_redacts_debug_escaped_secrets_before_formatting_launch_diagnostics() {
+    let secret = "review-secret\u{1b}-suffix";
+    let mut request = request();
+    let digest = "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a";
+    request.assignment.run.model = Some("gpt-5.6".to_owned());
+    request
+        .assignment
+        .effort
+        .as_mut()
+        .unwrap()
+        .capability_digest = Some(digest.to_owned());
+    request.assignment.env[0].value = secret.to_owned();
+    request.assignment.prompt = format!("Use {secret} in this prompt.");
+    let (_parent, workspace) = workspace_for(&request);
+    let adapter = adapter_for(&request.execution.harness).expect("select Codex adapter");
+    let capabilities = EffortCapabilities {
+        version: 1,
+        daemon_version: "0.1.0".to_owned(),
+        harness: "codex".to_owned(),
+        harness_version: "codex-cli fixture".to_owned(),
+        catalog_digest: digest.to_owned(),
+        models: vec![EffortModelCapability {
+            model: "gpt-5.6".to_owned(),
+            efforts: vec!["low".to_owned(), "high".to_owned()],
+        }],
+        accepts_asserted_effort: None,
+        discovery_error: None,
+    };
+
+    let launch = adapter
+        .launch(&request, &workspace, &capabilities)
+        .expect("build Codex launch");
+    let diagnostic = launch.diagnostics();
+    let launch_debug = format!("{launch:?}");
+    let rust_escaped_secret = format!("{secret:?}").trim_matches('"').to_owned();
+
+    for output in [diagnostic, launch_debug.as_str()] {
+        assert!(!output.contains(secret), "raw secret leaked: {output}");
+        assert!(
+            !output.contains(&rust_escaped_secret),
+            "Rust Debug-escaped secret leaked: {output}"
+        );
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    workspace.cleanup().expect("remove executor workspace");
+    fs::remove_dir_all(_parent).expect("remove workspace parent");
+}
+
+#[test]
 fn codex_fixture_events_become_generic_protocol_events_without_native_jsonl() {
     let request = request();
     let adapter = adapter_for(&request.execution.harness).expect("select Codex adapter");
