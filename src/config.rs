@@ -21,7 +21,7 @@ pub enum RunnerType {
 }
 
 /// Whether a completed assignment's workspace should be retained.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RetentionMode {
     #[default]

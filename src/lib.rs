@@ -9,6 +9,7 @@ pub mod config;
 pub mod credentials;
 pub mod effort;
 pub mod execution;
+pub mod execution_protocol;
 pub mod finish;
 pub mod logging;
 pub mod poll;

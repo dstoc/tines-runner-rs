@@ -114,7 +114,7 @@ pub struct RunnerConcurrencyInstruction {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunnerAssignment {
     pub run: RunReference,
     /// Effort accepted for this assignment after runner capability negotiation.
@@ -130,7 +130,7 @@ pub struct RunnerAssignment {
     pub timeout_minutes: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerAssignmentEffort {
     pub version: u8,
     pub value: String,
@@ -142,7 +142,7 @@ pub struct RunnerAssignmentEffort {
     pub verification: Option<String>,
 }
 
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerAssignmentEnv {
     pub name: String,
     pub value: String,
@@ -150,7 +150,7 @@ pub struct RunnerAssignmentEnv {
     pub secret: bool,
 }
 
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunReference {
     pub id: String,
     pub issue_id: String,
@@ -163,7 +163,7 @@ pub struct RunReference {
     pub state_at_start_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssueReference {
     pub project_name: String,
     pub number: u64,

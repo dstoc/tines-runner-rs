@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "tines": {
+    "api_url": "https://tines.example.test"
+  },
+  "execution": {
+    "harness": "codex",
+    "workspace": {
+      "parent": "/workspace"
+    },
+    "retention": {
+      "mode": "never",
+      "max_age_hours": 72,
+      "max_count": 20
+    }
+  },
+  "assignment": {
+    "run": {
+      "id": "arun_456",
+      "issue_id": "iss_789",
+      "model": "gpt-5.1-codex",
+      "issue_ref": {
+        "project_name": "Tines",
+        "number": 4,
+        "title": "Define protocol types"
+      },
+      "state_at_start_name": "Implement"
+    },
+    "effort": {
+      "version": 1,
+      "value": "high",
+      "capability_digest": "fixture-capability-digest",
+      "verification": null
+    },
+    "prompt": "Implement the assigned issue.",
+    "bundle": {
+      "prompt": { "text": "Issue context" },
+      "skills": [],
+      "repos": []
+    },
+    "run_key": "fixture-run-key",
+    "env": [
+      { "name": "FIXTURE_TOKEN", "value": "fixture-secret", "secret": true }
+    ],
+    "timeout_minutes": 120
+  }
+}

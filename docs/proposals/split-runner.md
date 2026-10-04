@@ -509,9 +509,13 @@ Usage events may update the latest observed usage during execution.
 {
   "version": 1,
   "type": "rate_limit",
-  "resume_at": "2026-10-04T05:30:00Z"
+  "resume_at": 1791091800000,
+  "message": "Provider quota reached"
 }
 ```
+
+`resume_at` is Unix epoch time in milliseconds. An event may include a message
+when the provider does not supply a reset time.
 
 ### Terminal result
 
@@ -547,7 +551,23 @@ Rate-limited example:
   "version": 1,
   "type": "result",
   "status": "rate_limited",
-  "resume_at": "2026-10-04T05:30:00Z"
+  "exit_code": 1,
+  "error": "Provider quota reached",
+  "provider_session_id": "thread_...",
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 400
+  },
+  "pricing_evidence": {
+    "provider": "example-provider",
+    "version": 1,
+    "payload": {}
+  },
+  "interrupted": false,
+  "rate_limit": {
+    "resume_at": 1791091800000,
+    "message": "Provider quota reached"
+  }
 }
 ```
 
@@ -561,7 +581,18 @@ The precise final schema should support all information currently required by Ti
 - rate-limit/reset information;
 - interruption where locally appropriate.
 
-The final result may repeat the latest session and usage values so the terminal record is self-contained.
+The final result may repeat the latest session and usage values so the terminal
+record is self-contained. Pricing evidence uses an opaque provider, version,
+and payload envelope. This keeps the local protocol independent of
+provider-specific event formats.
+
+Protocol v1 requires `exit_code: 0` for `completed` and does not allow it to
+carry an error, interruption, or rate-limit data. A `failed` result must
+include a nonzero exit code, an error, interruption, or rate-limit data. A
+`rate_limited` result must include rate-limit data. The daemon maps
+`completed` to Tines completed status and maps `failed` and `rate_limited` to
+Tines failed status. It maps interruption and rate limiting to the matching
+Tines judgment.
 
 ## Protocol rules
 
@@ -569,18 +600,25 @@ The executor protocol should follow these rules:
 
 - every stdout line is valid JSON;
 - every event carries a protocol version;
-- unknown additive event types may be ignored by a compatible daemon;
+- protocol versions other than `1` are rejected;
+- unknown additive event types and unknown fields on known events may be ignored when the version is `1`;
 - secrets must never be emitted;
 - the run key must never be emitted;
 - assignment environment secrets must never be emitted;
 - stdout that is not valid protocol JSON is a protocol error;
-- event line sizes should be bounded to protect the daemon from accidental or malicious unbounded output;
+- event lines are limited to 1,048,576 bytes, excluding the newline;
 - exactly one terminal `result` is expected during ordinary completion;
 - EOF without a terminal result is an executor failure;
-- a terminal result followed by further output is a protocol violation;
+- a terminal result followed by any further output, including a blank line, is a protocol violation;
 - executor stderr is reserved for local executor diagnostics and is not itself the machine protocol.
 
 The daemon may include a bounded amount of executor stderr in an operator-facing error if the executor fails before producing a terminal result, provided secret redaction remains effective.
+
+The request includes the run key and assignment environment values because
+the executor needs them to perform the assignment. Request debug output must
+redact the run key, secret environment values, prompt, and bundle. The event
+renderer must redact the run key and secret environment values from every
+event string before writing JSONL.
 
 ## Tines log delivery
 
