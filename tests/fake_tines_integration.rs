@@ -667,6 +667,20 @@ fn restart_recovers_a_crashed_run_before_polling_with_empty_ownership() {
         .trim()
         .parse::<u32>()
         .expect("parse crashed stub descendant PID");
+    let active_runs_path = directory
+        .credentials_path()
+        .with_file_name("active-runs.json");
+    let harness_identity =
+        wait_for_process_identity(&active_runs_path, "arun_crash", Duration::from_secs(10));
+    let process_group_id = harness_identity["process_group_id"]
+        .as_u64()
+        .expect("persisted harness process group ID") as u32;
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        linux_process_group_id(child_pid),
+        Some(process_group_id),
+        "crash fixture child belongs to the persisted harness group"
+    );
     let first_requests = fake.requests();
     let first_polls = poll_requests(&first_requests);
     let first_instance = first_polls
@@ -738,6 +752,27 @@ fn wait_for_file(path: &std::path::Path, timeout: Duration) {
     assert!(path.exists(), "timed out waiting for {}", path.display());
 }
 
+fn wait_for_process_identity(path: &std::path::Path, run_id: &str, timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let identity = fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+            .and_then(|state| state["runs"][run_id]["process"].as_object().cloned());
+        if let Some(identity) = identity {
+            assert!(identity["process_id"].as_u64().is_some());
+            assert!(identity["process_group_id"].as_u64().is_some());
+            return Value::Object(identity);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the harness process identity in {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn assert_process_stopped(process_id: u32) {
     let deadline = Instant::now() + Duration::from_secs(4);
@@ -751,7 +786,7 @@ fn assert_process_stopped(process_id: u32) {
                     .chars()
                     .next()
                     .expect("process state");
-                if state == 'Z' {
+                if matches!(state, 'Z' | 'X') {
                     return;
                 }
             }
@@ -787,8 +822,15 @@ fn assert_process_stopped(process_id: u32) {
 fn is_process_running(process_id: u32) -> bool {
     fs::read_to_string(format!("/proc/{process_id}/stat")).is_ok_and(|stat| {
         stat.rsplit_once(") ")
-            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+            .is_some_and(|(_, rest)| !matches!(rest.chars().next(), Some('Z' | 'X')))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_id(process_id: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_whitespace().nth(2)?.parse().ok()
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
