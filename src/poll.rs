@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::assignment::PreparedAssignment;
 use crate::config::Config;
+use crate::effort::EffortCapabilities;
 use crate::executor_capabilities::ExecutorCapabilities;
 use crate::executor_transport::ExecutorTransport;
 use crate::protocol::client::{ErrorCategory, RunLogBuffer};
@@ -42,6 +43,9 @@ pub struct PollState {
     executor_harness: String,
     executor_capabilities: Option<ExecutorCapabilities>,
     executor_capabilities_refreshed_at: Option<Instant>,
+    legacy_launch_capabilities: Option<EffortCapabilities>,
+    legacy_launch_capabilities_refreshed_at: Option<Instant>,
+    legacy_launch_wrapper: Vec<String>,
 }
 
 /// Result of reserving one server-delivered assignment in the local run set.
@@ -80,6 +84,9 @@ impl PollState {
             },
             executor_capabilities: None,
             executor_capabilities_refreshed_at: None,
+            legacy_launch_capabilities: None,
+            legacy_launch_capabilities_refreshed_at: None,
+            legacy_launch_wrapper: config.wrapper.clone(),
         }
     }
 
@@ -198,6 +205,29 @@ impl PollState {
         self.executor_capabilities
             .as_ref()
             .expect("executor capabilities are discovered before use")
+    }
+
+    /// Refresh the local report used by the current legacy Codex launcher.
+    /// This remains separate from the executor report advertised to Tines
+    /// until assignment execution moves through the executor boundary.
+    pub fn refresh_legacy_launch_capabilities(&mut self, force: bool) -> &EffortCapabilities {
+        let now = Instant::now();
+        let expired = self
+            .legacy_launch_capabilities
+            .as_ref()
+            .is_none_or(|capabilities| {
+                capabilities.refresh_due(self.legacy_launch_capabilities_refreshed_at, now)
+            });
+        if force || expired {
+            self.legacy_launch_capabilities = Some(EffortCapabilities::discover_with_wrapper(
+                &self.legacy_launch_wrapper,
+                crate::VERSION,
+            ));
+            self.legacy_launch_capabilities_refreshed_at = Some(now);
+        }
+        self.legacy_launch_capabilities
+            .as_ref()
+            .expect("legacy launch capabilities are discovered before use")
     }
 
     /// The local concurrency cap after applying the latest server instruction.

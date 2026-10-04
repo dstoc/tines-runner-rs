@@ -47,8 +47,22 @@ impl EffortCapabilities {
         Self::discover_with_program("codex", daemon_version)
     }
 
+    /// Discover Codex capabilities through the legacy launcher's argv prefix.
+    pub fn discover_with_wrapper(wrapper: &[String], daemon_version: &str) -> Self {
+        let Some((program, arguments)) = wrapper.split_first() else {
+            return Self::discover(daemon_version);
+        };
+        let mut prefix = arguments.to_vec();
+        prefix.push("codex".to_owned());
+        Self::discover_with_prefix(program, &prefix, daemon_version)
+    }
+
     fn discover_with_program(program: &str, daemon_version: &str) -> Self {
-        let harness_version = match run_capture(program, &["--version"]) {
+        Self::discover_with_prefix(program, &[], daemon_version)
+    }
+
+    fn discover_with_prefix(program: &str, prefix: &[String], daemon_version: &str) -> Self {
+        let harness_version = match run_capture(program, prefix, &["--version"]) {
             Ok(output) => match String::from_utf8(output) {
                 Ok(version) if !version.trim().is_empty() => truncate(version.trim(), 100),
                 Ok(_) => return Self::failure(daemon_version, "Codex returned an empty version"),
@@ -57,7 +71,7 @@ impl EffortCapabilities {
             Err(error) => return Self::failure(daemon_version, &error),
         };
 
-        match discover_models(program, daemon_version, harness_version.clone()) {
+        match discover_models(program, prefix, daemon_version, harness_version.clone()) {
             Ok(capabilities) => capabilities,
             Err(error) => Self::catalog_failure(daemon_version, &harness_version, &error),
         }
@@ -118,6 +132,12 @@ impl EffortCapabilities {
             return Err("effort capability catalog digest is invalid".to_owned());
         }
         Ok(())
+    }
+
+    /// Whether this report confirms that the named harness is installed in
+    /// the environment that produced the report.
+    pub fn supports_harness(&self, harness: &str) -> bool {
+        self.validate_for_harness(harness).is_ok() && self.harness_version != "unknown"
     }
 }
 
@@ -201,8 +221,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn run_capture(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+fn run_capture(program: &str, prefix: &[String], args: &[&str]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(program)
+        .args(prefix)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -277,10 +298,12 @@ fn wait_child(child: &mut Child, started: Instant) -> Result<std::process::ExitS
 
 fn discover_models(
     program: &str,
+    prefix: &[String],
     daemon_version: &str,
     harness_version: String,
 ) -> Result<EffortCapabilities, String> {
     let mut child = Command::new(program)
+        .args(prefix)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -823,5 +846,45 @@ exit 2
         assert_eq!(report.discovery_error, None);
 
         fs::remove_dir_all(root).expect("remove fake Codex directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_runs_through_the_legacy_wrapper_prefix() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "tines-runner-codex-wrapper-capabilities-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create fake Codex wrapper directory");
+        let wrapper = root.join("codex-wrapper");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\n[ \"$1\" = \"--profile\" ] || exit 8\nshift\n[ \"$1\" = \"codex\" ] || exit 9\nshift\nif [ \"$1\" = \"--version\" ]; then printf 'wrapped-codex 1.2.3\\n'; exit 0; fi\nexit 10\n",
+        )
+        .expect("write fake Codex wrapper");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("stat fake Codex wrapper")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+
+        let report = EffortCapabilities::discover_with_wrapper(
+            &[
+                wrapper.to_string_lossy().into_owned(),
+                "--profile".to_owned(),
+            ],
+            "0.1.0",
+        );
+
+        assert_eq!(report.harness_version, "wrapped-codex 1.2.3");
+        assert!(report.discovery_error.is_some());
+        assert!(report.supports_harness("codex"));
+        fs::remove_dir_all(root).expect("remove fake Codex wrapper directory");
     }
 }

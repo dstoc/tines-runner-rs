@@ -3,7 +3,7 @@
 use crate::assignment::resolve_assignment;
 use crate::cancellation::CancellationToken;
 use crate::config::Config;
-use crate::effort::assignment_effort_rejection;
+use crate::effort::{EffortCapabilities, assignment_effort_rejection};
 use crate::execution::{self, ExecutionOutcome};
 use crate::executor_capabilities::ExecutorCapabilities;
 use crate::executor_transport::ExecutorTransport;
@@ -31,6 +31,7 @@ pub fn run_assignment(
     run_logs: crate::protocol::client::RunLogBuffer,
     default_executor: &ExecutorTransport,
     advertised_capabilities: &ExecutorCapabilities,
+    legacy_launch_capabilities: &EffortCapabilities,
     cancellation: &CancellationToken,
     context: &execution::ExecutionContext<'_>,
 ) -> Result<AssignmentTaskOutcome, String> {
@@ -41,6 +42,7 @@ pub fn run_assignment(
             issue_client,
             default_executor,
             advertised_capabilities,
+            legacy_launch_capabilities,
             cancellation,
             context,
         },
@@ -55,6 +57,7 @@ struct AssignmentContext<'a> {
     issue_client: &'a Client,
     default_executor: &'a ExecutorTransport,
     advertised_capabilities: &'a ExecutorCapabilities,
+    legacy_launch_capabilities: &'a EffortCapabilities,
     cancellation: &'a CancellationToken,
     context: &'a execution::ExecutionContext<'a>,
 }
@@ -70,6 +73,7 @@ fn run_assignment_inner(
         issue_client,
         default_executor,
         advertised_capabilities,
+        legacy_launch_capabilities,
         cancellation,
         context,
     } = context;
@@ -136,12 +140,37 @@ fn run_assignment_inner(
             context,
         );
     }
+    let legacy_launch_capabilities = if resolved.resolution().config.wrapper == config.wrapper {
+        legacy_launch_capabilities.clone()
+    } else {
+        EffortCapabilities::discover_with_wrapper(
+            &resolved.resolution().config.wrapper,
+            crate::VERSION,
+        )
+    };
+    if cancellation.is_cancelled() {
+        return Ok(AssignmentTaskOutcome::Cancelled);
+    }
+    if context.shutdown.is_requested() {
+        return report_interrupted_before_execution(
+            connection,
+            &assignment.run.id,
+            &run_logs,
+            cancellation,
+            context,
+        );
+    }
     let harness = match resolved.resolution().config.runner_type {
         crate::config::RunnerType::Codex => "codex",
     };
     if !capabilities.supports(harness) {
         return Ok(AssignmentTaskOutcome::Declined(format!(
             "configured executor does not verify support for the {harness} harness"
+        )));
+    }
+    if !legacy_launch_capabilities.supports_harness(harness) {
+        return Ok(AssignmentTaskOutcome::Declined(format!(
+            "local legacy launcher does not verify support for the {harness} harness"
         )));
     }
     let effort_capabilities = capabilities.effort_report(harness, crate::VERSION);
@@ -156,6 +185,20 @@ fn run_assignment_inner(
             );
         }
         return Ok(AssignmentTaskOutcome::Declined(reason));
+    }
+    if let Some(reason) = assignment_effort_rejection(&assignment, &legacy_launch_capabilities) {
+        if context.shutdown.is_requested() {
+            return report_interrupted_before_execution(
+                connection,
+                &assignment.run.id,
+                &run_logs,
+                cancellation,
+                context,
+            );
+        }
+        return Ok(AssignmentTaskOutcome::Declined(format!(
+            "local legacy launcher: {reason}"
+        )));
     }
 
     let run_id = assignment.run.id.clone();
@@ -251,7 +294,7 @@ fn run_assignment_inner(
         prepared,
         connection,
         issue_client,
-        &effort_capabilities,
+        &legacy_launch_capabilities,
         &config.workspace_retention,
         cancellation,
         context,

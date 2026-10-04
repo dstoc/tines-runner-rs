@@ -1052,7 +1052,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
     fs::write(
         &wrapper_path,
         format!(
-            "#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\necho running\nwait\n",
+            "#!/bin/sh\nif [ \"$1\" = \"codex\" ] && [ \"$2\" = \"--version\" ]; then printf 'codex-fake 0.1.0\\n'; exit 0; fi\nif [ \"$1\" = \"codex\" ] && [ \"$2\" = \"app-server\" ]; then exit 1; fi\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\necho running\nwait\n",
             descendant_path.display()
         ),
     )
