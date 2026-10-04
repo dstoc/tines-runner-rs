@@ -361,6 +361,40 @@ fn request_debug_redacts_secrets_before_rust_escapes_them() {
 }
 
 #[test]
+fn rendered_events_redact_rust_escaped_secret_values() {
+    let (mut request, _) = request_fixture();
+    for secret in ["private\nvalue", "private\"value"] {
+        request.assignment.run_key = secret.into();
+        request.assignment.env[0].value = secret.into();
+        let rust_escaped = format!("{secret:?}");
+        let rust_escaped = &rust_escaped[1..rust_escaped.len() - 1];
+        let event = ExecutionEvent::new(ExecutionEventKind::Result {
+            result: TerminalResult {
+                status: TerminalStatus::Failed,
+                exit_code: Some(1),
+                error: Some(format!("git clone failed for directory {rust_escaped}")),
+                provider_session_id: None,
+                usage: None,
+                pricing_evidence: None,
+                interrupted: false,
+                rate_limit: None,
+            },
+        });
+
+        let rendered = render_event_jsonl(&event, &request).unwrap();
+        assert!(
+            !rendered.contains(secret),
+            "raw secret leaked for {secret:?}"
+        );
+        assert!(
+            !rendered.contains(rust_escaped),
+            "escaped secret leaked for {secret:?}"
+        );
+        assert!(rendered.contains("***"));
+    }
+}
+
+#[test]
 fn terminal_result_invariants_reject_success_with_failure_details() {
     let result = TerminalResult {
         status: TerminalStatus::Completed,
