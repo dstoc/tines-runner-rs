@@ -105,6 +105,32 @@ impl CodexLaunch {
         Ok(launch)
     }
 
+    /// Prepare Codex from the executor's self-contained request.
+    ///
+    /// The executable remains the semantic `codex` command and is resolved
+    /// from the executor process's `PATH`. The daemon does not choose a host
+    /// executable path.
+    pub fn for_execution_request(
+        request: &crate::execution_protocol::ExecutionRequest,
+        workspace: &crate::workspace::MaterializedWorkspace,
+        capabilities: &EffortCapabilities,
+    ) -> Result<Self, CodexLaunchError> {
+        let invocation = build_assignment_invocation(&request.assignment, capabilities, &[])?;
+        let mut launch = Self::new(
+            invocation,
+            workspace.path(),
+            workspace.environment().clone(),
+        );
+        launch.model = request.assignment.run.model.clone();
+        launch.effort = request
+            .assignment
+            .effort
+            .as_ref()
+            .map(|effort| effort.value.clone());
+        launch.timeout_minutes = Some(request.assignment.timeout_minutes);
+        Ok(launch)
+    }
+
     /// Combine an invocation with a working directory and assignment environment.
     pub fn new(
         invocation: CodexInvocation,

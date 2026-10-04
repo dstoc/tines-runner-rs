@@ -96,15 +96,19 @@ fn event_fixture_deserializes_and_serializes_every_known_event_variant() {
     for chunk in fixture.as_bytes().chunks(19) {
         events.extend(parser.push(chunk).expect("parse event chunk"));
     }
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
     assert!(matches!(events[0].kind, ExecutionEventKind::Log { .. }));
     assert!(matches!(events[1].kind, ExecutionEventKind::Session { .. }));
-    assert!(matches!(events[2].kind, ExecutionEventKind::Usage { .. }));
     assert!(matches!(
-        events[3].kind,
+        events[2].kind,
+        ExecutionEventKind::ProviderError { .. }
+    ));
+    assert!(matches!(events[3].kind, ExecutionEventKind::Usage { .. }));
+    assert!(matches!(
+        events[4].kind,
         ExecutionEventKind::RateLimit { .. }
     ));
-    assert!(matches!(events[4].kind, ExecutionEventKind::Result { .. }));
+    assert!(matches!(events[5].kind, ExecutionEventKind::Result { .. }));
     assert!(parser.finish().unwrap().is_none());
 
     let (request, _) = request_fixture();
