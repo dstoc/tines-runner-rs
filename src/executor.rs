@@ -3,7 +3,6 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -123,9 +122,20 @@ pub fn execute_request(
     };
     let mut parser = events.event_parser();
     let retention = retention_policy(request);
-    if retention::prune_retained(Path::new(&request.execution.workspace.parent), &retention)
-        .is_err()
-    {
+    let workspace_parent = match config::resolve_executor_workspace_parent(
+        request.execution.workspace.parent.as_deref(),
+    ) {
+        Ok(parent) => parent,
+        Err(error) => {
+            return emit_failure(
+                request,
+                output,
+                diagnostics,
+                format!("could not resolve executor workspace parent: {error}"),
+            );
+        }
+    };
+    if retention::prune_retained(&workspace_parent, &retention).is_err() {
         return emit_failure(
             request,
             output,
