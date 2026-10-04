@@ -47,7 +47,7 @@ impl Drop for RunnerGuard {
             self.credentials_path.with_file_name("active-runs.json"),
         ) {
             for record in store.records() {
-                if let Some(process) = record.process {
+                if let Some(process) = record.transport {
                     let _ = process.terminate_if_matches(Duration::from_millis(100));
                 }
             }
@@ -1046,25 +1046,21 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
         "runner_id = \"rnr_shutdown\"\nrunner_token = \"shutdown-token\"\n",
     )
     .expect("write runner credentials");
-    let executor_path = directory.0.join("stub-executor");
+    let executor_path = std::path::Path::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    let bin_directory = directory.0.join("bin");
+    fs::create_dir_all(&bin_directory).expect("create executor PATH directory");
+    let codex = bin_directory.join("codex");
+    fs::write(&codex, include_str!("support/stub_codex.sh")).expect("write Codex stub");
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
+        .expect("make Codex stub executable");
+    let harness_pid_path = directory.0.join("harness.pid");
     let descendant_path = directory.0.join("descendant.pid");
-    let capabilities_document = r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#;
-    fs::write(
-        &executor_path,
-        format!(
-            "#!/bin/sh\nif [ \"${{1:-}}\" = \"capabilities\" ]; then printf '%s\\n' '{}'; exit 0; fi\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\nwait\n",
-            capabilities_document,
-            descendant_path.display()
-        ),
-    )
-    .expect("write executor stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&executor_path, fs::Permissions::from_mode(0o755))
-            .expect("make executor executable");
-    }
     let workspace_parent = directory.0.join("workspaces");
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin_directory).chain(std::env::split_paths(&current_path)),
+    )
+    .expect("compose Codex PATH");
     fs::write(
         config_dir.join("config.toml"),
         format!(
@@ -1079,7 +1075,10 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
     directory.configure_command(&mut command);
-    command.env("PATH", "/usr/bin:/bin");
+    command
+        .env("PATH", path)
+        .env("FAKE_CODEX_HARNESS_PID_FILE", &harness_pid_path)
+        .env("FAKE_CODEX_CHILD_PID_FILE", &descendant_path);
     let mut runner = RunnerGuard {
         child: command
             .env_remove("TINES_API_KEY")
@@ -1088,21 +1087,37 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
         credentials_path: credentials_path.clone(),
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !descendant_path.exists() && Instant::now() < deadline {
+    while (!harness_pid_path.exists() || !descendant_path.exists()) && Instant::now() < deadline {
         if let Some(status) = runner.child.try_wait().expect("check runner") {
             panic!("runner exited before starting harness: {status}");
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        descendant_path.exists(),
-        "executor descendant did not start"
-    );
-    let descendant = fs::read_to_string(&descendant_path)
-        .expect("read descendant PID")
-        .trim()
-        .parse::<u32>()
-        .expect("parse descendant PID");
+    assert!(harness_pid_path.exists(), "Codex harness did not start");
+    assert!(descendant_path.exists(), "harness descendant did not start");
+    let harness = wait_for_pid_file(&mut runner.child, &harness_pid_path, deadline);
+    let descendant = wait_for_pid_file(&mut runner.child, &descendant_path, deadline);
+    let active_runs_path = credentials_path.with_file_name("active-runs.json");
+    let transport_identity = loop {
+        if let Some(status) = runner.child.try_wait().expect("check runner") {
+            panic!("runner exited before executor cancellation: {status}");
+        }
+        let store = tines_runner_rs::recovery::ActiveRunStore::open(&active_runs_path)
+            .expect("read active-run state");
+        if let Some(identity) = store
+            .records()
+            .into_iter()
+            .find(|record| record.run_id == "arun_shutdown")
+            .and_then(|record| record.transport)
+        {
+            break identity;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transport identity was not persisted"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
 
     let signal = Command::new("kill")
         .args(["-TERM", &runner.child.id().to_string()])
@@ -1121,7 +1136,13 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
         thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success(), "graceful shutdown exited with {status:?}");
+    assert_process_stopped(harness);
     assert_process_stopped(descendant);
+    assert_process_stopped(transport_identity.process_id());
+    assert!(
+        !transport_identity.matches_live_process(),
+        "the persisted executor transport identity must stop"
+    );
 
     let (requests, finish) = server.join().expect("join shutdown server");
     assert!(
@@ -1141,10 +1162,8 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
             .unwrap_or_default()
             .contains("shutdown")
     );
-    let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(
-        credentials_path.with_file_name("active-runs.json"),
-    )
-    .expect("read settled active-run state");
+    let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(active_runs_path)
+        .expect("read settled active-run state");
     assert!(active_runs.records().is_empty());
 }
 

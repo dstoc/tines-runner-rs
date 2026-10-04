@@ -295,6 +295,36 @@ fn wait_for_quiet_poll(fake: &FakeTines, run_id: &str) {
     });
 }
 
+fn wait_for_run_log(fake: &FakeTines, run_id: &str, message: &str) {
+    let target = format!("/runs/{run_id}/logs");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let requests = fake.requests();
+        if requests.iter().any(|request| {
+            request.target.ends_with(&target)
+                && request.json()["chunk"]
+                    .as_str()
+                    .is_some_and(|chunk| chunk.contains(message))
+        }) {
+            return;
+        }
+        let log_requests = requests
+            .iter()
+            .filter(|request| request.target.ends_with(&target))
+            .map(RecordedRequest::json)
+            .collect::<Vec<_>>();
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for run log {message:?}; received run logs {log_requests:?} and requests {:?}",
+            requests
+                .iter()
+                .map(|request| &request.target)
+                .collect::<Vec<_>>()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn stop_gracefully(fake: &FakeTines, runner: &mut RunnerProcess) {
     runner.signal("TERM");
     let status = runner.wait(Duration::from_secs(10));
@@ -935,6 +965,120 @@ fn supervisor_cancellation_kills_stub_descendants_and_is_acknowledged() {
 }
 
 #[test]
+fn cancellation_after_executor_result_does_not_report_a_second_finish() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    directory.configure(fake.url().as_str(), &stub, 1, false);
+    let run_id = "arun_cancel_after_result";
+    let control = directory.path.join("control");
+    fs::write(
+        control.join(format!("{run_id}.child")),
+        "keep transport open",
+    )
+    .expect("configure executor process-group child");
+    directory.write_events(
+        run_id,
+        [
+            json!({"version":1,"type":"log","stream":"system","message":"executor emitted terminal result and is still waiting while the daemon keeps transport state durable and the child remains alive"}),
+            json!({"version":1,"type":"result","status":"completed","exit_code":0,"interrupted":false}),
+        ],
+    );
+    let child_pid_file = control.join(format!("{run_id}.pid"));
+    fake.enqueue_poll(json!({
+        "assignments": [assignment(run_id, 5, Vec::new())],
+        "cancels": []
+    }));
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    wait_for_file(&child_pid_file, Duration::from_secs(10));
+    let child_pid = fs::read_to_string(&child_pid_file)
+        .expect("read executor descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("parse descendant PID");
+    wait_for_file(
+        &control.join(format!("{run_id}.events-sent")),
+        Duration::from_secs(10),
+    );
+    wait_for_run_log(&fake, run_id, "executor emitted terminal result");
+    fake.enqueue_poll(json!({
+        "assignments": [],
+        "cancel_requests": [{"run_id": run_id, "token": "cancel-after-result"}],
+        "cancels": []
+    }));
+    fake.wait_for(Duration::from_secs(15), |requests| {
+        requests.iter().any(|request| {
+            request.target.ends_with("/poll")
+                && request.json()["cancellation_acks"]
+                    .as_array()
+                    .is_some_and(|acks| {
+                        acks.iter().any(|ack| {
+                            ack["run_id"] == run_id && ack["token"] == "cancel-after-result"
+                        })
+                    })
+        })
+    });
+
+    assert_process_stopped(child_pid);
+    assert!(
+        fake.accepted_finishes().is_empty(),
+        "Tines cancellation after an executor result must suppress finish reporting"
+    );
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
+fn sigterm_stops_the_executor_transport_and_reports_one_interrupted_finish() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    directory.configure(fake.url().as_str(), &stub, 1, false);
+    let run_id = "arun_sigterm_active";
+    let control = directory.path.join("control");
+    fs::write(
+        control.join(format!("{run_id}.child")),
+        "keep transport open",
+    )
+    .expect("configure executor process-group child");
+    directory.write_events(
+        run_id,
+        [json!({"version":1,"type":"log","stream":"system","message":"executor is active and waiting for a supervisor signal while its transport and descendant remain alive"})],
+    );
+    let child_pid_file = control.join(format!("{run_id}.pid"));
+    fake.enqueue_poll(json!({
+        "assignments": [assignment(run_id, 5, Vec::new())],
+        "cancels": []
+    }));
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    wait_for_file(&child_pid_file, Duration::from_secs(10));
+    let child_pid = fs::read_to_string(&child_pid_file)
+        .expect("read executor descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("parse descendant PID");
+    let active_runs_path = directory
+        .credentials_path()
+        .with_file_name("active-runs.json");
+    let transport_identity =
+        wait_for_process_identity(&active_runs_path, run_id, Duration::from_secs(10));
+    let transport_pid = transport_identity["process_id"]
+        .as_u64()
+        .expect("persisted transport process ID") as u32;
+    wait_for_run_log(&fake, run_id, "executor is active and waiting");
+
+    runner.signal("TERM");
+    let status = runner.wait(Duration::from_secs(10));
+    assert!(status.success(), "graceful shutdown failed: {status}");
+    assert_process_stopped(transport_pid);
+    assert_process_stopped(child_pid);
+    let finishes = fake.wait_for_finishes(1, Duration::from_secs(10));
+    assert_eq!(finishes.len(), 1, "shutdown reports the run once");
+    assert_eq!(finishes[0]["judgment"], "interrupted");
+}
+
+#[test]
 fn zero_minute_assignment_timeout_uses_the_protocol_finish_path() {
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
@@ -985,16 +1129,16 @@ fn restart_recovers_a_crashed_run_before_polling_with_empty_ownership() {
     let active_runs_path = directory
         .credentials_path()
         .with_file_name("active-runs.json");
-    let harness_identity =
+    let transport_identity =
         wait_for_process_identity(&active_runs_path, "arun_crash", Duration::from_secs(10));
-    let process_group_id = harness_identity["process_group_id"]
+    let process_group_id = transport_identity["process_group_id"]
         .as_u64()
-        .expect("persisted harness process group ID") as u32;
+        .expect("persisted executor transport process group ID") as u32;
     #[cfg(target_os = "linux")]
     assert_eq!(
         linux_process_group_id(child_pid),
         Some(process_group_id),
-        "crash fixture child belongs to the persisted harness group"
+        "crash fixture child belongs to the persisted executor transport group"
     );
     let first_requests = fake.requests();
     let first_polls = poll_requests(&first_requests);
@@ -1073,7 +1217,7 @@ fn wait_for_process_identity(path: &std::path::Path, run_id: &str, timeout: Dura
         let identity = fs::read_to_string(path)
             .ok()
             .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
-            .and_then(|state| state["runs"][run_id]["process"].as_object().cloned());
+            .and_then(|state| state["runs"][run_id]["transport"].as_object().cloned());
         if let Some(identity) = identity {
             assert!(identity["process_id"].as_u64().is_some());
             assert!(identity["process_group_id"].as_u64().is_some());
@@ -1081,7 +1225,7 @@ fn wait_for_process_identity(path: &std::path::Path, run_id: &str, timeout: Dura
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for the harness process identity in {}",
+            "timed out waiting for the executor transport identity in {}",
             path.display()
         );
         thread::sleep(Duration::from_millis(5));

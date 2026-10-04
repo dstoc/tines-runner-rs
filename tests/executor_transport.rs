@@ -3,16 +3,24 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tines_runner_rs::config::{Config, MatchContext};
+#[cfg(target_os = "linux")]
+use tines_runner_rs::config::{RetentionMode, WorkspaceRetention};
 use tines_runner_rs::execution_protocol::{
     EXECUTION_PROTOCOL_VERSION, ExecutionRequest, ExecutionRetentionPolicy, LocalExecutionPolicy,
     TinesExecutionContext, WorkspacePolicy,
 };
 use tines_runner_rs::executor_transport::{ExecutorTransport, ExecutorTransportError};
 use tines_runner_rs::process::ProcessExit;
+#[cfg(target_os = "linux")]
+use tines_runner_rs::process::{EXECUTOR_TRANSPORT_TERMINATION_GRACE, ProcessIdentity};
+#[cfg(target_os = "linux")]
+use tines_runner_rs::recovery::{ActiveRunStore, recover_active_runs};
 
 struct TestDirectory(PathBuf);
 
@@ -29,6 +37,16 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[cfg(target_os = "linux")]
+struct NativeExecutorFixture {
+    _directory: TestDirectory,
+    transport: ExecutorTransport,
+    request: ExecutionRequest,
+    workspace_parent: PathBuf,
+    harness_pid_path: PathBuf,
+    descendant_pid_path: PathBuf,
 }
 
 fn write_executable(path: &Path, contents: &str) {
@@ -90,6 +108,154 @@ fn result_event() -> &'static str {
 
 fn codex_capabilities_document() -> &'static str {
     r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#
+}
+
+#[cfg(target_os = "linux")]
+fn run_native_executor_until_stopped(shutdown: bool) {
+    let fixture = native_executor_fixture();
+    let mut stdout = Vec::new();
+    let mut identity: Option<ProcessIdentity> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let output = fixture
+        .transport
+        .run_with_callbacks(
+            &fixture.request,
+            Duration::from_secs(30),
+            EXECUTOR_TRANSPORT_TERMINATION_GRACE,
+            || {
+                !shutdown
+                    && fixture.harness_pid_path.exists()
+                    && fixture.descendant_pid_path.exists()
+            },
+            || {
+                shutdown
+                    && fixture.harness_pid_path.exists()
+                    && fixture.descendant_pid_path.exists()
+            },
+            |process, _| {
+                identity = Some(process.clone());
+                Ok(())
+            },
+            |chunk| stdout.extend_from_slice(chunk),
+            || {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "executor did not start harness"
+                )
+            },
+        )
+        .expect("supervise real execute command");
+
+    assert!(!output.timed_out);
+    assert_eq!(output.cancelled, !shutdown);
+    assert_eq!(output.interrupted, shutdown);
+    assert!(
+        !String::from_utf8_lossy(&stdout).lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .is_some_and(|event| event["type"] == "result")
+        }),
+        "an interrupted native executor must not emit a terminal result"
+    );
+    assert!(
+        !identity
+            .expect("executor transport identity was reported")
+            .matches_live_process(),
+        "transport process group must stop before the daemon returns"
+    );
+    let harness_pid = read_pid(&fixture.harness_pid_path);
+    let descendant_pid = read_pid(&fixture.descendant_pid_path);
+    assert_process_stopped(harness_pid);
+    assert_process_stopped(descendant_pid);
+}
+
+#[cfg(target_os = "linux")]
+fn native_executor_fixture() -> NativeExecutorFixture {
+    let directory = TestDirectory::new();
+    let bin_directory = directory.0.join("bin");
+    fs::create_dir_all(&bin_directory).expect("create executor PATH directory");
+    let harness_pid_path = directory.0.join("harness.pid");
+    let descendant_pid_path = directory.0.join("descendant.pid");
+    let codex = bin_directory.join("codex");
+    write_executable(
+        &codex,
+        &format!(
+            "#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\nchild=$!\nprintf '%s\\n' \"$$\" > '{}.tmp'\nmv '{}.tmp' '{}'\nprintf '%s\\n' \"$child\" > '{}.tmp'\nmv '{}.tmp' '{}'\nwait \"$child\"\n",
+            harness_pid_path.display(),
+            harness_pid_path.display(),
+            harness_pid_path.display(),
+            descendant_pid_path.display(),
+            descendant_pid_path.display(),
+            descendant_pid_path.display(),
+        ),
+    );
+
+    let executor = directory.0.join("native-executor");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    write_executable(
+        &executor,
+        &format!(
+            "#!/bin/sh\nPATH={}:/usr/bin:/bin\nexport PATH\nexec {} \"$@\"\n",
+            shell_quote(&bin_directory.to_string_lossy()),
+            shell_quote(&binary.to_string_lossy()),
+        ),
+    );
+
+    let mut request = request("nested termination".to_owned());
+    let workspace_parent = directory.0.join("executor-workspaces");
+    request.execution.workspace.parent = Some(workspace_parent.clone());
+    let transport =
+        ExecutorTransport::new(vec![executor.to_string_lossy().into_owned()], &directory.0);
+    NativeExecutorFixture {
+        _directory: directory,
+        transport,
+        request,
+        workspace_parent,
+        harness_pid_path,
+        descendant_pid_path,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .expect("read child PID")
+        .trim()
+        .parse()
+        .expect("parse child PID")
+}
+
+#[cfg(target_os = "linux")]
+fn assert_process_stopped(process_id: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+            Ok(stat) => {
+                let state = stat
+                    .rsplit_once(") ")
+                    .expect("valid proc stat record")
+                    .1
+                    .chars()
+                    .next()
+                    .expect("process state");
+                if state == 'Z' {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("could not inspect process: {error}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {process_id} remained alive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -439,4 +605,124 @@ fn review_cwd_without_search_permission() {
         ExecutorTransportError::InvalidWorkingDirectory(_)
     ));
     assert!(error.to_string().contains("executor_cwd"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancellation_waits_for_native_executor_to_kill_term_resistant_harness() {
+    run_native_executor_until_stopped(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_waits_for_native_executor_to_kill_term_resistant_harness() {
+    run_native_executor_until_stopped(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crash_recovery_waits_for_native_executor_to_kill_term_resistant_harness() {
+    let fixture = native_executor_fixture();
+    let store = ActiveRunStore::open(fixture._directory.0.join("active-runs.json"))
+        .expect("open active-run state");
+    let retention = WorkspaceRetention {
+        mode: RetentionMode::Never,
+        max_age: Duration::from_secs(60 * 60),
+        max_count: 10,
+    };
+    let started_identity = Arc::new(Mutex::new(None::<ProcessIdentity>));
+    let callback_identity = Arc::clone(&started_identity);
+    let mut recovery_result = None;
+    let mut stdout = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+
+    let output = fixture
+        .transport
+        .run_with_callbacks(
+            &fixture.request,
+            Duration::from_secs(30),
+            EXECUTOR_TRANSPORT_TERMINATION_GRACE,
+            || {
+                if recovery_result.is_none()
+                    && fixture.harness_pid_path.exists()
+                    && fixture.descendant_pid_path.exists()
+                {
+                    recovery_result = Some((|| {
+                        let identity = callback_identity
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                            .ok_or_else(|| std::io::Error::other("missing transport identity"))?;
+                        let workspace = fs::read_dir(&fixture.workspace_parent)?
+                            .filter_map(Result::ok)
+                            .map(|entry| entry.path())
+                            .find(|path| path.is_dir())
+                            .ok_or_else(|| std::io::Error::other("executor workspace not found"))?;
+                        store.record_transport(
+                            fixture.request.assignment.run.id.clone(),
+                            identity,
+                            &workspace,
+                        )?;
+                        recover_active_runs(
+                            &store,
+                            &retention,
+                            std::slice::from_ref(&fixture.workspace_parent),
+                        )
+                    })());
+                }
+                false
+            },
+            || false,
+            move |identity, _| {
+                *started_identity
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+                Ok(())
+            },
+            |chunk| stdout.extend_from_slice(chunk),
+            || {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "executor did not start harness"
+                )
+            },
+        )
+        .expect("supervise recovered native executor");
+
+    assert!(!output.timed_out);
+    assert!(!output.cancelled);
+    assert!(!output.interrupted);
+    assert_eq!(
+        recovery_result
+            .expect("recovery ran after the TERM-resistant harness started")
+            .expect("recover executor transport"),
+        [fixture.request.assignment.run.id.as_str()]
+    );
+    assert!(store.records().is_empty(), "recovery clears active state");
+    assert!(
+        fs::read_dir(&fixture.workspace_parent)
+            .expect("read recovered workspace parent")
+            .next()
+            .is_none(),
+        "recovery removes the abandoned workspace"
+    );
+    assert_process_stopped(read_pid(&fixture.harness_pid_path));
+    assert_process_stopped(read_pid(&fixture.descendant_pid_path));
+    assert!(
+        !callback_identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .expect("transport identity was reported")
+            .matches_live_process(),
+        "recovery stops the persisted executor transport"
+    );
+    assert!(
+        !String::from_utf8_lossy(&stdout).lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .is_some_and(|event| event["type"] == "result")
+        }),
+        "recovery must not report a terminal executor result"
+    );
 }

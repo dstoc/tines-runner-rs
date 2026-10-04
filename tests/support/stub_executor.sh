@@ -57,6 +57,10 @@ else
         '{"version":1,"type":"result","status":"completed","exit_code":0,"interrupted":false}'
 fi
 
+sent_tmp="$control_dir/$run_id.events-sent.tmp"
+: > "$sent_tmp"
+mv "$sent_tmp" "$control_dir/$run_id.events-sent"
+
 if [ -f "$control_dir/$run_id.child" ]; then
     while :; do sleep 1; done
 fi

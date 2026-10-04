@@ -15,13 +15,13 @@ use crate::execution_protocol::{
     TerminalStatus, render_event_jsonl,
 };
 use crate::harness::{HarnessExit, adapter_for};
-use crate::process::{ProcessExit, ProcessStream, SupervisedProcess};
+use crate::process::{
+    PROCESS_TREE_TERMINATION_GRACE, ProcessExit, ProcessStream, SupervisedProcess,
+};
 use crate::protocol::FinishStatus;
 use crate::retention;
 use crate::shutdown::ShutdownSignal;
 use crate::workspace::{MaterializedWorkspace, WorkspaceError};
-
-const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 /// A failure while preparing an execution request inside the executor.
 #[derive(Debug)]
@@ -212,7 +212,7 @@ pub fn execute_request(
                             );
                             match process.wait_timeout_with_output_or_shutdown(
                                 timeout,
-                                TERMINATION_GRACE,
+                                PROCESS_TREE_TERMINATION_GRACE,
                                 || false,
                                 || shutdown.is_requested(),
                                 |chunk| {

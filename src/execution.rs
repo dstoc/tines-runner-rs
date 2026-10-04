@@ -199,7 +199,7 @@ fn run_executor(
         || shutdown.is_requested(),
         |identity, run_deadline| {
             active_runs
-                .record(run_id.clone(), identity.clone(), &workspace)
+                .record_transport(run_id.clone(), identity.clone(), &workspace)
                 .map_err(|error| error.to_string())?;
             deadline.set(Some(run_deadline));
             last_flush.set(Instant::now());

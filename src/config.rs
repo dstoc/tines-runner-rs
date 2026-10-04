@@ -885,6 +885,41 @@ executor_cwd = "~/executor"
     }
 
     #[test]
+    fn executor_argv_is_not_interpreted_by_configuration() {
+        for executor in [
+            r#"["docker", "run", "--rm", "-dit", "runner-image"]"#,
+            r#"["podman", "run", "--detach", "runner-image"]"#,
+            r#"["custom-transport", "run", "-d"]"#,
+        ] {
+            let contents = format!(
+                "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test-runner\"\nexecutor_cwd = \"/daemon\"\nexecutor = {executor}\n"
+            );
+            Config::from_toml_str_with_defaults(&contents, defaults())
+                .expect("executor argv is an opaque transport command");
+        }
+
+        let config = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+executor_cwd = "/daemon"
+[[override]]
+project = "Payments"
+executor = ["docker", "run", "--detach", "runner-image"]
+"#,
+            defaults(),
+        )
+        .expect("override executor argv is also opaque");
+        assert_eq!(
+            config
+                .resolve(context("Payments", "Build", "Implement"))
+                .executor,
+            ["docker", "run", "--detach", "runner-image"]
+        );
+    }
+
+    #[test]
     fn executor_and_daemon_cwd_resolve_by_project_workflow_and_state() {
         let config = parse_with_overrides(
             r#"[[override]]
