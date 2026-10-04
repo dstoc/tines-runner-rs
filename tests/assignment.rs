@@ -8,6 +8,7 @@ use std::time::Duration;
 use tines_runner_rs::assignment::{PreparedAssignment, resolve_assignment};
 use tines_runner_rs::config::Config;
 use tines_runner_rs::credentials::{CredentialStore, RunnerCredentials};
+use tines_runner_rs::executor_transport::execution_request;
 use tines_runner_rs::poll::PollLoop;
 use tines_runner_rs::protocol::RunnerAssignment;
 use tines_runner_rs::protocol::client::Client;
@@ -66,6 +67,7 @@ fn config(overrides: &str) -> Config {
             url = "http://127.0.0.1:1"
             [runner]
             name = "assignment-test"
+            executor_cwd = "~"
             wrapper = ["base-wrapper"]
             {overrides}
         "#
@@ -174,6 +176,7 @@ fn poll_queue_retains_resolved_context_config_and_original_assignment() {
             url = "{server_url}"
             [runner]
             name = "assignment-test"
+            executor_cwd = "~"
             wrapper = ["base-wrapper"]
             workspace_parent = {:?}
             [[override]]
@@ -248,6 +251,83 @@ fn poll_queue_retains_resolved_context_config_and_original_assignment() {
 }
 
 #[test]
+fn execution_request_keeps_workspace_and_retention_in_executor_environment() {
+    let (server_url, server) = issue_server(1);
+    let config = Config::from_toml_str(
+        r#"[server]
+url = "http://127.0.0.1:1"
+[runner]
+name = "execution-request-test"
+executor = ["docker", "run", "--rm", "-i", "runner-image"]
+executor_cwd = "/host/daemon"
+workspace_parent = "/executor/workspaces"
+[storage]
+keep_workspaces = "failed"
+keep_workspaces_for_hours = 36
+keep_workspaces_max = 17
+"#,
+    )
+    .expect("parse executor request configuration");
+    let client =
+        Client::with_timeout(&server_url, Duration::from_secs(5)).expect("create issue client");
+    let resolved =
+        resolve_assignment(&config, &client, &assignment()).expect("resolve assignment metadata");
+    let request = execution_request(&resolved, &server_url, &config.workspace_retention);
+    server.join().expect("issue detail request");
+
+    assert_eq!(resolved.resolution().config.executor[0], "docker");
+    assert_eq!(
+        resolved.resolution().config.executor_cwd,
+        PathBuf::from("/host/daemon")
+    );
+    assert_eq!(request.execution.harness, "codex");
+    assert_eq!(
+        request.execution.workspace.parent,
+        Some(PathBuf::from("/executor/workspaces"))
+    );
+    assert_eq!(
+        request.execution.retention.mode,
+        tines_runner_rs::config::RetentionMode::Failed
+    );
+    assert_eq!(request.execution.retention.max_age_hours, 36);
+    assert_eq!(request.execution.retention.max_count, 17);
+    let serialized = serde_json::to_value(request).expect("serialize executor request");
+    assert!(serialized.get("executor_cwd").is_none());
+    assert!(serialized["execution"].get("executor_cwd").is_none());
+}
+
+#[test]
+fn execution_request_preserves_executor_tilde_paths_and_omits_its_default() {
+    let (server_url, server) = issue_server(3);
+    let cases = [
+        (
+            "workspace_parent = \"~/work/base\"",
+            Some(PathBuf::from("~/work/base")),
+        ),
+        (
+            "[[override]]\nproject = \"Tines\"\nworkspace_parent = \"~/work/payments\"",
+            Some(PathBuf::from("~/work/payments")),
+        ),
+        ("", None),
+    ];
+
+    for (workspace_config, expected_parent) in cases {
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = \"http://127.0.0.1:1\"\n[runner]\nname = \"executor-path-test\"\nexecutor_cwd = \"/host/daemon\"\n{workspace_config}\n"
+        ))
+        .expect("parse executor workspace configuration");
+        let client =
+            Client::with_timeout(&server_url, Duration::from_secs(5)).expect("issue client");
+        let resolved = resolve_assignment(&config, &client, &assignment())
+            .expect("resolve assignment metadata");
+        let request = execution_request(&resolved, &server_url, &config.workspace_retention);
+        assert_eq!(request.execution.workspace.parent, expected_parent);
+    }
+
+    server.join().expect("issue detail requests");
+}
+
+#[test]
 fn workspace_materialization_failure_finishes_only_the_assignment() {
     let directory = TestDirectory::new();
     let store = CredentialStore::at(directory.credentials_path());
@@ -296,6 +376,7 @@ fn workspace_materialization_failure_finishes_only_the_assignment() {
             url = "{server_url}"
             [runner]
             name = "materialization-test"
+            executor_cwd = "~"
             workspace_parent = {:?}
             [storage]
             credentials_file = {:?}

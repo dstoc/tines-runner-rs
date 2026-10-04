@@ -594,7 +594,7 @@ mod tests {
         max_concurrent: usize,
     ) -> Config {
         Config::from_toml_str(&format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"poll-test\"\nmax_concurrent = {max_concurrent}\nallow_remote_concurrency = {allow_remote_concurrency}\n[storage]\ncredentials_file = {:?}\n",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"poll-test\"\nexecutor_cwd = \"~\"\nmax_concurrent = {max_concurrent}\nallow_remote_concurrency = {allow_remote_concurrency}\n[storage]\ncredentials_file = {:?}\n",
             credentials_file
         ))
         .expect("valid poll config")

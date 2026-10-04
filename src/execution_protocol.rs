@@ -44,7 +44,12 @@ impl ExecutionRequest {
         if !matches!(api_url.scheme(), "http" | "https")
             || api_url.host().is_none()
             || self.execution.harness.trim().is_empty()
-            || self.execution.workspace.parent.as_os_str().is_empty()
+            || self
+                .execution
+                .workspace
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.as_os_str().is_empty())
         {
             return Err(ProtocolError::InvalidRequest);
         }
@@ -198,15 +203,17 @@ struct RedactedWorkspace<'a> {
 
 impl fmt::Debug for RedactedWorkspace<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let parent = self.policy.parent.to_string_lossy();
+        let parent = self
+            .policy
+            .parent
+            .as_ref()
+            .map(|parent| parent.to_string_lossy());
+        let parent = parent.as_deref().map(|value| RedactedDebugString {
+            value,
+            secrets: self.secrets,
+        });
         f.debug_struct("WorkspacePolicy")
-            .field(
-                "parent",
-                &RedactedDebugString {
-                    value: &parent,
-                    secrets: self.secrets,
-                },
-            )
+            .field("parent", &parent)
             .finish()
     }
 }
@@ -259,10 +266,13 @@ pub struct LocalExecutionPolicy {
     pub retention: ExecutionRetentionPolicy,
 }
 
-/// Local workspace location passed to the executor.
+/// Optional executor-side workspace location passed in the execution request.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspacePolicy {
-    pub parent: PathBuf,
+    /// An executor-environment path. `None` selects the executor's
+    /// platform/XDG default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<PathBuf>,
 }
 
 /// Retention settings in stable, platform-independent units.

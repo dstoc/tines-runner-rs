@@ -192,7 +192,7 @@ fn configured(
         .unwrap_or_default();
     let workspace_parent = directory.0.join("workspaces");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\n{wrapper}workspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\n{wrapper}executor_cwd = \"~\"\nworkspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
         workspace_parent,
         credentials_path
     ))

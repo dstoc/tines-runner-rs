@@ -451,7 +451,7 @@ fn explicit_configs_register_separate_runners_and_credentials() {
         fs::write(
             &config_path,
             format!(
-                "[server]\nurl = {server_url:?}\n[runner]\nname = {runner_name:?}\n[storage]\ncredentials_file = {credentials_value}\n"
+                "[server]\nurl = {server_url:?}\n[runner]\nname = {runner_name:?}\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {credentials_value}\n"
             ),
         )
         .expect("write selected runner config");
@@ -547,7 +547,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -609,7 +609,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("update runner config for restart");
@@ -660,7 +660,7 @@ fn daemon_uses_its_first_poll_to_authenticate_and_detect_fencing() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -723,7 +723,7 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -780,7 +780,7 @@ fn startup_fails_when_tines_is_unavailable() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = \"http://{address}\"\n[runner]\nname = \"cli-test-runner\"\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = \"http://{address}\"\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -845,7 +845,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nwrapper = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nexecutor_cwd = \"~\"\nwrapper = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
             serde_json::to_string(&wrapper_path.to_string_lossy().as_ref())
                 .expect("encode wrapper path"),
             workspace_parent,

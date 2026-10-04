@@ -38,14 +38,17 @@ pub struct WorkspaceRetention {
     pub max_count: usize,
 }
 
-/// Non-secret runner configuration after parsing and path expansion.
+/// Non-secret runner configuration after parsing and daemon-side path expansion.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub server_url: Url,
     pub runner_name: String,
     pub runner_type: RunnerType,
     pub workspace_parent: PathBuf,
-    /// An argv prefix. Entries are passed directly to process creation.
+    /// Unexpanded workspace path for the executor environment. `None` asks
+    /// the executor to use its platform/XDG default.
+    pub executor_workspace_parent: Option<PathBuf>,
+    /// Deprecated argv prefix for the legacy direct-Codex execution path.
     pub wrapper: Vec<String>,
     /// The argv prefix used to reach the local or isolated executor.
     pub executor: Vec<String>,
@@ -64,7 +67,10 @@ pub struct Config {
 pub struct ResolvedRunConfig {
     pub runner_type: RunnerType,
     pub workspace_parent: PathBuf,
-    /// An argv prefix. It is not a shell command.
+    /// Unexpanded workspace path for the executor environment. `None` asks
+    /// the executor to use its platform/XDG default.
+    pub executor_workspace_parent: Option<PathBuf>,
+    /// Deprecated argv prefix for the legacy direct-Codex execution path.
     pub wrapper: Vec<String>,
     /// The argv prefix used to reach the executor; `execute` is appended.
     pub executor: Vec<String>,
@@ -182,6 +188,7 @@ impl Config {
         let mut resolved = ResolvedRunConfig {
             runner_type: self.runner_type,
             workspace_parent: self.workspace_parent.clone(),
+            executor_workspace_parent: self.executor_workspace_parent.clone(),
             wrapper: self.wrapper.clone(),
             executor: self.executor.clone(),
             executor_cwd: self.executor_cwd.clone(),
@@ -198,6 +205,9 @@ impl Config {
             }
             if let Some(workspace_parent) = &rule.workspace_parent {
                 resolved.workspace_parent.clone_from(workspace_parent);
+            }
+            if let Some(workspace_parent) = &rule.executor_workspace_parent {
+                resolved.executor_workspace_parent = Some(workspace_parent.clone());
             }
             if let Some(wrapper) = &rule.wrapper {
                 resolved.wrapper.clone_from(wrapper);
@@ -241,6 +251,19 @@ impl Config {
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| ConfigError::Invalid("missing [runner].name".to_owned()))?;
+        if raw.runner.wrapper.is_some() {
+            tracing::warn!(
+                "[runner].wrapper is deprecated and applies only to the legacy direct-Codex path; configure the executor environment instead"
+            );
+        }
+        for (index, rule) in raw.overrides.iter().enumerate() {
+            if rule.wrapper.is_some() {
+                tracing::warn!(
+                    override_index = index + 1,
+                    "[[override]].wrapper is deprecated and applies only to the legacy direct-Codex path; configure the executor environment instead"
+                );
+            }
+        }
         let workspace_parent = expand_path(
             raw.runner
                 .workspace_parent
@@ -248,11 +271,14 @@ impl Config {
                 .unwrap_or(&defaults.workspace_parent),
             &defaults.home,
         )?;
+        let executor_workspace_parent = raw.runner.workspace_parent.clone();
         let executor_cwd = resolve_executor_cwd(
-            raw.runner
-                .executor_cwd
-                .as_deref()
-                .unwrap_or(&defaults.executor_cwd),
+            raw.runner.executor_cwd.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(
+                    "missing required [runner].executor_cwd; set the daemon-side working directory for the executor transport"
+                        .to_owned(),
+                )
+            })?,
             &defaults.home,
         )?;
         let credentials_file = expand_path(
@@ -306,6 +332,7 @@ impl Config {
                         .as_deref()
                         .map(|path| expand_path(path, &defaults.home))
                         .transpose()?,
+                    executor_workspace_parent: rule.workspace_parent,
                     runner_type: rule.runner_type,
                     wrapper: rule.wrapper,
                     executor: rule.executor,
@@ -323,6 +350,7 @@ impl Config {
             runner_name,
             runner_type: raw.runner.runner_type.unwrap_or(RunnerType::Codex),
             workspace_parent,
+            executor_workspace_parent,
             wrapper: raw.runner.wrapper.unwrap_or_default(),
             executor: raw
                 .runner
@@ -363,6 +391,7 @@ struct ConfigOverride {
     workflow: Option<String>,
     state: Option<String>,
     workspace_parent: Option<PathBuf>,
+    executor_workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     wrapper: Option<Vec<String>>,
     executor: Option<Vec<String>>,
@@ -447,7 +476,6 @@ struct DefaultPaths {
     config_dir: PathBuf,
     workspace_parent: PathBuf,
     credentials_file: PathBuf,
-    executor_cwd: PathBuf,
 }
 
 fn default_paths() -> Result<DefaultPaths, ConfigError> {
@@ -467,6 +495,29 @@ fn default_paths() -> Result<DefaultPaths, ConfigError> {
         env::var_os("APPDATA").map(PathBuf::from),
         env::var_os("LOCALAPPDATA").map(PathBuf::from),
     ))
+}
+
+/// Resolve a workspace path in the current executor environment.
+///
+/// An absent path selects the executor's platform/XDG default. A configured
+/// path is kept unexpanded by the daemon so that `~` resolves against the
+/// executor's home directory.
+pub fn resolve_executor_workspace_parent(path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    if let Some(path) = path
+        && path != Path::new("~")
+        && path.strip_prefix("~").is_err()
+    {
+        return Ok(path.to_path_buf());
+    }
+    let defaults = default_paths()?;
+    resolve_executor_workspace_parent_with_defaults(path, &defaults)
+}
+
+fn resolve_executor_workspace_parent_with_defaults(
+    path: Option<&Path>,
+    defaults: &DefaultPaths,
+) -> Result<PathBuf, ConfigError> {
+    expand_path(path.unwrap_or(&defaults.workspace_parent), &defaults.home)
 }
 
 fn default_paths_for(
@@ -506,7 +557,6 @@ fn default_paths_for(
         credentials_file: config_dir.join("credentials.toml"),
         config_dir,
         workspace_parent: data_dir.join("tines-runner-rs").join("workspaces"),
-        executor_cwd: home,
     }
 }
 
@@ -551,7 +601,6 @@ mod tests {
             config_dir: config_dir.clone(),
             workspace_parent: home.join(".local/share/tines-runner-rs/workspaces"),
             credentials_file: config_dir.join("credentials.toml"),
-            executor_cwd: home,
         }
     }
 
@@ -564,6 +613,7 @@ mod tests {
                 [runner]
                 name = "test-runner"
                 workspace_parent = "/default/workspaces"
+                executor_cwd = "/host/default"
                 wrapper = ["base-wrapper", "--"]
 
                 {overrides}
@@ -596,6 +646,82 @@ workspace_parent = "/project/workspaces"
                 PathBuf::from("/project/workspaces"),
                 PathBuf::from("/review/workspaces"),
             ]
+        );
+    }
+
+    #[test]
+    fn executor_workspace_paths_keep_tildes_and_use_executor_defaults() {
+        let config = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+workspace_parent = "~/work/base"
+executor_cwd = "/daemon/transport"
+[[override]]
+project = "Payments"
+workspace_parent = "~/work/payments"
+"#,
+            defaults(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.workspace_parent,
+            PathBuf::from("/home/tester/work/base")
+        );
+        assert_eq!(
+            config.executor_workspace_parent,
+            Some(PathBuf::from("~/work/base"))
+        );
+        let resolved = config.resolve(context("Payments", "Build", "Ready"));
+        assert_eq!(
+            resolved.workspace_parent,
+            PathBuf::from("/home/tester/work/payments")
+        );
+        assert_eq!(
+            resolved.executor_workspace_parent,
+            Some(PathBuf::from("~/work/payments"))
+        );
+
+        let executor_defaults = default_paths_for(
+            PathBuf::from("/executor/home"),
+            None,
+            Some(PathBuf::from("/executor/xdg-data")),
+            None,
+            None,
+        );
+        assert_eq!(
+            resolve_executor_workspace_parent_with_defaults(
+                config.executor_workspace_parent.as_deref(),
+                &executor_defaults,
+            )
+            .unwrap(),
+            PathBuf::from("/executor/home/work/base")
+        );
+        assert_eq!(
+            resolve_executor_workspace_parent_with_defaults(
+                resolved.executor_workspace_parent.as_deref(),
+                &executor_defaults,
+            )
+            .unwrap(),
+            PathBuf::from("/executor/home/work/payments")
+        );
+
+        let default_config = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+executor_cwd = "/daemon/transport"
+"#,
+            defaults(),
+        )
+        .unwrap();
+        assert_eq!(default_config.executor_workspace_parent, None);
+        assert_eq!(
+            resolve_executor_workspace_parent_with_defaults(None, &executor_defaults).unwrap(),
+            PathBuf::from("/executor/xdg-data/tines-runner-rs/workspaces")
         );
     }
 
@@ -734,7 +860,7 @@ wrapper = ["bin/wrapper", "; echo should-not-run"]
     }
 
     #[test]
-    fn executor_command_and_daemon_cwd_resolve_with_assignment_overrides() {
+    fn executor_command_and_daemon_cwd_resolve_with_project_override() {
         let config = parse_with_overrides(
             r#"[[override]]
 project = "Tines"
@@ -755,11 +881,51 @@ executor_cwd = "~/executor"
 
         let fallback = config.resolve(context("Other", "Build", "Implement"));
         assert_eq!(fallback.executor, ["tines-runner-rs"]);
-        assert_eq!(fallback.executor_cwd, PathBuf::from("/home/tester"));
+        assert_eq!(fallback.executor_cwd, PathBuf::from("/host/default"));
     }
 
     #[test]
-    fn relative_executor_cwd_resolves_under_home_and_empty_is_rejected() {
+    fn executor_and_daemon_cwd_resolve_by_project_workflow_and_state() {
+        let config = parse_with_overrides(
+            r#"[[override]]
+project = "Payments"
+executor = ["docker", "run", "--rm", "-i", "payments-image"]
+executor_cwd = "/host/payments"
+
+[[override]]
+workflow = "Implementation"
+executor = ["podman", "run", "--rm", "-i", "implementation-image"]
+executor_cwd = "~/implementation"
+
+[[override]]
+state = "Review"
+executor = ["docker", "run", "--rm", "-i", "review-image"]
+executor_cwd = "review"
+"#,
+        );
+
+        let project = config.resolve(context("payments", "Build", "Ready"));
+        assert_eq!(project.executor[0], "docker");
+        assert_eq!(project.executor_cwd, PathBuf::from("/host/payments"));
+
+        let workflow = config.resolve(context("Other", "implementation", "Ready"));
+        assert_eq!(workflow.executor[0], "podman");
+        assert_eq!(
+            workflow.executor_cwd,
+            PathBuf::from("/home/tester/implementation")
+        );
+
+        let state = config.resolve(context("Other", "Build", "review"));
+        assert_eq!(state.executor[0], "docker");
+        assert_eq!(state.executor_cwd, PathBuf::from("/home/tester/review"));
+
+        let fallback = config.resolve(context("Other", "Build", "Ready"));
+        assert_eq!(fallback.executor, ["tines-runner-rs"]);
+        assert_eq!(fallback.executor_cwd, PathBuf::from("/host/default"));
+    }
+
+    #[test]
+    fn explicit_executor_cwd_resolves_under_home_and_empty_is_rejected() {
         let config = Config::from_toml_str_with_defaults(
             r#"[server]
 url = "https://tines.example.test"
@@ -786,6 +952,40 @@ executor_cwd = ""
     }
 
     #[test]
+    fn executor_cwd_is_required_without_an_implicit_default() {
+        let error = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+"#,
+            defaults(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required [runner].executor_cwd")
+        );
+    }
+
+    #[test]
+    fn native_executor_uses_explicit_daemon_cwd() {
+        let config = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "native-runner"
+executor_cwd = "/srv/tines-runner"
+"#,
+            defaults(),
+        )
+        .unwrap();
+        assert_eq!(config.executor, ["tines-runner-rs"]);
+        assert_eq!(config.executor_cwd, PathBuf::from("/srv/tines-runner"));
+    }
+
+    #[test]
     fn defaults_and_tilde_expansion_are_predictable() {
         let config = Config::from_toml_str_with_defaults(
             r#"
@@ -793,6 +993,7 @@ executor_cwd = ""
                 url = "https://tines.example.test"
                 [runner]
                 name = "test-runner"
+                executor_cwd = "~/daemon"
                 workspace_parent = "~/workspaces"
                 [storage]
                 credentials_file = "~/credentials/runner.toml"
@@ -830,6 +1031,7 @@ executor_cwd = ""
                 name = "workstation"
                 runner_type = "codex"
                 workspace_parent = "~/runner-workspaces"
+                executor_cwd = "~/daemon"
                 wrapper = ["/usr/local/bin/codex-wrapper", "--trace"]
                 max_concurrent = 4
                 poll_interval_seconds = 9
@@ -855,6 +1057,7 @@ executor_cwd = ""
             config.workspace_parent,
             PathBuf::from("/home/tester/runner-workspaces")
         );
+        assert_eq!(config.executor_cwd, PathBuf::from("/home/tester/daemon"));
         assert_eq!(config.wrapper, ["/usr/local/bin/codex-wrapper", "--trace"]);
         assert_eq!(config.max_concurrent, 4);
         assert!(config.allow_remote_concurrency);
@@ -902,6 +1105,7 @@ executor_cwd = ""
                 url = "https://tines.example.test"
                 [runner]
                 name = "test-runner"
+                executor_cwd = "~/daemon"
             "#,
             defaults.clone(),
         )
@@ -936,6 +1140,7 @@ executor_cwd = ""
             url = "https://tines.example.test"
             [runner]
             name = "test-runner"
+            executor_cwd = "~/daemon"
             runner_type = "claude"
         "#;
         assert!(Config::from_toml_str_with_defaults(non_codex, defaults()).is_err());
@@ -945,6 +1150,7 @@ executor_cwd = ""
             url = "https://tines.example.test"
             [runner]
             name = "test-runner"
+            executor_cwd = "~/daemon"
             max_concurrent = 0
         "#;
         assert!(Config::from_toml_str_with_defaults(zero_concurrency, defaults()).is_err());
