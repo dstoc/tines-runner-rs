@@ -269,6 +269,12 @@ On Unix, run the protocol acceptance suite with
 `cargo test --test fake_tines_integration`; it needs Git and `curl`, but not a
 live Tines instance.
 
+On Unix, run `cargo test --test isolated_executor_transport` to exercise the
+daemon through a separate local transport process. It covers executor working
+directory overrides, environment isolation, capability discovery, protocol
+streams, cancellation, and timeout without Docker or Podman. It needs Python 3
+and Git, but not a live Tines instance or a container runtime.
+
 ## Releases
 
 The release workflow targets Linux x86_64. When a tagged version is
