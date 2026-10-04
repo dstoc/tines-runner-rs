@@ -7,7 +7,7 @@
 //! start time; Windows identities include process creation time to reject a
 //! reused PID.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -185,6 +185,9 @@ pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     /// Bytes written to stderr by the child and its descendants.
     pub stderr: Vec<u8>,
+    /// Error while writing an optional stdin payload, if the child closed its
+    /// input before the payload was complete.
+    pub stdin_error: Option<String>,
 }
 
 /// The pipe that produced one streamed process chunk.
@@ -237,6 +240,7 @@ pub struct SupervisedProcess {
     identity: ProcessIdentity,
     stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stdin_writer: Option<JoinHandle<io::Result<()>>>,
     output: Option<Receiver<(ProcessStream, Vec<u8>)>>,
     #[cfg(unix)]
     finished: bool,
@@ -252,7 +256,7 @@ impl SupervisedProcess {
     /// The returned identity is captured before this method returns, so callers
     /// can persist it before awaiting the command.
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
-        Self::spawn_inner(command, None, true)
+        Self::spawn_inner(command, None, true, None)
     }
 
     /// Start a command that streams bounded output chunks to `sender` instead
@@ -262,14 +266,23 @@ impl SupervisedProcess {
         command: &mut Command,
         sender: SyncSender<(ProcessStream, Vec<u8>)>,
     ) -> io::Result<Self> {
-        Self::spawn_inner(command, Some(sender), false)
+        Self::spawn_inner(command, Some(sender), false, None)
     }
 
     /// Start a command and make stdout/stderr chunks available while it runs.
     /// The bounded channel applies backpressure if the caller cannot keep up.
     pub fn spawn_with_output(command: &mut Command) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(16);
-        let mut process = Self::spawn_inner(command, Some(sender), false)?;
+        let mut process = Self::spawn_inner(command, Some(sender), false, None)?;
+        process.output = Some(receiver);
+        Ok(process)
+    }
+
+    /// Start a command with one complete stdin payload and live output pipes.
+    /// The payload is written on a separate thread, then stdin is closed.
+    pub fn spawn_with_stdin_and_output(command: &mut Command, input: Vec<u8>) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(16);
+        let mut process = Self::spawn_inner(command, Some(sender), false, Some(input))?;
         process.output = Some(receiver);
         Ok(process)
     }
@@ -278,9 +291,13 @@ impl SupervisedProcess {
         command: &mut Command,
         output_sender: Option<SyncSender<(ProcessStream, Vec<u8>)>>,
         capture_output: bool,
+        stdin_bytes: Option<Vec<u8>>,
     ) -> io::Result<Self> {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
+        if stdin_bytes.is_some() {
+            command.stdin(Stdio::piped());
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         command.process_group(0);
@@ -340,11 +357,47 @@ impl SupervisedProcess {
             }
         };
 
+        let stdin_writer = if let Some(input) = stdin_bytes {
+            let Some(stdin) = child.stdin.take() else {
+                #[cfg(unix)]
+                let _ = signal_unix_group(child.id(), SIGKILL);
+                #[cfg(windows)]
+                let _ = job.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout.join();
+                let _ = stderr.join();
+                return Err(io::Error::other("child stdin pipe was not created"));
+            };
+            match thread::Builder::new()
+                .name("runner-child-stdin".to_owned())
+                .spawn(move || {
+                    let mut stdin = stdin;
+                    stdin.write_all(&input)
+                }) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    #[cfg(unix)]
+                    let _ = signal_unix_group(child.id(), SIGKILL);
+                    #[cfg(windows)]
+                    let _ = job.terminate();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout.join();
+                    let _ = stderr.join();
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             child,
             identity,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            stdin_writer,
             output: None,
             #[cfg(unix)]
             finished: false,
@@ -617,6 +670,14 @@ impl SupervisedProcess {
                 .take()
                 .ok_or_else(|| io::Error::other("child stderr reader was already joined"))?,
         )?;
+        let stdin_error = self
+            .stdin_writer
+            .take()
+            .and_then(|writer| match writer.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("executor request writer thread panicked".to_owned()),
+            });
         Ok(ProcessOutput {
             exit: process_exit(status),
             timed_out,
@@ -624,6 +685,7 @@ impl SupervisedProcess {
             interrupted,
             stdout,
             stderr,
+            stdin_error,
         })
     }
 }
@@ -661,6 +723,9 @@ impl Drop for SupervisedProcess {
         }
         if let Some(stderr) = self.stderr.take() {
             let _ = stderr.join();
+        }
+        if let Some(stdin_writer) = self.stdin_writer.take() {
+            let _ = stdin_writer.join();
         }
     }
 }
@@ -1700,6 +1765,7 @@ mod tests {
             interrupted: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stdin_error: None,
         };
         assert_eq!(
             output.format_exit_diagnostic(Duration::from_secs(61)),

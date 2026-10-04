@@ -47,6 +47,10 @@ pub struct Config {
     pub workspace_parent: PathBuf,
     /// An argv prefix. Entries are passed directly to process creation.
     pub wrapper: Vec<String>,
+    /// The argv prefix used to reach the local or isolated executor.
+    pub executor: Vec<String>,
+    /// The daemon-side working directory for the executor transport process.
+    pub executor_cwd: PathBuf,
     pub max_concurrent: usize,
     pub allow_remote_concurrency: bool,
     pub poll_interval: Duration,
@@ -62,6 +66,10 @@ pub struct ResolvedRunConfig {
     pub workspace_parent: PathBuf,
     /// An argv prefix. It is not a shell command.
     pub wrapper: Vec<String>,
+    /// The argv prefix used to reach the executor; `execute` is appended.
+    pub executor: Vec<String>,
+    /// Absolute daemon-side working directory for the executor process.
+    pub executor_cwd: PathBuf,
 }
 
 /// Names used to select assignment-specific overrides.
@@ -175,6 +183,8 @@ impl Config {
             runner_type: self.runner_type,
             workspace_parent: self.workspace_parent.clone(),
             wrapper: self.wrapper.clone(),
+            executor: self.executor.clone(),
+            executor_cwd: self.executor_cwd.clone(),
         };
         let mut matching_overrides = Vec::new();
 
@@ -191,6 +201,12 @@ impl Config {
             }
             if let Some(wrapper) = &rule.wrapper {
                 resolved.wrapper.clone_from(wrapper);
+            }
+            if let Some(executor) = &rule.executor {
+                resolved.executor.clone_from(executor);
+            }
+            if let Some(executor_cwd) = &rule.executor_cwd {
+                resolved.executor_cwd.clone_from(executor_cwd);
             }
         }
 
@@ -232,6 +248,13 @@ impl Config {
                 .unwrap_or(&defaults.workspace_parent),
             &defaults.home,
         )?;
+        let executor_cwd = resolve_executor_cwd(
+            raw.runner
+                .executor_cwd
+                .as_deref()
+                .unwrap_or(&defaults.executor_cwd),
+            &defaults.home,
+        )?;
         let credentials_file = expand_path(
             raw.storage
                 .credentials_file
@@ -267,6 +290,8 @@ impl Config {
                 if rule.workspace_parent.is_none()
                     && rule.runner_type.is_none()
                     && rule.wrapper.is_none()
+                    && rule.executor.is_none()
+                    && rule.executor_cwd.is_none()
                 {
                     return Err(ConfigError::Invalid(
                         "each [[override]] must set at least one override value".to_owned(),
@@ -283,6 +308,12 @@ impl Config {
                         .transpose()?,
                     runner_type: rule.runner_type,
                     wrapper: rule.wrapper,
+                    executor: rule.executor,
+                    executor_cwd: rule
+                        .executor_cwd
+                        .as_deref()
+                        .map(|path| resolve_executor_cwd(path, &defaults.home))
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
@@ -293,6 +324,11 @@ impl Config {
             runner_type: raw.runner.runner_type.unwrap_or(RunnerType::Codex),
             workspace_parent,
             wrapper: raw.runner.wrapper.unwrap_or_default(),
+            executor: raw
+                .runner
+                .executor
+                .unwrap_or_else(|| vec!["tines-runner-rs".to_owned()]),
+            executor_cwd,
             max_concurrent,
             allow_remote_concurrency: raw.runner.allow_remote_concurrency,
             poll_interval: Duration::from_secs(poll_interval_seconds),
@@ -329,6 +365,8 @@ struct ConfigOverride {
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     wrapper: Option<Vec<String>>,
+    executor: Option<Vec<String>>,
+    executor_cwd: Option<PathBuf>,
 }
 
 impl ConfigOverride {
@@ -373,6 +411,8 @@ struct RawRunner {
     runner_type: Option<RunnerType>,
     workspace_parent: Option<PathBuf>,
     wrapper: Option<Vec<String>>,
+    executor: Option<Vec<String>>,
+    executor_cwd: Option<PathBuf>,
     max_concurrent: Option<usize>,
     #[serde(default)]
     allow_remote_concurrency: bool,
@@ -397,6 +437,8 @@ struct RawOverride {
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     wrapper: Option<Vec<String>>,
+    executor: Option<Vec<String>>,
+    executor_cwd: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +447,7 @@ struct DefaultPaths {
     config_dir: PathBuf,
     workspace_parent: PathBuf,
     credentials_file: PathBuf,
+    executor_cwd: PathBuf,
 }
 
 fn default_paths() -> Result<DefaultPaths, ConfigError> {
@@ -459,10 +502,25 @@ fn default_paths_for(
         absolute_path(xdg_data_home).unwrap_or_else(|| home.join(".local").join("share"));
 
     DefaultPaths {
-        home,
+        home: home.clone(),
         credentials_file: config_dir.join("credentials.toml"),
         config_dir,
         workspace_parent: data_dir.join("tines-runner-rs").join("workspaces"),
+        executor_cwd: home,
+    }
+}
+
+fn resolve_executor_cwd(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid(
+            "[runner].executor_cwd must not be empty".to_owned(),
+        ));
+    }
+    let expanded = expand_path(path, home)?;
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(home.join(expanded))
     }
 }
 
@@ -493,6 +551,7 @@ mod tests {
             config_dir: config_dir.clone(),
             workspace_parent: home.join(".local/share/tines-runner-rs/workspaces"),
             credentials_file: config_dir.join("credentials.toml"),
+            executor_cwd: home,
         }
     }
 
@@ -672,6 +731,58 @@ wrapper = ["bin/wrapper", "; echo should-not-run"]
         config.overrides.clear();
 
         assert_eq!(resolved.wrapper, ["bin/wrapper", "; echo should-not-run"]);
+    }
+
+    #[test]
+    fn executor_command_and_daemon_cwd_resolve_with_assignment_overrides() {
+        let config = parse_with_overrides(
+            r#"[[override]]
+project = "Tines"
+executor = ["docker", "run", "--rm", "-i", "runner-image"]
+executor_cwd = "~/executor"
+"#,
+        );
+
+        let resolved = config.resolve(context("tines", "Build", "Implement"));
+        assert_eq!(
+            resolved.executor,
+            ["docker", "run", "--rm", "-i", "runner-image"]
+        );
+        assert_eq!(
+            resolved.executor_cwd,
+            PathBuf::from("/home/tester/executor")
+        );
+
+        let fallback = config.resolve(context("Other", "Build", "Implement"));
+        assert_eq!(fallback.executor, ["tines-runner-rs"]);
+        assert_eq!(fallback.executor_cwd, PathBuf::from("/home/tester"));
+    }
+
+    #[test]
+    fn relative_executor_cwd_resolves_under_home_and_empty_is_rejected() {
+        let config = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+executor_cwd = "executor"
+"#,
+            defaults(),
+        )
+        .unwrap();
+        assert_eq!(config.executor_cwd, PathBuf::from("/home/tester/executor"));
+
+        let error = Config::from_toml_str_with_defaults(
+            r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+executor_cwd = ""
+"#,
+            defaults(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("executor_cwd must not be empty"));
     }
 
     #[test]

@@ -73,6 +73,8 @@ url = "https://tines.example.com"
 [runner]
 name = "workstation-codex"
 runner_type = "codex"
+executor = ["tines-runner-rs"]
+executor_cwd = "~"
 max_concurrent = 1
 poll_interval_seconds = 15
 
@@ -168,6 +170,8 @@ The main settings are:
 | `[runner].runner_type` | Harness type. Only `codex` is supported. |
 | `[runner].workspace_parent` | Parent directory for assignment workspaces. |
 | `[runner].wrapper` | Optional argument array prepended to the Codex command. It is run directly, without a shell. |
+| `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
+| `[runner].executor_cwd` | Required working directory for the daemon-side executor process. Defaults to the daemon account's home directory. Relative paths resolve from that directory. |
 | `[runner].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
 | `[runner].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |
 | `[runner].allow_remote_concurrency` | Allow Tines to change the runner's concurrency. Defaults to `false`. |
@@ -176,10 +180,11 @@ The main settings are:
 | `[storage].keep_workspaces_for_hours` | Maximum age for retained workspaces. Defaults to `72` hours. |
 | `[storage].keep_workspaces_max` | Maximum number of retained workspaces. Defaults to `20`. |
 
-Use `[[override]]` entries to change a workspace parent, runner type, or
-wrapper for matching assignments. Each selector is optional. Every selector
-in one entry must match. Names match exactly and without regard to case.
-Entries apply in file order; later entries replace only the fields they set.
+Use `[[override]]` entries to change a workspace parent, runner type, wrapper,
+executor command, or executor working directory for matching assignments.
+Each selector is optional. Every selector in one entry must match. Names match
+exactly and without regard to case. Entries apply in file order; later entries
+replace only the fields they set.
 
 ```toml
 # Use a separate workspace root and wrapper for matching assignments.
@@ -189,10 +194,14 @@ workflow = "Implementation"
 state = "Ready"
 workspace_parent = "~/work/payments"
 wrapper = ["/usr/local/bin/codex-profile", "--name", "implementation"]
+executor = ["docker", "run", "--rm", "-i", "runner-image"]
+executor_cwd = "/var/lib/tines-runner-rs"
 ```
 
 Every selector in this entry must match. A wrapper is an argument array, not
-a shell command string.
+a shell command string. The executor working directory belongs to the daemon
+transport; it is not sent in the execution request. `workspace_parent` is sent
+to the executor and is interpreted in the executor environment.
 
 ## Workspace retention
 
