@@ -1079,6 +1079,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
     directory.configure_command(&mut command);
+    command.env("PATH", "/usr/bin:/bin");
     let mut runner = RunnerGuard {
         child: command
             .env_remove("TINES_API_KEY")
@@ -1093,7 +1094,10 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(descendant_path.exists(), "harness descendant did not start");
+    assert!(
+        descendant_path.exists(),
+        "executor descendant did not start"
+    );
     let descendant = fs::read_to_string(&descendant_path)
         .expect("read descendant PID")
         .trim()
