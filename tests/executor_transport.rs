@@ -79,6 +79,7 @@ fn request(prompt: String) -> ExecutionRequest {
         },
         execution: LocalExecutionPolicy {
             harness: "codex".to_owned(),
+            custom_command: None,
             workspace: WorkspacePolicy {
                 parent: Some(PathBuf::from("/executor/workspaces")),
             },

@@ -4,7 +4,7 @@ use std::fmt;
 use std::process::Command;
 
 use crate::effort::EffortCapabilities;
-use crate::execution_protocol::{ExecutionEvent, ExecutionRequest};
+use crate::execution_protocol::{ExecutionEvent, ExecutionEventKind, ExecutionRequest};
 use crate::executor::workspace::MaterializedWorkspace;
 
 /// Select an adapter from the semantic harness identifier in an execution
@@ -12,6 +12,7 @@ use crate::executor::workspace::MaterializedWorkspace;
 pub fn adapter_for(identifier: &str) -> Result<Box<dyn HarnessAdapter>, UnsupportedHarness> {
     match identifier {
         "codex" => Ok(Box::new(crate::executor::codex_adapter::CodexAdapter)),
+        "custom" => Ok(Box::new(crate::executor::custom_adapter::CustomAdapter)),
         _ => Err(UnsupportedHarness),
     }
 }
@@ -78,6 +79,17 @@ pub struct HarnessExit {
 /// Native stream parser that returns only versioned, harness-neutral events.
 pub trait HarnessEventParser: Send {
     fn push(&mut self, chunk: &str) -> Vec<ExecutionEvent>;
+    /// Translate stderr while retaining any bounded diagnostic context needed
+    /// to describe a failed process.
+    fn push_stderr(&mut self, chunk: &str) -> Vec<ExecutionEvent> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        vec![ExecutionEvent::new(ExecutionEventKind::Log {
+            stream: crate::execution_protocol::LogStream::Stderr,
+            message: chunk.to_owned(),
+        })]
+    }
     fn finish(&mut self) -> Vec<ExecutionEvent>;
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent;
 }

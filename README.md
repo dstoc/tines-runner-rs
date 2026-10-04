@@ -7,9 +7,10 @@ status to Tines. The executor creates the workspace, checks out assigned Git
 repositories, and runs the selected harness. The executor can run on the
 daemon host or inside a container.
 
-Codex is the only supported harness. The runner makes outbound connections to
-Tines and Git remotes; it does not need an inbound connection. It does not
-install or update Codex, manage a service, or update itself.
+The runner supports Codex and a generic custom command harness. It makes
+outbound connections to Tines and Git remotes; it does not need an inbound
+connection. It does not install or update harness tools, manage a service, or
+update itself.
 
 ## Install
 
@@ -42,11 +43,11 @@ The daemon account needs:
   file exists.
 
 The executor environment needs Git, credentials for assigned repositories,
-and network access to Git remotes. It also needs Codex. For native execution,
-install and authenticate Git and Codex for the daemon account. For container
-execution, configure them inside the container. Service managers and
-containers often use a different `PATH` and credentials than an interactive
-shell.
+and network access to Git remotes. It also needs the selected harness command.
+For native execution, install and configure Git and that command for the
+daemon account. For container execution, configure them inside the container.
+Service managers and containers often use a different `PATH` and credentials
+than an interactive shell.
 
 ## Quick start
 
@@ -84,8 +85,8 @@ keep_workspaces = "never"
 ```
 
 `[server].url` and `[runner].name` are required. The runner type defaults to
-`codex`; it is the only supported type. The daemon expands `~` in its paths,
-including `executor_cwd` and `credentials_file`. It sends the configured
+`codex`. Set it to `custom` to run a configured command. The daemon expands
+`~` in its paths, including `executor_cwd` and `credentials_file`. It sends the configured
 `workspace_parent` to the executor, which resolves it in its own environment.
 If it is omitted, the executor uses its platform default. Unknown settings
 cause startup to fail.
@@ -174,7 +175,8 @@ The main settings are:
 | --- | --- |
 | `[server].url` | Tines instance URL. Required; must use HTTP or HTTPS. |
 | `[runner].name` | Name used to register this runner. Required. |
-| `[runner].runner_type` | Harness type. Only `codex` is supported. |
+| `[runner].runner_type` | Harness type: `codex` or `custom`. Defaults to `codex`. |
+| `[runner].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
 | `[runner].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
 | `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
 | `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
@@ -244,14 +246,16 @@ container exits.
 
 Capability discovery also crosses the executor boundary. The daemon invokes
 the configured executor in `capabilities` mode and caches its versioned
-report for ten minutes. The native executor discovers Codex on the daemon
-account's `PATH`; a container executor discovers Codex inside the container.
-The daemon refreshes the report before it accepts assignments with enforced
-effort. An invalid report or unsupported harness or effort causes the daemon
-to decline the incompatible assignment.
+report for ten minutes. The report includes the built-in custom harness. The
+native executor discovers Codex on the daemon account's `PATH`; a container
+executor discovers Codex inside the container. Custom commands do not support
+Codex model effort settings. The daemon refreshes the report before it accepts
+assignments with enforced effort. An invalid report or unsupported harness or
+effort causes the daemon to decline the incompatible assignment.
 
-Use `[[override]]` entries to change a workspace parent, runner type, executor
-command, or executor working directory for matching assignments.
+Use `[[override]]` entries to change a workspace parent, runner type, custom
+harness command, executor command, or executor working directory for matching
+assignments.
 Each selector is optional. Every selector in one entry must match. Names match
 exactly and without regard to case. Entries apply in file order; later entries
 replace only the fields they set.
@@ -284,6 +288,42 @@ propagate stdin, stdout, stderr, exit status, and termination. Detached Docker
 and Podman modes are unsupported. Use attached commands such as
 `docker run --rm -i ...` and mount any retained executor workspace storage into
 the container.
+
+Custom harness commands are argv arrays. The runner starts them directly
+without a shell and sets their working directory to the assignment workspace.
+Use `{prompt_file}` for the workspace's `prompt.md` path and `{workspace}` for
+the workspace path. The runner replaces these placeholders inside each argv
+item. It passes the Tines run key as `TINES_API_KEY`, the Tines instance URL as
+`TINES_API_URL`, and delivered assignment environment values as environment
+variables. Assignment values cannot override `PATH` or the two Tines API
+variables. The runner removes inherited `TINES_RUNNER_TOKEN` and
+`TYPESAFE_API_KEY` values before it starts the harness. Values marked secret
+use the same output redaction as Codex.
+
+One runner registration can select different commands by project, workflow,
+or state. The command must be available on the executor's `PATH` or use an
+absolute path:
+
+```toml
+[runner]
+runner_type = "custom"
+custom_command = ["default-checks", "{prompt_file}"]
+
+[[override]]
+project = "Payments"
+custom_command = ["github-checks", "--prompt-file", "{prompt_file}", "--workspace", "{workspace}"]
+
+[[override]]
+state = "Review"
+custom_command = ["review-checks", "{workspace}"]
+```
+
+Selectors are optional and match with the existing exact, case-insensitive
+rules. Entries apply in declaration order. Each entry replaces only fields it
+sets, so a later matching entry replaces the custom command when it sets one.
+Custom command stdout and stderr become Tines run logs. Exit code `0`
+completes the run. Other exit statuses fail it and include bounded stderr
+context in the failure diagnostic.
 
 The `wrapper` setting is no longer supported. Move transport arguments such
 as Docker or Podman to `executor` and set `executor_cwd`. To use a Codex

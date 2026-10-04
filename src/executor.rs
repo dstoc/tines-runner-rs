@@ -26,6 +26,7 @@ use crate::shutdown::ShutdownSignal;
 pub mod codex;
 pub mod codex_adapter;
 pub mod codex_stream;
+pub mod custom_adapter;
 pub mod harness;
 pub mod workspace;
 
@@ -238,17 +239,13 @@ pub fn execute_request(
                                         }
                                         ProcessStream::Stderr => {
                                             let message = stderr_decoder.push(&chunk.bytes);
-                                            if !message.is_empty() {
-                                                streamed_error = write_event(
-                                                    request,
-                                                    output,
-                                                    &ExecutionEvent::new(ExecutionEventKind::Log {
-                                                        stream: LogStream::Stderr,
-                                                        message,
-                                                    }),
-                                                )
-                                                .err()
-                                                .map(|error| error.to_string());
+                                            for event in parser.push_stderr(&message) {
+                                                if let Err(error) =
+                                                    write_event(request, output, &event)
+                                                {
+                                                    streamed_error = Some(error.to_string());
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -276,17 +273,15 @@ pub fn execute_request(
                                             }
                                         }
                                         let stderr_tail = stderr_decoder.finish();
-                                        if streamed_error.is_none() && !stderr_tail.is_empty() {
-                                            streamed_error = write_event(
-                                                request,
-                                                output,
-                                                &ExecutionEvent::new(ExecutionEventKind::Log {
-                                                    stream: LogStream::Stderr,
-                                                    message: stderr_tail,
-                                                }),
-                                            )
-                                            .err()
-                                            .map(|error| error.to_string());
+                                        if streamed_error.is_none() {
+                                            for event in parser.push_stderr(&stderr_tail) {
+                                                if let Err(error) =
+                                                    write_event(request, output, &event)
+                                                {
+                                                    streamed_error = Some(error.to_string());
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
 

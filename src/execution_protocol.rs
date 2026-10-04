@@ -53,6 +53,19 @@ impl ExecutionRequest {
         {
             return Err(ProtocolError::InvalidRequest);
         }
+        if self.execution.harness == "custom"
+            && self
+                .execution
+                .custom_command
+                .as_ref()
+                .is_none_or(|command| {
+                    command.is_empty()
+                        || command[0].trim().is_empty()
+                        || command.iter().any(|argument| argument.contains('\0'))
+                })
+        {
+            return Err(ProtocolError::InvalidRequest);
+        }
         Ok(())
     }
 
@@ -192,6 +205,10 @@ impl fmt::Debug for RedactedExecution<'_> {
                 },
             )
             .field("retention", &self.policy.retention)
+            .field(
+                "custom_command",
+                &self.policy.custom_command.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -260,8 +277,11 @@ pub struct TinesExecutionContext {
 /// Execution policy resolved by the daemon for this assignment.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalExecutionPolicy {
-    /// Semantic harness name, such as `codex`; this is not an executable path.
+    /// Semantic harness name, such as `codex` or `custom`.
     pub harness: String,
+    /// Resolved argv for the custom harness. This is not interpreted by a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_command: Option<Vec<String>>,
     pub workspace: WorkspacePolicy,
     pub retention: ExecutionRetentionPolicy,
 }

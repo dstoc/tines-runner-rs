@@ -290,6 +290,37 @@ keep_workspaces_max = 17
 }
 
 #[test]
+fn execution_request_carries_the_resolved_custom_harness_argv() {
+    let (server_url, server) = issue_server(1);
+    let config = Config::from_toml_str(
+        r#"[server]
+url = "http://127.0.0.1:1"
+[runner]
+name = "custom-execution-request-test"
+runner_type = "custom"
+custom_command = ["checks", "{prompt_file}"]
+executor_cwd = "/host/daemon"
+[[override]]
+project = "Tines"
+custom_command = ["project-checks", "{workspace}"]
+"#,
+    )
+    .expect("parse custom harness configuration");
+    let client =
+        Client::with_timeout(&server_url, Duration::from_secs(5)).expect("create issue client");
+    let resolved =
+        resolve_assignment(&config, &client, &assignment()).expect("resolve assignment metadata");
+    let request = execution_request(&resolved, &server_url, &config.workspace_retention);
+    server.join().expect("issue detail request");
+
+    assert_eq!(request.execution.harness, "custom");
+    assert_eq!(
+        request.execution.custom_command,
+        Some(vec!["project-checks".to_owned(), "{workspace}".to_owned()])
+    );
+}
+
+#[test]
 fn execution_request_preserves_executor_tilde_paths_and_omits_its_default() {
     let (server_url, server) = issue_server(3);
     let cases = [
