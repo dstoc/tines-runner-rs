@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Child;
@@ -86,13 +88,20 @@ impl Drop for TestDirectory {
 }
 
 fn run_executor(input: &[u8]) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
+    run_executor_with_path(input, None)
+}
+
+fn run_executor_with_path(input: &[u8], path: Option<std::ffi::OsString>) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command
         .arg("execute")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start executor CLI");
+        .stderr(Stdio::piped());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let mut child = command.spawn().expect("start executor CLI");
     child
         .stdin
         .take()
@@ -100,6 +109,26 @@ fn run_executor(input: &[u8]) -> std::process::Output {
         .write_all(input)
         .expect("write executor request");
     child.wait_with_output().expect("wait for executor CLI")
+}
+
+#[cfg(unix)]
+fn run_executor_with_codex(
+    input: &[u8],
+    directory: &TestDirectory,
+    script: &str,
+) -> std::process::Output {
+    let bin_directory = directory.0.join("executor-bin");
+    fs::create_dir_all(&bin_directory).expect("create executor bin directory");
+    let codex = bin_directory.join("codex");
+    fs::write(&codex, script).expect("write Codex stub");
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
+        .expect("make Codex stub executable");
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin_directory).chain(std::env::split_paths(&current_path)),
+    )
+    .expect("compose executor PATH");
+    run_executor_with_path(input, Some(path))
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
@@ -282,8 +311,9 @@ fn version_flag_reports_package_version() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn execute_accepts_one_request_without_writing_to_stdout() {
+fn execute_runs_harness_and_emits_one_terminal_protocol_result() {
     let directory = TestDirectory::new();
     let workspace_parent = directory.0.join("executor-workspaces");
     let mut fixture: serde_json::Value =
@@ -291,15 +321,36 @@ fn execute_accepts_one_request_without_writing_to_stdout() {
             .expect("valid execution request fixture");
     fixture["execution"]["workspace"]["parent"] =
         serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
-    let output = run_executor(fixture.to_string().as_bytes());
+    fixture["execution"]["retention"]["mode"] = serde_json::Value::String("never".to_owned());
+    fixture["assignment"]["effort"] = serde_json::Value::Null;
+    let output = run_executor_with_codex(
+        fixture.to_string().as_bytes(),
+        &directory,
+        "#!/bin/sh\nexit 0\n",
+    );
 
     assert!(
         output.status.success(),
         "execute rejected a valid request: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+    let mut parser = ExecutionEventParser::default();
+    let events = parser
+        .push(&output.stdout)
+        .expect("executor output should be JSONL");
+    assert!(parser.finish().unwrap().is_none());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::Result { .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        events.last().map(|event| &event.kind),
+        Some(ExecutionEventKind::Result { result }) if result.status == TerminalStatus::Completed
+    ));
     assert!(
         fs::read_dir(workspace_parent)
             .expect("executor creates its selected workspace parent")
@@ -333,10 +384,15 @@ fn execute_reports_workspace_failures_as_protocol_results_without_tines_calls() 
         .push(&output.stdout)
         .expect("executor failure should be JSONL");
     assert!(parser.finish().unwrap().is_none());
-    assert_eq!(events.len(), 1);
-    let ExecutionEventKind::Result { result } = &events[0].kind else {
-        panic!("workspace failure should produce a result event");
-    };
+    let results = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ExecutionEventKind::Result { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    let result = results[0];
     assert_eq!(result.status, TerminalStatus::Failed);
     assert!(
         result
@@ -384,10 +440,15 @@ fn execute_redacts_escaped_secret_values_in_clone_failure_results() {
             .push(&output.stdout)
             .expect("executor failure should be JSONL");
         assert!(parser.finish().unwrap().is_none());
-        assert_eq!(events.len(), 1);
-        let ExecutionEventKind::Result { result } = &events[0].kind else {
-            panic!("workspace failure should produce a result event");
-        };
+        let results = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Result { result } => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        let result = results[0];
         let error = result.error.as_deref().expect("failure result has error");
         let rust_escaped = format!("{secret:?}");
         let rust_escaped = &rust_escaped[1..rust_escaped.len() - 1];

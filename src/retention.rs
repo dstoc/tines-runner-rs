@@ -26,7 +26,7 @@ pub struct RetainedWorkspaceMarker {
     pub retained_at: u64,
 }
 
-/// Apply the configured retention policy after Tines accepts a terminal report.
+/// Apply the configured retention policy to a locally settled run.
 ///
 /// A workspace selected for retention receives its marker before pruning runs.
 /// A workspace that is not retained is removed as the known, settled run
