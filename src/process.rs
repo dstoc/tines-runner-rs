@@ -1999,28 +1999,71 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const ESRCH_ERRNO: i32 = 3;
+
+    #[cfg(target_os = "linux")]
+    fn is_missing_process_error(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH_ERRNO)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn descendant_is_stopped(process_id: u32) -> io::Result<bool> {
+        match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+            Ok(stat) => {
+                let state = stat
+                    .rsplit_once(") ")
+                    .expect("valid proc stat record")
+                    .1
+                    .chars()
+                    .next()
+                    .expect("process state");
+                Ok(state == 'Z')
+            }
+            Err(error) if is_missing_process_error(&error) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_descendant_stopped(process_id: u32) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match fs::read_to_string(format!("/proc/{process_id}/stat")) {
-                Ok(stat) => {
-                    let state = stat
-                        .rsplit_once(") ")
-                        .expect("valid proc stat record")
-                        .1
-                        .chars()
-                        .next()
-                        .expect("process state");
-                    if state == 'Z' {
-                        return;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            match descendant_is_stopped(process_id) {
+                Ok(true) => return,
+                Ok(false) => {}
                 Err(error) => panic!("could not inspect descendant: {error}"),
             }
-            assert!(Instant::now() < deadline, "descendant remained alive");
+            assert!(
+                Instant::now() < deadline,
+                "descendant {process_id} remained live after cleanup"
+            );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_probe_accepts_missing_process_errors() {
+        assert!(is_missing_process_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        assert!(is_missing_process_error(&io::Error::from_raw_os_error(
+            ESRCH_ERRNO
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_probe_does_not_accept_a_live_process() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn live descendant probe target");
+        let stopped = descendant_is_stopped(child.id());
+        child.kill().expect("stop live descendant probe target");
+        child.wait().expect("reap live descendant probe target");
+
+        assert!(!stopped.expect("inspect live descendant probe target"));
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
