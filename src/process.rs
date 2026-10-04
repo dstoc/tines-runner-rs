@@ -17,6 +17,14 @@ use crate::cancellation::CancellationToken;
 
 const MAX_OUTPUT_CHUNKS_PER_PASS: usize = 32;
 
+/// Grace period used by a supervised process before its process tree is killed.
+pub const PROCESS_TREE_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+/// The daemon gives an executor more time than the executor gives its harness.
+/// The extra three seconds allow the nested process tree to stop and let the
+/// executor finish workspace cleanup before the daemon escalates to SIGKILL.
+pub const EXECUTOR_TRANSPORT_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
@@ -417,7 +425,7 @@ impl SupervisedProcess {
     /// collect stdout and stderr.
     pub fn wait(mut self) -> io::Result<ProcessOutput> {
         let status = self.child.wait()?;
-        self.terminate_remaining_group(Duration::from_secs(2))?;
+        self.terminate_remaining_group(PROCESS_TREE_TERMINATION_GRACE)?;
         self.collect(status, false, false)
     }
 
@@ -715,7 +723,11 @@ impl SupervisedProcess {
 impl Drop for SupervisedProcess {
     fn drop(&mut self) {
         self.output.take();
-        if !self.finished && self.terminate_group(Duration::from_secs(2)).is_err() {
+        if !self.finished
+            && self
+                .terminate_group(PROCESS_TREE_TERMINATION_GRACE)
+                .is_err()
+        {
             let process_group_id = self
                 .identity
                 .process_group_id

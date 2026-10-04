@@ -10,11 +10,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::config::WorkspaceRetention;
-use crate::process::ProcessIdentity;
+use crate::process::{EXECUTOR_TRANSPORT_TERMINATION_GRACE, ProcessIdentity};
 use crate::retention;
 
 const STATE_VERSION: u8 = 2;
-const ORPHAN_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const ORPHAN_TERMINATION_GRACE: Duration = EXECUTOR_TRANSPORT_TERMINATION_GRACE;
 
 /// The durable local information needed to recover one active assignment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

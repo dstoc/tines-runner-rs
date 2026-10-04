@@ -37,6 +37,12 @@ fi
 if [ -n "${FAKE_CODEX_ARGS_FILE:-}" ]; then
     printf '%s\n' "$@" > "$FAKE_CODEX_ARGS_FILE"
 fi
+if [ -n "${FAKE_CODEX_HARNESS_PID_FILE:-}" ]; then
+    trap '' TERM
+    harness_pid_file_tmp="${FAKE_CODEX_HARNESS_PID_FILE}.tmp"
+    printf '%s\n' "$$" > "$harness_pid_file_tmp"
+    mv "$harness_pid_file_tmp" "$FAKE_CODEX_HARNESS_PID_FILE"
+fi
 
 if [ -n "${FAKE_CODEX_WORKSPACE_PROBE_FILE:-}" ]; then
     printf 'workspace=%s\n' "$PWD" > "$FAKE_CODEX_WORKSPACE_PROBE_FILE"

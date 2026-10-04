@@ -395,17 +395,185 @@ fn validate_container_executor(argv: &[String]) -> Result<(), ConfigError> {
     let Some(run_index) = argv.iter().position(|argument| argument == "run") else {
         return Ok(());
     };
-    if argv[run_index + 1..].iter().any(|argument| {
-        matches!(
-            argument.as_str(),
-            "-d" | "-d=true" | "--detach" | "--detach=true"
-        )
-    }) {
+    if container_run_detaches(&argv[run_index + 1..]) {
         return Err(ConfigError::Invalid(
             "docker and podman executor commands must run containers in the foreground; remove -d or --detach so the daemon can supervise container termination".to_owned(),
         ));
     }
     Ok(())
+}
+
+/// Inspect only Docker/Podman run options before the image positional argument.
+fn container_run_detaches(arguments: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--detach" || argument == "--detach=true" || argument == "-d=true" {
+            return true;
+        }
+        if let Some(value) = argument.strip_prefix("--detach=") {
+            if value != "false" {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        if argument == "-d=false" {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with("--") {
+            let name = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(name, _)| name);
+            index +=
+                usize::from(!argument.contains('=') && container_long_option_takes_value(name));
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') && argument.len() > 1 {
+            let mut chars = argument[1..].chars();
+            while let Some(short_option) = chars.next() {
+                if short_option == 'd' {
+                    return true;
+                }
+                if container_short_option_takes_value(short_option) {
+                    if chars.next().is_none() {
+                        index += 1;
+                    }
+                    break;
+                }
+            }
+            index += 1;
+            continue;
+        }
+
+        // Docker and Podman interpret the first positional argument as IMAGE.
+        // Later arguments belong to the image's command and must not be read
+        // as transport options.
+        break;
+    }
+    false
+}
+
+fn container_long_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "--add-host"
+            | "--annotation"
+            | "--arch"
+            | "--attach"
+            | "--authfile"
+            | "--blkio-weight"
+            | "--blkio-weight-device"
+            | "--cap-add"
+            | "--cap-drop"
+            | "--cgroup-conf"
+            | "--cgroup-parent"
+            | "--cgroups"
+            | "--cgroupns"
+            | "--cidfile"
+            | "--conmon-pidfile"
+            | "--cpu-period"
+            | "--cpu-quota"
+            | "--cpu-rt-period"
+            | "--cpu-rt-runtime"
+            | "--cpu-shares"
+            | "--cpus"
+            | "--cpuset-cpus"
+            | "--cpuset-mems"
+            | "--creds"
+            | "--detach-keys"
+            | "--device"
+            | "--device-cgroup-rule"
+            | "--device-read-bps"
+            | "--device-read-iops"
+            | "--device-write-bps"
+            | "--device-write-iops"
+            | "--dns"
+            | "--dns-option"
+            | "--dns-search"
+            | "--domainname"
+            | "--entrypoint"
+            | "--env"
+            | "--env-file"
+            | "--env-merge"
+            | "--expose"
+            | "--gpus"
+            | "--gidmap"
+            | "--group-add"
+            | "--health-cmd"
+            | "--health-interval"
+            | "--health-retries"
+            | "--health-start-interval"
+            | "--health-start-period"
+            | "--health-timeout"
+            | "--hostname"
+            | "--image-volume"
+            | "--init-path"
+            | "--ip"
+            | "--ip6"
+            | "--ipc"
+            | "--isolation"
+            | "--kernel-memory"
+            | "--label"
+            | "--label-file"
+            | "--link"
+            | "--link-local-ip"
+            | "--log-driver"
+            | "--log-opt"
+            | "--mac-address"
+            | "--memory"
+            | "--memory-reservation"
+            | "--memory-swap"
+            | "--memory-swappiness"
+            | "--mount"
+            | "--name"
+            | "--net"
+            | "--network"
+            | "--network-alias"
+            | "--oom-score-adj"
+            | "--os"
+            | "--pid"
+            | "--pidfile"
+            | "--pids-limit"
+            | "--platform"
+            | "--pod"
+            | "--preserve-fds"
+            | "--publish"
+            | "--pull"
+            | "--restart"
+            | "--runtime"
+            | "--security-opt"
+            | "--seccomp-profile"
+            | "--shm-size"
+            | "--stop-signal"
+            | "--stop-timeout"
+            | "--storage-opt"
+            | "--subgidname"
+            | "--subuidname"
+            | "--sysctl"
+            | "--tmpfs"
+            | "--uidmap"
+            | "--ulimit"
+            | "--unsetenv"
+            | "--user"
+            | "--userns"
+            | "--uts"
+            | "--volume"
+            | "--volume-driver"
+            | "--volumes-from"
+            | "--workdir"
+    )
+}
+
+fn container_short_option_takes_value(option: char) -> bool {
+    matches!(
+        option,
+        'a' | 'c' | 'e' | 'h' | 'l' | 'm' | 'p' | 'u' | 'v' | 'w'
+    )
 }
 
 /// Effective settings and the override entries that matched one assignment.
@@ -926,6 +1094,8 @@ executor_cwd = "~/executor"
         for executor in [
             r#"["docker", "run", "--rm", "-d", "runner-image"]"#,
             r#"["/usr/bin/podman", "run", "--detach=true", "runner-image"]"#,
+            r#"["docker", "run", "--rm", "-dit", "runner-image"]"#,
+            r#"["podman", "run", "-id", "--name", "runner", "runner-image"]"#,
         ] {
             let contents = format!(
                 "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test-runner\"\nexecutor_cwd = \"/daemon\"\nexecutor = {executor}\n"
@@ -957,6 +1127,31 @@ executor = ["docker", "run", "--detach", "runner-image"]
                 .to_string()
                 .contains("run containers in the foreground")
         );
+    }
+
+    #[test]
+    fn container_option_values_and_executor_arguments_are_not_detach_flags() {
+        for executor in [
+            r#"["docker", "run", "--env=-d", "runner-image", "tines-runner-rs", "execute", "-d"]"#,
+            r#"["docker", "run", "--env", "-d", "runner-image"]"#,
+            r#"["podman", "run", "--detach-keys", "-d", "runner-image"]"#,
+        ] {
+            let contents = format!(
+                "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test-runner\"\nexecutor_cwd = \"/daemon\"\nexecutor = {executor}\n"
+            );
+            Config::from_toml_str_with_defaults(&contents, defaults())
+                .expect("option values and executor arguments are outside Docker run options");
+        }
+
+        let attached_false = r#"[server]
+url = "https://tines.example.test"
+[runner]
+name = "test-runner"
+executor_cwd = "/daemon"
+executor = ["docker", "run", "--detach=false", "runner-image"]
+"#;
+        Config::from_toml_str_with_defaults(attached_false, defaults())
+            .expect("an explicit false detach option keeps the container attached");
     }
 
     #[test]
