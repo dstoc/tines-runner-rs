@@ -1,6 +1,7 @@
 //! Versioned JSON and JSONL types for one local executor invocation.
 
 use std::fmt;
+use std::io::Read;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
@@ -66,6 +67,53 @@ impl ExecutionRequest {
         values
     }
 }
+
+/// Read and validate exactly one execution request without exposing parser
+/// details that may contain assignment data.
+pub fn read_execution_request<R: Read>(reader: R) -> Result<ExecutionRequest, RequestError> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = Value::deserialize(&mut deserializer).map_err(|_| RequestError::MalformedJson)?;
+    deserializer
+        .end()
+        .map_err(|_| RequestError::MalformedJson)?;
+
+    match value.get("version").and_then(Value::as_u64) {
+        Some(version) if version != u64::from(EXECUTION_PROTOCOL_VERSION) => {
+            return Err(RequestError::UnsupportedVersion(version));
+        }
+        Some(_) => {}
+        None => return Err(RequestError::InvalidRequest),
+    }
+
+    let request = serde_json::from_value::<ExecutionRequest>(value)
+        .map_err(|_| RequestError::InvalidRequest)?;
+    request
+        .validate()
+        .map_err(|_| RequestError::InvalidRequest)?;
+    Ok(request)
+}
+
+/// Safe, deterministic errors returned while reading an execution request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    MalformedJson,
+    UnsupportedVersion(u64),
+    InvalidRequest,
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedJson => f.write_str("malformed execution request JSON"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported execution protocol version {version}")
+            }
+            Self::InvalidRequest => f.write_str("invalid executor request"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
 
 impl fmt::Debug for ExecutionRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

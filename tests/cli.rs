@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Child;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 #[cfg(unix)]
@@ -80,6 +80,23 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn run_executor(input: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
+        .arg("execute")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start executor CLI");
+    child
+        .stdin
+        .take()
+        .expect("executor stdin")
+        .write_all(input)
+        .expect("write executor request");
+    child.wait_with_output().expect("wait for executor CLI")
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
@@ -260,6 +277,46 @@ fn version_flag_reports_package_version() {
         String::from_utf8(output.stdout).expect("version output should be UTF-8"),
         format!("tines-runner-rs {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn execute_accepts_one_request_without_writing_to_stdout() {
+    let output = run_executor(include_bytes!("fixtures/execution-request-v1.json"));
+
+    assert!(
+        output.status.success(),
+        "execute rejected a valid request: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn execute_rejects_bad_requests_without_echoing_secret_content() {
+    let malformed =
+        run_executor(br#"{"version":1,"assignment":{"run_key":"raw-run-key-secret",not-json}}"#);
+    assert!(!malformed.status.success());
+    assert!(malformed.stdout.is_empty());
+    let malformed_diagnostic = String::from_utf8_lossy(&malformed.stderr);
+    assert_eq!(
+        malformed_diagnostic,
+        "executor request rejected: malformed execution request JSON\n"
+    );
+    assert!(!malformed_diagnostic.contains("raw-run-key-secret"));
+
+    let fixture = include_str!("fixtures/execution-request-v1.json");
+    let unsupported = fixture.replace("\"version\": 1", "\"version\": 37");
+    let unsupported = run_executor(unsupported.as_bytes());
+    assert!(!unsupported.status.success());
+    assert!(unsupported.stdout.is_empty());
+    let unsupported_diagnostic = String::from_utf8_lossy(&unsupported.stderr);
+    assert_eq!(
+        unsupported_diagnostic,
+        "executor request rejected: unsupported execution protocol version 37\n"
+    );
+    assert!(!unsupported_diagnostic.contains("fixture-run-key"));
+    assert!(!unsupported_diagnostic.contains("fixture-secret"));
 }
 
 #[test]
