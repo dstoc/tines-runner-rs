@@ -31,6 +31,11 @@ pub trait HarnessAdapter: Send + Sync {
 
     /// Create a parser that translates native output into protocol events.
     fn event_parser(&self) -> Box<dyn HarnessEventParser>;
+
+    /// Create a parser with assignment context when secret-aware streaming is needed.
+    fn event_parser_for_request(&self, _request: &ExecutionRequest) -> Box<dyn HarnessEventParser> {
+        self.event_parser()
+    }
 }
 
 /// A directly spawned process and safe diagnostic text for the launch.
@@ -91,6 +96,10 @@ pub trait HarnessEventParser: Send {
         })]
     }
     fn finish(&mut self) -> Vec<ExecutionEvent>;
+    /// Flush output held back for secret redaction across chunk boundaries.
+    fn finish_stderr(&mut self) -> Vec<ExecutionEvent> {
+        Vec::new()
+    }
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent;
 }
 

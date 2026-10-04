@@ -84,6 +84,35 @@ impl ExecutionRequest {
         );
         values
     }
+
+    /// Return secret values and their escaped forms for safe diagnostics.
+    pub(crate) fn secret_patterns(&self) -> Vec<String> {
+        let mut secrets = self
+            .secret_values()
+            .into_iter()
+            .flat_map(|secret| {
+                let json_escaped =
+                    serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
+                let rust_escaped = format!("{secret:?}");
+                [
+                    secret.to_owned(),
+                    json_escaped[1..json_escaped.len() - 1].to_owned(),
+                    rust_escaped[1..rust_escaped.len() - 1].to_owned(),
+                ]
+            })
+            .filter(|secret| !secret.is_empty())
+            .collect::<Vec<_>>();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        secrets
+    }
+
+    /// Remove request secrets from a diagnostic before it is retained.
+    pub(crate) fn redact_sensitive_text(&self, value: &mut String) {
+        for secret in self.secret_patterns() {
+            *value = value.replace(&secret, "***");
+        }
+    }
 }
 
 /// Read and validate exactly one execution request without exposing parser
@@ -531,22 +560,7 @@ pub fn render_event_jsonl(
     request.validate()?;
     event.validate()?;
     let mut value = serde_json::to_value(event).map_err(|_| ProtocolError::Serialization)?;
-    let mut secrets = request
-        .secret_values()
-        .into_iter()
-        .flat_map(|secret| {
-            let json_escaped =
-                serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
-            let rust_escaped = format!("{secret:?}");
-            [
-                secret.to_owned(),
-                json_escaped[1..json_escaped.len() - 1].to_owned(),
-                rust_escaped[1..rust_escaped.len() - 1].to_owned(),
-            ]
-        })
-        .collect::<Vec<_>>();
-    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-    secrets.dedup();
+    let secrets = request.secret_patterns();
     redact_value(&mut value, &secrets);
     let mut line = serde_json::to_string(&value).map_err(|_| ProtocolError::Serialization)?;
     if line.len() > MAX_EXECUTION_EVENT_LINE_BYTES {

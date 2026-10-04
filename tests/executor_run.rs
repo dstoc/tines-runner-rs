@@ -228,12 +228,12 @@ fn custom_github_checks_style_command_runs_with_placeholders_environment_and_gen
                 .as_str()
                 .is_some_and(|message| message.contains("github-checks style fixture passed"))
     }));
-    assert!(logs.iter().any(|event| {
-        event["stream"] == "stderr"
-            && event["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("custom stderr diagnostic"))
-    }));
+    let stderr = logs
+        .iter()
+        .filter(|event| event["stream"] == "stderr")
+        .filter_map(|event| event["message"].as_str())
+        .collect::<String>();
+    assert!(stderr.contains("custom stderr diagnostic"));
     let rendered = serde_json::to_string(&output.events).unwrap();
     for secret in [
         "fixture-secret",
@@ -251,10 +251,14 @@ fn custom_nonzero_exit_fails_with_redacted_stderr_context() {
     let directory = TestDirectory::new();
     let workspace_parent = directory.0.join("custom-workspaces");
     let script_path = directory.0.join("failing-check");
-    write_executable(
-        &script_path,
-        "#!/bin/sh\nprintf '%s\\n' 'check failed with fixture-secret' >&2\nexit 7\n",
+    let before_boundary = "x".repeat(8 * 1024 - 4);
+    let after_secret = "y".repeat(
+        16 * 1024 - before_boundary.len() - "fixture-secret".len() - "fixture-run-key".len(),
     );
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{before_boundary}' >&2\nprintf '%s' 'fixture-secret' >&2\nprintf '%s' '{after_secret}' >&2\nprintf '%s' 'fixture-run-key' >&2\nexit 7\n"
+    );
+    write_executable(&script_path, &script);
     let request = custom_request(
         &workspace_parent,
         vec![script_path.to_string_lossy().into_owned()],
@@ -271,6 +275,7 @@ fn custom_nonzero_exit_fails_with_redacted_stderr_context() {
     assert!(error.contains("custom harness stderr"));
     assert!(error.contains("***"));
     assert!(!error.contains("fixture-secret"));
+    assert!(!error.contains("e-secret"));
     assert!(output.events.iter().any(|event| {
         event["type"] == "log"
             && event["stream"] == "stderr"
@@ -278,6 +283,32 @@ fn custom_nonzero_exit_fails_with_redacted_stderr_context() {
                 .as_str()
                 .is_some_and(|message| message.contains("***"))
     }));
+    let rendered_events = serde_json::to_string(&output.events).expect("serialize test events");
+    for secret in ["fixture-secret", "e-secret", "fixture-run-key"] {
+        assert!(
+            !rendered_events.contains(secret),
+            "secret fragment {secret} reached executor events"
+        );
+    }
+
+    let workspace = fs::read_dir(workspace_parent)
+        .expect("failed workspace parent remains")
+        .next()
+        .expect("failed workspace retained")
+        .expect("workspace entry")
+        .path();
+    let marker: Value = serde_json::from_slice(
+        &fs::read(workspace.join(".tines-runner-retained.json")).expect("retention marker"),
+    )
+    .expect("valid retention marker");
+    let retained_error = marker["error"].as_str().expect("retained error diagnostic");
+    assert!(retained_error.contains("***"));
+    for secret in ["fixture-secret", "e-secret", "fixture-run-key"] {
+        assert!(
+            !retained_error.contains(secret),
+            "secret fragment {secret} reached retained metadata"
+        );
+    }
 }
 
 #[test]

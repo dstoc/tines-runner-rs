@@ -89,13 +89,89 @@ impl HarnessAdapter for CustomAdapter {
     }
 
     fn event_parser(&self) -> Box<dyn HarnessEventParser> {
-        Box::<CustomEventParser>::default()
+        Box::new(CustomEventParser::new(Vec::new()))
+    }
+
+    fn event_parser_for_request(&self, request: &ExecutionRequest) -> Box<dyn HarnessEventParser> {
+        Box::new(CustomEventParser::new(request.secret_patterns()))
     }
 }
 
-#[derive(Default)]
 struct CustomEventParser {
     stderr_diagnostic: String,
+    stderr_pending: String,
+    secrets: Vec<String>,
+    redaction_window: usize,
+}
+
+impl CustomEventParser {
+    fn new(secrets: Vec<String>) -> Self {
+        let redaction_window = secrets
+            .iter()
+            .map(|secret| secret.chars().count())
+            .max()
+            .unwrap_or_default()
+            .saturating_sub(1);
+        Self {
+            stderr_diagnostic: String::new(),
+            stderr_pending: String::new(),
+            secrets,
+            redaction_window,
+        }
+    }
+
+    fn redact_stderr(&self, value: &str) -> String {
+        self.secrets
+            .iter()
+            .fold(value.to_owned(), |redacted, secret| {
+                redacted.replace(secret, "***")
+            })
+    }
+
+    fn take_safe_stderr_prefix(&mut self, chunk: &str, finish: bool) -> String {
+        self.stderr_pending.push_str(chunk);
+        let characters = self.stderr_pending.chars().collect::<Vec<_>>();
+        let safe_starts = if finish {
+            characters.len()
+        } else {
+            characters.len().saturating_sub(self.redaction_window)
+        };
+        let offsets = self
+            .stderr_pending
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(self.stderr_pending.len()))
+            .collect::<Vec<_>>();
+        let mut output = String::new();
+        let mut index = 0;
+        while index < safe_starts {
+            let byte_index = offsets[index];
+            if let Some(secret) = self
+                .secrets
+                .iter()
+                .find(|secret| self.stderr_pending[byte_index..].starts_with(secret.as_str()))
+            {
+                output.push_str("***");
+                index += secret.chars().count();
+            } else {
+                output.push(characters[index]);
+                index += 1;
+            }
+        }
+        self.stderr_pending = characters[index..].iter().collect();
+        output
+    }
+
+    fn flush_stderr_diagnostic(&mut self) {
+        let final_chunk = self.take_safe_stderr_prefix("", true);
+        append_stderr_tail(&mut self.stderr_diagnostic, &final_chunk);
+    }
+
+    fn finish_stderr_output(&mut self) -> Vec<ExecutionEvent> {
+        let final_chunk = self.take_safe_stderr_prefix("", true);
+        append_stderr_tail(&mut self.stderr_diagnostic, &final_chunk);
+        log_event(LogStream::Stderr, &final_chunk)
+    }
 }
 
 impl HarnessEventParser for CustomEventParser {
@@ -107,22 +183,28 @@ impl HarnessEventParser for CustomEventParser {
         if chunk.is_empty() {
             return Vec::new();
         }
-        append_stderr_tail(&mut self.stderr_diagnostic, chunk);
-        log_event(LogStream::Stderr, chunk)
+        let safe_diagnostic = self.take_safe_stderr_prefix(chunk, false);
+        append_stderr_tail(&mut self.stderr_diagnostic, &safe_diagnostic);
+        log_event(LogStream::Stderr, &safe_diagnostic)
     }
 
     fn finish(&mut self) -> Vec<ExecutionEvent> {
         Vec::new()
     }
 
+    fn finish_stderr(&mut self) -> Vec<ExecutionEvent> {
+        self.finish_stderr_output()
+    }
+
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent {
+        self.flush_stderr_diagnostic();
         let completed = !exit.interrupted && exit.exit_code == Some(0) && exit.error.is_none();
         let status = if completed {
             TerminalStatus::Completed
         } else {
             TerminalStatus::Failed
         };
-        let error = if completed {
+        let mut error = if completed {
             None
         } else {
             let base = exit.error.unwrap_or_else(|| {
@@ -143,6 +225,9 @@ impl HarnessEventParser for CustomEventParser {
                 ))
             }
         };
+        if let Some(error) = &mut error {
+            *error = self.redact_stderr(error);
+        }
 
         ExecutionEvent::new(ExecutionEventKind::Result {
             result: TerminalResult {
