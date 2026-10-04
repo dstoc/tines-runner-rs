@@ -79,7 +79,10 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    Parse(toml::de::Error),
+    Parse {
+        path: Option<PathBuf>,
+        source: toml::de::Error,
+    },
     Invalid(String),
 }
 
@@ -89,7 +92,11 @@ impl fmt::Display for ConfigError {
             Self::Io { path, source } => {
                 write!(f, "could not read config file {}: {source}", path.display())
             }
-            Self::Parse(source) => write!(f, "invalid config TOML: {source}"),
+            Self::Parse {
+                path: Some(path),
+                source,
+            } => write!(f, "invalid config file {}: {source}", path.display()),
+            Self::Parse { path: None, source } => write!(f, "invalid config TOML: {source}"),
             Self::Invalid(message) => f.write_str(message),
         }
     }
@@ -99,7 +106,7 @@ impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Parse(source) => Some(source),
+            Self::Parse { source, .. } => Some(source),
             Self::Invalid(_) => None,
         }
     }
@@ -138,7 +145,13 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml_str(&contents)
+        Self::from_toml_str(&contents).map_err(|error| match error {
+            ConfigError::Parse { source, .. } => ConfigError::Parse {
+                path: Some(path.to_path_buf()),
+                source,
+            },
+            error => error,
+        })
     }
 
     /// Parse configuration TOML and expand path settings using the current
@@ -191,7 +204,8 @@ impl Config {
         contents: &str,
         defaults: DefaultPaths,
     ) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(contents).map_err(ConfigError::Parse)?;
+        let raw: RawConfig =
+            toml::from_str(contents).map_err(|source| ConfigError::Parse { path: None, source })?;
 
         let server_url = raw
             .server

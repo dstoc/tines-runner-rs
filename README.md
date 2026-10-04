@@ -61,7 +61,8 @@ Create `config.toml` in the runner configuration directory:
 
 The runner uses `XDG_CONFIG_HOME` only when it is an absolute path. On
 Windows, it uses `%USERPROFILE%\AppData\Roaming` when `APPDATA` is not set.
-The runner has no `--config` option.
+Pass `--config /path/to/config.toml` to select a different file. Without this
+option, the runner uses the default path in the table.
 
 Start with this configuration and replace the URL and runner name:
 
@@ -100,14 +101,49 @@ tines-runner-rs --check
 unset TINES_API_KEY
 ```
 
-The default credentials file is next to `config.toml`. On Unix, the runner
-creates or repairs it with mode `0600`. Keep it private and use the same file
-when restarting the daemon. Later `--check` runs use the saved runner token
-and do not need `TINES_API_KEY`:
+The default credentials file is in the platform configuration directory. Set
+`[storage].credentials_file` to choose another path. On Unix, the runner
+creates or repairs the file with mode `0600`. Keep it private and use the same
+file when restarting the daemon. Later `--check` runs use the saved runner
+token and do not need `TINES_API_KEY`:
 
 ```sh
 tines-runner-rs --check
 ```
+
+### Run multiple runners
+
+Give each runner its own config file, registration name, credentials file,
+and workspace directory. For example, save this as
+`/etc/tines-runner-rs/build.toml`:
+
+```toml
+[server]
+url = "https://tines.example.com"
+
+[runner]
+name = "build-codex"
+workspace_parent = "/var/lib/tines-runner-rs/build/workspaces"
+
+[storage]
+credentials_file = "/var/lib/tines-runner-rs/build/credentials.toml"
+```
+
+Save a second config as `/etc/tines-runner-rs/review.toml` with its own
+`[runner].name`, `workspace_parent`, and `[storage].credentials_file`, such as
+`review-codex`, `/var/lib/tines-runner-rs/review/workspaces`, and
+`/var/lib/tines-runner-rs/review/credentials.toml`. Register and start each
+runner with its selected file:
+
+```sh
+tines-runner-rs --config /etc/tines-runner-rs/build.toml --check
+tines-runner-rs --config /etc/tines-runner-rs/review.toml --check
+tines-runner-rs --config /etc/tines-runner-rs/build.toml
+tines-runner-rs --config /etc/tines-runner-rs/review.toml
+```
+
+Each config keeps the runner's registration and local state separate. Run
+`--check` for both files with `TINES_API_KEY` set on first registration.
 
 ### 3. Start the daemon
 
@@ -171,9 +207,9 @@ It removes only workspace directories that it marked as retained.
 - **The runner cannot find Codex or Git:** check `PATH` as the daemon account.
   `--check` does not test Codex authentication, Git access, or workspace
   permissions.
-- **Configuration fails to load:** check that `config.toml` is in the default
-  configuration directory, the TOML is valid, and the server URL and runner
-  name are set. There is no `--config` option.
+- **Configuration fails to load:** check the selected file path, TOML syntax,
+  and that the server URL and runner name are set. Without `--config`, the
+  runner reads `config.toml` from the default configuration directory.
 - **First registration fails:** confirm `TINES_API_KEY` is set for the
   `--check` process and can access the configured Tines instance. The key is
   needed only when no saved runner credentials exist.

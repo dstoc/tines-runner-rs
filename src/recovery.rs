@@ -436,7 +436,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "sleep 300 >/dev/null 2>&1 & echo $! > \"$1\"; exec sleep 300",
+                "sleep 300 >/dev/null 2>&1 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 300",
                 "stub-harness",
             ])
             .arg(&ready_path)
@@ -513,7 +513,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "sleep 300 >/dev/null 2>&1 & echo $! > \"$1\"; exec sleep 300",
+                "sleep 300 >/dev/null 2>&1 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 300",
                 "stub-harness",
             ])
             .arg(&ready_path)
