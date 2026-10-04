@@ -31,8 +31,12 @@ fi
 
 wrapper_id=${1:-missing-wrapper-id}
 shift || true
-printf '%s\n' "$wrapper_id" > "$FAKE_CODEX_WRAPPER_FILE"
-printf '%s\n' "$@" > "$FAKE_CODEX_ARGS_FILE"
+if [ -n "${FAKE_CODEX_WRAPPER_FILE:-}" ]; then
+    printf '%s\n' "$wrapper_id" > "$FAKE_CODEX_WRAPPER_FILE"
+fi
+if [ -n "${FAKE_CODEX_ARGS_FILE:-}" ]; then
+    printf '%s\n' "$@" > "$FAKE_CODEX_ARGS_FILE"
+fi
 
 if [ -n "${FAKE_CODEX_WORKSPACE_PROBE_FILE:-}" ]; then
     printf 'workspace=%s\n' "$PWD" > "$FAKE_CODEX_WORKSPACE_PROBE_FILE"
@@ -40,6 +44,10 @@ if [ -n "${FAKE_CODEX_WORKSPACE_PROBE_FILE:-}" ]; then
     cat prompt.md >> "$FAKE_CODEX_WORKSPACE_PROBE_FILE"
     printf 'repo=' >> "$FAKE_CODEX_WORKSPACE_PROBE_FILE"
     cat materialized/acceptance.txt >> "$FAKE_CODEX_WORKSPACE_PROBE_FILE"
+fi
+
+if [ -n "${FAKE_CODEX_ENV_PROBE_FILE:-}" ]; then
+    printf '%s\n' "${DEPLOY_TOKEN:-}" > "$FAKE_CODEX_ENV_PROBE_FILE"
 fi
 
 if [ -n "${FAKE_CODEX_RUN_KEY_PROBE_FILE:-}" ]; then

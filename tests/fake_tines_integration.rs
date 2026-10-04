@@ -36,13 +36,17 @@ impl TestDirectory {
         fs::write(&path, include_str!("support/stub_executor.sh")).expect("write executor stub");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
             .expect("make executor stub executable");
+        self.install_codex_stub();
+        path
+    }
+
+    fn install_codex_stub(&self) {
         let bin = self.path.join("bin");
         fs::create_dir_all(&bin).expect("create isolated Codex PATH directory");
         let codex = bin.join("codex");
         fs::write(&codex, include_str!("support/stub_codex.sh")).expect("install fake Codex CLI");
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
             .expect("make fake Codex CLI executable");
-        path
     }
 
     fn write_events(&self, run_id: &str, events: impl IntoIterator<Item = Value>) {
@@ -90,6 +94,19 @@ impl TestDirectory {
         fs::write(config_dir.join("config.toml"), config).expect("write runner config");
     }
 
+    fn configure_native(&self, server_url: &str, max_concurrent: usize) {
+        let config_dir = self.path.join("config/tines-runner-rs");
+        fs::create_dir_all(&config_dir).expect("create runner config directory");
+        let credentials = self.path.join("credentials.toml");
+        let workspaces = self.path.join("workspaces");
+        fs::create_dir_all(&workspaces).expect("create native workspace parent");
+        let config = format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+            workspaces, credentials
+        );
+        fs::write(config_dir.join("config.toml"), config).expect("write native runner config");
+    }
+
     fn credentials_path(&self) -> std::path::PathBuf {
         self.path.join("credentials.toml")
     }
@@ -101,7 +118,10 @@ impl TestDirectory {
     fn runner(&self, bootstrap_key: Option<&str>) -> RunnerProcess {
         let config_home = self.path.join("config");
         let data_home = self.path.join("data");
-        let mut search_path = vec![self.path.join("bin")];
+        let runner_binary_directory = std::path::Path::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
+            .parent()
+            .expect("runner binary has a parent directory");
+        let mut search_path = vec![self.path.join("bin"), runner_binary_directory.to_owned()];
         search_path.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
@@ -284,6 +304,274 @@ fn stop_gracefully(fake: &FakeTines, runner: &mut RunnerProcess) {
             .iter()
             .any(|request| request.json()["draining"] == true)
     });
+}
+
+#[test]
+fn default_native_executor_preserves_cold_workspace_environment_logs_and_finish() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    directory.install_codex_stub();
+    directory.configure_native(fake.url().as_str(), 1);
+    let local_repository = create_local_repository(&directory.path.join("native-repository"));
+    let workspace_probe = directory.path.join("native-workspace.txt");
+    let environment_probe = directory.path.join("native-environment.txt");
+    let run_key_probe = directory.path.join("native-run-key.json");
+    let mut native_assignment = assignment(
+        "arun_happy",
+        5,
+        vec![
+            json!({"name":"FAKE_CODEX_WORKSPACE_PROBE_FILE","value":workspace_probe,"secret":false}),
+            json!({"name":"FAKE_CODEX_ENV_PROBE_FILE","value":environment_probe,"secret":false}),
+            json!({"name":"FAKE_CODEX_RUN_KEY_PROBE_FILE","value":run_key_probe,"secret":false}),
+            json!({"name":"DEPLOY_TOKEN","value":"native-integration-secret","secret":true}),
+        ],
+    );
+    native_assignment["bundle"]["repos"] = json!([{
+        "url": local_repository.to_string_lossy(),
+        "branch": null,
+        "dir": "materialized"
+    }]);
+    fake.route_issue("fake-tines-integration", native_assignment);
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    let finishes = fake.wait_for_finishes(1, Duration::from_secs(30));
+    let finish = &finishes[0];
+    assert_eq!(
+        finish["status"],
+        "completed",
+        "{finish}; logs: {:?}",
+        fake.accepted_logs()
+    );
+    assert_eq!(finish["provider_session_id"], "stub-thread");
+    assert_eq!(finish["usage"]["input_tokens"], 75);
+    assert_eq!(finish["usage"]["cache_read_tokens"], 20);
+    assert_eq!(finish["usage"]["cache_write_tokens"], 5);
+    assert_eq!(finish["usage"]["output_tokens"], 7);
+
+    let workspace = fs::read_to_string(workspace_probe).expect("native Codex workspace probe");
+    assert!(workspace.contains("prompt=exercise arun_happy"));
+    assert!(workspace.contains("repo=materialized from routed test repository"));
+    assert!(workspace.contains("/workspaces/"));
+    assert_eq!(
+        fs::read_to_string(environment_probe)
+            .expect("assignment environment probe")
+            .trim(),
+        "native-integration-secret"
+    );
+    assert!(
+        fs::read_to_string(run_key_probe)
+            .expect("run-key API probe")
+            .contains("iss_arun_happy")
+    );
+
+    let logs = fake
+        .accepted_logs()
+        .into_iter()
+        .filter_map(|log| log["chunk"].as_str().map(str::to_owned))
+        .collect::<String>();
+    assert!(logs.contains("[session] started (thread stub-thread)"));
+    assert!(logs.contains("[session] turn completed"));
+    assert!(!logs.contains("native-integration-secret"));
+    let issue_requests = fake
+        .requests()
+        .into_iter()
+        .filter(|request| request.target == "/api/v1/issues/iss_arun_happy")
+        .collect::<Vec<_>>();
+    assert!(issue_requests.iter().any(|request| {
+        request.header("authorization") == Some("Bearer issue-run-key-arun_happy")
+    }));
+    assert!(
+        issue_requests.len() >= 2,
+        "Codex used the run key inside the executor"
+    );
+    wait_for_quiet_poll(&fake, "arun_happy");
+    assert_eq!(
+        fs::read_dir(directory.workspace_parent()).unwrap().count(),
+        0
+    );
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
+fn native_executor_maps_codex_rate_limits_and_enforces_assignment_timeout() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    directory.install_codex_stub();
+    directory.configure_native(fake.url().as_str(), 2);
+    let rate_limit_events = directory.path.join("native-rate-limit.jsonl");
+    fs::write(
+        &rate_limit_events,
+        concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"native-limited\"}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":80,\"cached_input_tokens\":10,\"cache_write_input_tokens\":5,\"output_tokens\":9}}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit exceeded.\",\"resets_at\":2000000000}}\n"
+        ),
+    )
+    .expect("write Codex rate-limit fixture");
+    fake.enqueue_poll(json!({
+        "assignments": [
+            assignment("arun_native_rate_limit", 5, vec![json!({
+                "name":"FAKE_CODEX_JSONL_FILE",
+                "value":rate_limit_events,
+                "secret":false
+            })]),
+            assignment("arun_native_timeout", 0, vec![json!({
+                "name":"FAKE_CODEX_SLEEP_SECONDS",
+                "value":"30",
+                "secret":false
+            })])
+        ],
+        "cancels": []
+    }));
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    fake.wait_for_finishes(2, Duration::from_secs(30));
+    let requests = fake.requests();
+    let rate_finish = requests
+        .iter()
+        .find(|request| request.target == "/api/v1/runs/arun_native_rate_limit/finish")
+        .expect("rate-limit finish request")
+        .json();
+    assert_eq!(rate_finish["status"], "failed");
+    assert_eq!(rate_finish["judgment"], "rate_limited");
+    assert_eq!(rate_finish["resume_at"], 2_000_000_000_000_u64);
+    assert_eq!(rate_finish["provider_session_id"], "native-limited");
+    assert_eq!(rate_finish["usage"]["input_tokens"], 65);
+    assert_eq!(rate_finish["usage"]["output_tokens"], 9);
+
+    let timeout_finish = requests
+        .iter()
+        .find(|request| request.target == "/api/v1/runs/arun_native_timeout/finish")
+        .expect("timeout finish request")
+        .json();
+    assert_eq!(timeout_finish["status"], "failed");
+    assert!(
+        timeout_finish["error"]
+            .as_str()
+            .expect("timeout diagnostic")
+            .contains("0-minute run timeout"),
+        "timeout finish: {timeout_finish}"
+    );
+    wait_for_quiet_poll(&fake, "arun_native_timeout");
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
+fn multiple_default_native_executors_run_concurrently_within_the_configured_limit() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    directory.install_codex_stub();
+    directory.configure_native(fake.url().as_str(), 2);
+    let barrier = directory.path.join("native-codex-barrier");
+    fs::create_dir_all(&barrier).expect("create native Codex concurrency barrier");
+    let mut assignments = ["arun_native_parallel_a", "arun_native_parallel_b"]
+        .into_iter()
+        .map(|run_id| {
+            assignment(
+                run_id,
+                5,
+                vec![
+                    json!({"name":"FAKE_CODEX_BARRIER_DIR","value":barrier,"secret":false}),
+                    json!({"name":"FAKE_CODEX_BARRIER_NAME","value":run_id,"secret":false}),
+                    json!({"name":"FAKE_CODEX_BARRIER_COUNT","value":"2","secret":false}),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let declined_probe = directory.path.join("native-over-capacity-ran.txt");
+    assignments.push(assignment(
+        "arun_native_over_capacity",
+        5,
+        vec![json!({
+            "name":"FAKE_CODEX_ENV_PROBE_FILE",
+            "value":declined_probe,
+            "secret":false
+        })],
+    ));
+    fake.enqueue_poll(json!({"assignments": assignments, "cancels": []}));
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    let finishes = fake.wait_for_finishes(2, Duration::from_secs(30));
+    assert_eq!(finishes.len(), 2);
+    assert!(
+        finishes
+            .iter()
+            .all(|finish| finish["status"] == "completed"),
+        "native executor finishes: {finishes:?}"
+    );
+    assert!(barrier.join("arun_native_parallel_a").exists());
+    assert!(barrier.join("arun_native_parallel_b").exists());
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        poll_requests(requests).iter().any(|request| {
+            request.json()["declined_assignments"]
+                .as_array()
+                .is_some_and(|declined| declined.contains(&json!("arun_native_over_capacity")))
+        })
+    });
+    assert!(
+        !declined_probe.exists(),
+        "the daemon must not start an executor beyond configured concurrency"
+    );
+    assert_eq!(
+        poll_requests(&fake.requests())[0].json()["max_concurrent"],
+        2
+    );
+    wait_for_quiet_poll(&fake, "arun_native_parallel_a");
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
+fn supervisor_cancellation_terminates_native_executor_and_codex_descendants() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    directory.install_codex_stub();
+    directory.configure_native(fake.url().as_str(), 1);
+    let child_pid_file = directory.path.join("native-codex-child.pid");
+    fake.enqueue_poll(json!({
+        "assignments": [assignment("arun_native_cancel", 5, vec![json!({
+            "name":"FAKE_CODEX_CHILD_PID_FILE",
+            "value":child_pid_file,
+            "secret":false
+        })])],
+        "cancels": []
+    }));
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    wait_for_file(&child_pid_file, Duration::from_secs(15));
+    let child_pid = fs::read_to_string(&child_pid_file)
+        .expect("read native Codex descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("parse native Codex descendant PID");
+    fake.enqueue_poll(json!({
+        "assignments": [],
+        "cancel_requests": [{"run_id":"arun_native_cancel","token":"native-cancel-token"}],
+        "cancels": []
+    }));
+
+    fake.wait_for(Duration::from_secs(20), |requests| {
+        requests.iter().any(|request| {
+            request.target.ends_with("/poll")
+                && request.json()["cancellation_acks"]
+                    .as_array()
+                    .is_some_and(|acks| {
+                        acks.iter().any(|ack| {
+                            ack["run_id"] == "arun_native_cancel"
+                                && ack["token"] == "native-cancel-token"
+                        })
+                    })
+        })
+    });
+    assert_process_stopped(child_pid);
+    assert!(fake.accepted_finishes().is_empty());
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        requests.iter().any(|request| {
+            request.target.ends_with("/poll")
+                && request.json()["owned_runs"] == json!([])
+                && request.json()["cancellation_acks"].is_null()
+        })
+    });
+    stop_gracefully(&fake, &mut runner);
 }
 
 #[test]
@@ -822,7 +1110,8 @@ fn assert_process_stopped(process_id: u32) {
         }
         assert!(
             Instant::now() < deadline,
-            "process {process_id} remained live"
+            "process {process_id} remained live: {}",
+            fs::read_to_string(format!("/proc/{process_id}/stat")).unwrap_or_default()
         );
         thread::sleep(Duration::from_millis(10));
     }

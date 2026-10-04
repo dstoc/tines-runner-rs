@@ -401,7 +401,7 @@ fn safe_executor_environment(
         .iter()
         .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>();
-    let restricted_values = assignment_values(request);
+    let restricted_values = secret_values(request);
     environment
         .filter(|(name, value)| {
             let name = name.to_string_lossy();
@@ -449,21 +449,6 @@ fn secret_values(request: &ExecutionRequest) -> Vec<String> {
             .filter(|entry| entry.secret && !entry.value.is_empty())
             .map(|entry| entry.value.clone()),
     );
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
-    values
-}
-
-fn assignment_values(request: &ExecutionRequest) -> Vec<String> {
-    let mut values = vec![request.assignment.run_key.clone()];
-    values.extend(
-        request
-            .assignment
-            .env
-            .iter()
-            .map(|entry| entry.value.clone()),
-    );
-    values.retain(|value| !value.is_empty());
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values.dedup();
     values
@@ -639,7 +624,8 @@ mod tests {
                 "timeout_minutes": 5,
                 "env": [
                     {"name": "DEPLOY_TOKEN", "value": "assignment-secret", "secret": true},
-                    {"name": "BUILD_MODE", "value": "secret-build-mode", "secret": false}
+                    {"name": "BUILD_MODE", "value": "release-mode", "secret": false},
+                    {"name": "BATCH_SIZE", "value": "2", "secret": false}
                 ]
             }
         }))
@@ -647,16 +633,17 @@ mod tests {
     }
 
     #[test]
-    fn filters_runner_and_assignment_credentials_from_executor_environment() {
+    fn filters_runner_credentials_and_secrets_without_removing_path_for_short_values() {
         let request = request();
         let environment = [
-            ("PATH", "/usr/bin"),
+            ("PATH", "/usr/bin/2/bin"),
             ("TINES_API_KEY", "long-lived-runner-key"),
             ("TINES_API_URL", "https://tines.example.test"),
             ("tines_runner_token", "runner-token"),
             ("DEPLOY_TOKEN", "inherited-assignment-value"),
             ("BUILD_MODE", "inherited-build-mode"),
-            ("OTHER_MODE", "prefix-secret-build-mode-suffix"),
+            ("BATCH_SIZE", "inherited-batch-size"),
+            ("OTHER_MODE", "prefix-release-mode-suffix"),
             ("OTHER_SETTING", "contains-assignment-secret"),
             ("SAFE_SETTING", "safe-value"),
         ]
@@ -674,19 +661,22 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(filtered.contains(&("PATH".to_owned(), "/usr/bin".to_owned())));
+        assert!(filtered.contains(&("PATH".to_owned(), "/usr/bin/2/bin".to_owned())));
         assert!(filtered.contains(&("SAFE_SETTING".to_owned(), "safe-value".to_owned())));
+        assert!(filtered.contains(&(
+            "OTHER_MODE".to_owned(),
+            "prefix-release-mode-suffix".to_owned()
+        )));
         assert!(filtered.iter().all(|(name, _)| {
             !name.eq_ignore_ascii_case("TINES_API_KEY")
                 && !name.eq_ignore_ascii_case("TINES_API_URL")
                 && !name.eq_ignore_ascii_case("TINES_RUNNER_TOKEN")
                 && !name.eq_ignore_ascii_case("DEPLOY_TOKEN")
                 && !name.eq_ignore_ascii_case("BUILD_MODE")
+                && !name.eq_ignore_ascii_case("BATCH_SIZE")
         }));
         assert!(filtered.iter().all(|(_, value)| {
-            !value.contains("ephemeral-run-key")
-                && !value.contains("assignment-secret")
-                && !value.contains("secret-build-mode")
+            !value.contains("ephemeral-run-key") && !value.contains("assignment-secret")
         }));
     }
 }

@@ -244,7 +244,7 @@ fn run_capture(program: &str, prefix: &[String], args: &[&str]) -> Result<Vec<u8
         }
     };
     let output = receiver
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(DISCOVERY_DEADLINE.saturating_sub(started.elapsed()))
         .map_err(|_| "could not read Codex version output".to_owned())??;
     let _ = reader.join();
     if !status.success() {
@@ -833,7 +833,11 @@ exit 2
             "0.1.0",
         );
 
-        assert_eq!(report.harness_version, "codex-cli 0.153.4");
+        assert_eq!(
+            report.harness_version, "codex-cli 0.153.4",
+            "discovery error: {:?}",
+            report.discovery_error
+        );
         assert_eq!(report.models.len(), 2);
         assert_eq!(report.models[0].model, "gpt-5.6");
         assert_eq!(report.models[0].efforts, ["low", "high"]);
