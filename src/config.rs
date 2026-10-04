@@ -470,13 +470,17 @@ fn container_long_option_takes_value(option: &str) -> bool {
             | "--blkio-weight-device"
             | "--cap-add"
             | "--cap-drop"
+            | "--cert-dir"
             | "--cgroup-conf"
             | "--cgroup-parent"
             | "--cgroups"
             | "--cgroupns"
+            | "--chrootdirs"
             | "--cidfile"
             | "--conmon-pidfile"
+            | "--cpu-count"
             | "--cpu-period"
+            | "--cpu-percent"
             | "--cpu-quota"
             | "--cpu-rt-period"
             | "--cpu-rt-runtime"
@@ -485,6 +489,7 @@ fn container_long_option_takes_value(option: &str) -> bool {
             | "--cpuset-cpus"
             | "--cpuset-mems"
             | "--creds"
+            | "--decryption-key"
             | "--detach-keys"
             | "--device"
             | "--device-cgroup-rule"
@@ -504,15 +509,29 @@ fn container_long_option_takes_value(option: &str) -> bool {
             | "--gpus"
             | "--gidmap"
             | "--group-add"
+            | "--group-entry"
             | "--health-cmd"
             | "--health-interval"
+            | "--health-log-destination"
+            | "--health-max-log-count"
+            | "--health-max-log-size"
+            | "--health-on-failure"
             | "--health-retries"
             | "--health-start-interval"
             | "--health-start-period"
+            | "--health-startup-cmd"
+            | "--health-startup-interval"
+            | "--health-startup-retries"
+            | "--health-startup-success"
+            | "--health-startup-timeout"
             | "--health-timeout"
             | "--hostname"
+            | "--hosts-file"
+            | "--hostuser"
             | "--image-volume"
             | "--init-path"
+            | "--io-maxbandwidth"
+            | "--io-maxiops"
             | "--ip"
             | "--ip6"
             | "--ipc"
@@ -536,26 +555,41 @@ fn container_long_option_takes_value(option: &str) -> bool {
             | "--network-alias"
             | "--oom-score-adj"
             | "--os"
+            | "--passwd-entry"
+            | "--personality"
             | "--pid"
             | "--pidfile"
             | "--pids-limit"
             | "--platform"
             | "--pod"
+            | "--pod-id-file"
+            | "--preserve-fd"
             | "--preserve-fds"
             | "--publish"
             | "--pull"
+            | "--rdt-class"
+            | "--requires"
+            | "--retry"
+            | "--retry-delay"
             | "--restart"
             | "--runtime"
             | "--security-opt"
+            | "--seccomp-policy"
             | "--seccomp-profile"
+            | "--secret"
+            | "--sdnotify"
             | "--shm-size"
+            | "--shm-size-systemd"
             | "--stop-signal"
             | "--stop-timeout"
             | "--storage-opt"
             | "--subgidname"
             | "--subuidname"
             | "--sysctl"
+            | "--timeout"
             | "--tmpfs"
+            | "--tz"
+            | "--umask"
             | "--uidmap"
             | "--ulimit"
             | "--unsetenv"
@@ -565,6 +599,7 @@ fn container_long_option_takes_value(option: &str) -> bool {
             | "--volume"
             | "--volume-driver"
             | "--volumes-from"
+            | "--variant"
             | "--workdir"
     )
 }
@@ -1096,6 +1131,8 @@ executor_cwd = "~/executor"
             r#"["/usr/bin/podman", "run", "--detach=true", "runner-image"]"#,
             r#"["docker", "run", "--rm", "-dit", "runner-image"]"#,
             r#"["podman", "run", "-id", "--name", "runner", "runner-image"]"#,
+            r#"["podman", "run", "--sdnotify", "ignore", "-dit", "runner-image"]"#,
+            r#"["podman", "run", "--timeout", "0", "-dit", "runner-image"]"#,
         ] {
             let contents = format!(
                 "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"test-runner\"\nexecutor_cwd = \"/daemon\"\nexecutor = {executor}\n"
@@ -1152,6 +1189,61 @@ executor = ["docker", "run", "--detach=false", "runner-image"]
 "#;
         Config::from_toml_str_with_defaults(attached_false, defaults())
             .expect("an explicit false detach option keeps the container attached");
+    }
+
+    #[test]
+    fn documented_container_option_values_are_skipped_before_detach_flags() {
+        let value_options = [
+            ("--cert-dir", "/certs"),
+            ("--chrootdirs", "/srv"),
+            ("--cpu-count", "2"),
+            ("--cpu-percent", "50"),
+            ("--decryption-key", "/key"),
+            ("--health-log-destination", "/logs"),
+            ("--health-max-log-count", "5"),
+            ("--health-max-log-size", "100"),
+            ("--health-on-failure", "restart"),
+            ("--health-startup-cmd", "check"),
+            ("--health-startup-interval", "5s"),
+            ("--health-startup-retries", "3"),
+            ("--health-startup-success", "1"),
+            ("--health-startup-timeout", "30s"),
+            ("--group-entry", "runner:x:1000:"),
+            ("--hosts-file", "/etc/hosts"),
+            ("--hostuser", "runner"),
+            ("--io-maxbandwidth", "1mb"),
+            ("--io-maxiops", "100"),
+            ("--passwd-entry", "runner:x:1000:1000::/home/runner:/bin/sh"),
+            ("--personality", "linux/amd64"),
+            ("--pod-id-file", "/tmp/pod-id"),
+            ("--preserve-fd", "3"),
+            ("--rdt-class", "default"),
+            ("--requires", "database"),
+            ("--retry", "3"),
+            ("--retry-delay", "1s"),
+            ("--seccomp-policy", "default"),
+            ("--secret", "token"),
+            ("--sdnotify", "ignore"),
+            ("--shm-size-systemd", "64m"),
+            ("--timeout", "0"),
+            ("--tz", "UTC"),
+            ("--umask", "0022"),
+            ("--variant", "v8"),
+        ];
+
+        for (option, value) in value_options {
+            let arguments = [option, value, "-dit", "runner-image"].map(str::to_owned);
+            assert!(
+                container_run_detaches(&arguments),
+                "{option} must be skipped before checking detach flags"
+            );
+
+            let arguments = [option, "-d", "runner-image"].map(str::to_owned);
+            assert!(
+                !container_run_detaches(&arguments),
+                "{option} value must not be treated as a detach flag"
+            );
+        }
     }
 
     #[test]
