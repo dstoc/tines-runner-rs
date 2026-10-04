@@ -489,9 +489,11 @@ pub fn render_event_jsonl(
         .flat_map(|secret| {
             let json_escaped =
                 serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
+            let rust_escaped = format!("{secret:?}");
             [
                 secret.to_owned(),
                 json_escaped[1..json_escaped.len() - 1].to_owned(),
+                rust_escaped[1..rust_escaped.len() - 1].to_owned(),
             ]
         })
         .collect::<Vec<_>>();

@@ -271,7 +271,12 @@ fn clone_failure_protocol_results_redact_escaped_secret_directories() {
     let workspace_parent = directory.0.join("workspaces");
     fs::create_dir_all(&workspace_parent).expect("create workspace parent");
 
-    for secret in ["private\"value", "private\nvalue"] {
+    for secret in [
+        "private\"value",
+        "private\nvalue",
+        "private\u{8}value",
+        "private\u{85}value",
+    ] {
         let mut request = request_fixture(
             &workspace_parent,
             json!({
