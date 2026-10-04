@@ -182,11 +182,6 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
             let capabilities = state
                 .refresh_executor_capabilities(force_capability_refresh)
                 .clone();
-            let legacy_launch_capabilities = (!response.assignments.is_empty()).then(|| {
-                state
-                    .refresh_legacy_launch_capabilities(force_capability_refresh)
-                    .clone()
-            });
             for assignment in &response.assignments {
                 let run_id = assignment.run.id.clone();
                 if response.released_assignments.contains(&run_id) {
@@ -228,10 +223,6 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                 let worker_client = issue_client.clone();
                 let worker_default_executor = default_executor.clone();
                 let worker_capabilities = capabilities.clone();
-                let worker_legacy_launch_capabilities = legacy_launch_capabilities
-                    .as_ref()
-                    .expect("assignments trigger legacy launch capability discovery")
-                    .clone();
                 let worker_assignment = assignment.clone();
                 let worker_shutdown = shutdown.clone();
                 let worker_active_runs = active_runs.clone();
@@ -250,7 +241,6 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                             run_logs,
                             &worker_default_executor,
                             &worker_capabilities,
-                            &worker_legacy_launch_capabilities,
                             &worker_cancellation,
                             &context,
                         )

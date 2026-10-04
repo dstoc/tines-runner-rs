@@ -225,6 +225,7 @@ pub struct ResolvedAssignment {
     assignment: RunnerAssignment,
     context: AssignmentMatchContext,
     resolution: ConfigResolution,
+    api_url: String,
 }
 
 impl ResolvedAssignment {
@@ -239,6 +240,11 @@ impl ResolvedAssignment {
 
     pub fn resolution(&self) -> &ConfigResolution {
         &self.resolution
+    }
+
+    /// Tines API URL carried into the local executor request.
+    pub fn api_url(&self) -> &str {
+        &self.api_url
     }
 }
 
@@ -360,5 +366,6 @@ pub fn resolve_assignment(
         assignment: assignment.clone(),
         context,
         resolution,
+        api_url: config.server_url.to_string(),
     })
 }

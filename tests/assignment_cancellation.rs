@@ -196,24 +196,24 @@ fn executor_capabilities(accepts_asserted_effort: bool) -> ExecutorCapabilities 
 fn configured(
     directory: &TestDirectory,
     server_url: &str,
-    wrapper: Option<&PathBuf>,
+    executor: Option<&PathBuf>,
 ) -> (Config, Client, RunnerConnection) {
     let credentials_path = directory.0.join("credentials.toml");
     CredentialStore::at(&credentials_path)
         .save(&RunnerCredentials::new("rnr_cancel", "runner-token"))
         .expect("save runner credentials");
-    let wrapper = wrapper
+    let executor = executor
         .map(|path| {
             format!(
-                "wrapper = {}\n",
+                "executor = {}\n",
                 serde_json::to_string(&vec![path.to_string_lossy().into_owned()])
-                    .expect("encode wrapper")
+                    .expect("encode executor")
             )
         })
         .unwrap_or_default();
     let workspace_parent = directory.0.join("workspaces");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\n{wrapper}executor_cwd = \"~\"\nworkspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\nexecutor_cwd = \"~\"\n{executor}workspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
         workspace_parent,
         credentials_path
     ))
@@ -222,6 +222,21 @@ fn configured(
         Client::with_timeout(server_url, Duration::from_secs(5)).expect("create protocol client");
     let connection = RunnerConnection::connect(&config).expect("load runner credentials");
     (config, client, connection)
+}
+
+fn successful_executor(directory: &TestDirectory, name: &str) -> PathBuf {
+    let path = directory.0.join(name);
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"version":1,"type":"result","status":"completed","exit_code":0,"interrupted":false}'
+"#,
+    )
+    .expect("write executor stub");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("make executor stub executable");
+    path
 }
 
 fn prepared(config: &Config, client: &Client, assignment: &RunnerAssignment) -> PreparedAssignment {
@@ -271,13 +286,13 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
 #[test]
 fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
     let directory = TestDirectory::new();
-    let wrapper = directory.0.join("slow-wrapper");
-    fs::write(&wrapper, "#!/bin/sh\nexec sleep 30\n").expect("write wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make wrapper executable");
+    let executor = directory.0.join("slow-executor");
+    fs::write(&executor, "#!/bin/sh\nexec sleep 30\n").expect("write executor");
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755))
+        .expect("make executor executable");
 
-    let (server_url, server, _log_seen) = cancellation_server(4);
-    let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
+    let (server_url, server, _log_seen) = cancellation_server(3);
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let mut assignment = assignment(None);
     assignment.timeout_minutes = 0;
     let prepared = prepared(&config, &client, &assignment);
@@ -299,12 +314,11 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
 
     assert_eq!(outcome, ExecutionOutcome::Finished);
     let requests = server.join().expect("join fake Tines server");
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 3);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
     assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/logs "));
-    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/logs "));
-    assert!(requests[3].starts_with("POST /api/v1/runs/arun_cancel/finish "));
-    let (_, body) = requests[3].split_once("\r\n\r\n").expect("finish body");
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/finish "));
+    let (_, body) = requests[2].split_once("\r\n\r\n").expect("finish body");
     let finish: serde_json::Value = serde_json::from_str(body).expect("decode finish payload");
     assert_eq!(finish["status"], "failed");
     assert!(
@@ -319,17 +333,20 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
 fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
     let directory = TestDirectory::new();
     let pid_file = directory.0.join("descendant.pid");
-    let wrapper = directory.0.join("slow-wrapper");
+    let executor = directory.0.join("slow-executor");
     fs::write(
-        &wrapper,
-        "#!/bin/sh\n(trap '' TERM; exec sleep 30) &\necho $! > \"$PID_FILE\"\nwait\n",
+        &executor,
+        format!(
+            "#!/bin/sh\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        ),
     )
-    .expect("write wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make wrapper executable");
+    .expect("write executor");
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755))
+        .expect("make executor executable");
 
     let (server_url, server, log_seen) = cancellation_server(2);
-    let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let assignment = assignment(Some(&pid_file));
     let prepared = prepared(&config, &client, &assignment);
     let workspace_path = prepared.workspace().path().to_path_buf();
@@ -428,7 +445,6 @@ fn cancellation_during_metadata_enrichment_does_not_materialize_or_finish() {
             &tines_runner_rs::executor_capabilities::ExecutorCapabilities::unavailable(
                 "test cancellation",
             ),
-            &capabilities(),
             &worker_token,
             &context,
         )
@@ -478,7 +494,6 @@ fn unsupported_executor_declines_before_workspace_materialization() {
         &tines_runner_rs::executor_capabilities::ExecutorCapabilities::unavailable(
             "Codex is not installed in the executor",
         ),
-        &capabilities(),
         &CancellationToken::default(),
         &context,
     )
@@ -497,19 +512,11 @@ fn unsupported_executor_declines_before_workspace_materialization() {
 }
 
 #[test]
-fn executor_effort_does_not_authorize_unsupported_legacy_launch_effort() {
+fn executor_effort_capabilities_authorize_effort_without_a_legacy_launcher() {
     let directory = TestDirectory::new();
-    let (server_url, server, _log_seen) = cancellation_server(1);
-    let launch_marker = directory.0.join("legacy-launch-started");
-    let wrapper = directory.0.join("legacy-launcher");
-    fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nprintf started > {:?}\nexit 0\n", launch_marker),
-    )
-    .expect("write local launch wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make local launch wrapper executable");
-    let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
+    let (server_url, server, _log_seen) = cancellation_server(3);
+    let executor = successful_executor(&directory, "effort-executor");
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
         config.executor.clone(),
         config.executor_cwd.clone(),
@@ -518,12 +525,11 @@ fn executor_effort_does_not_authorize_unsupported_legacy_launch_effort() {
         ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
     let shutdown = ShutdownSignal::inactive();
     let context = ExecutionContext::new(&shutdown, &active_runs);
-    let legacy_launch_capabilities = capabilities();
     let mut assignment = assignment(None);
     assignment.effort = Some(RunnerAssignmentEffort {
         version: 1,
         value: "high".to_owned(),
-        capability_digest: Some(legacy_launch_capabilities.catalog_digest.clone()),
+        capability_digest: Some(capabilities().catalog_digest.clone()),
         verification: Some("asserted".to_owned()),
     });
 
@@ -535,61 +541,20 @@ fn executor_effort_does_not_authorize_unsupported_legacy_launch_effort() {
         tines_runner_rs::protocol::client::RunLogBuffer::new(),
         &default_executor,
         &executor_capabilities(true),
-        &legacy_launch_capabilities,
         &CancellationToken::default(),
         &context,
     )
-    .expect("decline effort that the local launcher cannot verify");
+    .expect("execute using the configured executor effort report");
 
-    assert!(
-        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("local legacy launcher"))
-    );
-    assert!(!launch_marker.exists(), "the local harness must not launch");
-    assert!(
-        !directory.0.join("workspaces").exists(),
-        "unsupported local effort is declined before workspace creation"
-    );
+    assert_eq!(outcome, AssignmentTaskOutcome::Finished);
     let requests = server.join().expect("join fake Tines server");
-    assert_eq!(requests.len(), 1, "only issue metadata is requested");
-}
-
-#[test]
-fn executor_harness_does_not_authorize_missing_local_codex() {
-    let directory = TestDirectory::new();
-    let (server_url, server, _log_seen) = cancellation_server(1);
-    let (config, client, connection) = configured(&directory, &server_url, None);
-    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
-        config.executor.clone(),
-        config.executor_cwd.clone(),
-    );
-    let active_runs =
-        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
-    let shutdown = ShutdownSignal::inactive();
-    let context = ExecutionContext::new(&shutdown, &active_runs);
-
-    let outcome = run_assignment(
-        &config,
-        &connection,
-        &client,
-        assignment(None),
-        tines_runner_rs::protocol::client::RunLogBuffer::new(),
-        &default_executor,
-        &executor_capabilities(true),
-        &EffortCapabilities::unavailable("test-runner", "codex", "Codex is not installed locally"),
-        &CancellationToken::default(),
-        &context,
-    )
-    .expect("decline an assignment when the local launcher lacks Codex");
-
-    assert!(
-        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("local legacy launcher"))
-    );
-    assert!(
-        !directory.0.join("workspaces").exists(),
-        "an unavailable local harness is declined before workspace creation"
-    );
-    let requests = server.join().expect("join fake Tines server");
-    assert_eq!(requests.len(), 1, "only issue metadata is requested");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
+    assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/logs "));
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/finish "));
+    let (_, finish_body) = requests[2].split_once("\r\n\r\n").expect("finish body");
+    let finish: serde_json::Value = serde_json::from_str(finish_body).expect("decode finish");
+    assert_eq!(finish["status"], "completed");
 }
 
 #[cfg(target_os = "linux")]

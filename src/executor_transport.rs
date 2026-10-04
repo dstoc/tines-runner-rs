@@ -21,7 +21,7 @@ use crate::execution_protocol::{
     TinesExecutionContext, WorkspacePolicy,
 };
 use crate::executor_capabilities::ExecutorCapabilities;
-use crate::process::{ProcessExit as ChildExit, ProcessStream, SupervisedProcess};
+use crate::process::{ProcessExit as ChildExit, ProcessIdentity, ProcessStream, SupervisedProcess};
 
 const EXECUTOR_MODE: &str = "execute";
 const CAPABILITIES_MODE: &str = "capabilities";
@@ -150,10 +150,43 @@ impl ExecutorTransport {
         request: &ExecutionRequest,
         deadline: Duration,
         termination_grace: Duration,
-        mut on_stdout: F,
+        on_stdout: F,
     ) -> Result<ExecutorOutput, ExecutorTransportError>
     where
         F: FnMut(&[u8]),
+    {
+        self.run_with_callbacks(
+            request,
+            deadline,
+            termination_grace,
+            || false,
+            || false,
+            |_, _| Ok(()),
+            on_stdout,
+            || {},
+        )
+    }
+
+    /// Run the executor while reporting its process identity and forwarding
+    /// cancellation, shutdown, stdout, and quiet-period callbacks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_callbacks<F, C, I, S, T>(
+        &self,
+        request: &ExecutionRequest,
+        deadline: Duration,
+        termination_grace: Duration,
+        is_cancelled: C,
+        is_interrupted: I,
+        mut on_started: S,
+        mut on_stdout: F,
+        on_tick: T,
+    ) -> Result<ExecutorOutput, ExecutorTransportError>
+    where
+        F: FnMut(&[u8]),
+        C: FnMut() -> bool,
+        I: FnMut() -> bool,
+        S: FnMut(&ProcessIdentity, Instant) -> Result<(), String>,
+        T: FnMut(),
     {
         request
             .validate()
@@ -174,33 +207,45 @@ impl ExecutorTransport {
             .current_dir(&working_directory);
         sanitize_executor_environment(&mut command, request);
 
-        let execution_deadline = Instant::now() + deadline;
         let process = SupervisedProcess::spawn_with_stdin_and_output(&mut command, input).map_err(
             |error| ExecutorTransportError::Spawn(redact_text(&error.to_string(), request)),
         )?;
+        let execution_deadline = Instant::now() + deadline;
+        if let Err(error) = on_started(process.identity(), execution_deadline) {
+            let error = redact_text(&error, request);
+            let _ = process.terminate(termination_grace);
+            return Err(ExecutorTransportError::Start(error));
+        }
         let mut stderr = BoundedStderr::new(request);
         let output = process
-            .wait_timeout_with_output(
+            .wait_timeout_with_output_or_shutdown(
                 execution_deadline.saturating_duration_since(Instant::now()),
                 termination_grace,
-                || false,
+                is_cancelled,
+                is_interrupted,
                 |chunk| match chunk.stream {
                     ProcessStream::Stdout => on_stdout(&chunk.bytes),
                     ProcessStream::Stderr => stderr.push(&chunk.bytes),
                 },
-                || {},
+                on_tick,
             )
             .map_err(|error| {
                 ExecutorTransportError::Wait(redact_text(&error.to_string(), request))
             })?;
 
-        if output.stdin_error.is_some() && !output.timed_out {
+        if output.stdin_error.is_some()
+            && !output.timed_out
+            && !output.cancelled
+            && !output.interrupted
+        {
             return Err(ExecutorTransportError::RequestDelivery);
         }
 
         Ok(ExecutorOutput {
             exit: output.exit,
             timed_out: output.timed_out,
+            cancelled: output.cancelled,
+            interrupted: output.interrupted,
             stderr: stderr.finish(),
         })
     }
@@ -211,6 +256,8 @@ impl ExecutorTransport {
 pub struct ExecutorOutput {
     pub exit: ChildExit,
     pub timed_out: bool,
+    pub cancelled: bool,
+    pub interrupted: bool,
     pub stderr: String,
 }
 
@@ -428,7 +475,12 @@ fn secret_forms(request: &ExecutionRequest) -> Vec<String> {
         .flat_map(|secret| {
             let escaped =
                 serde_json::to_string(&secret).expect("Rust strings always serialize to JSON");
-            [secret, escaped[1..escaped.len() - 1].to_owned()]
+            let rust_escaped = format!("{secret:?}");
+            [
+                secret,
+                escaped[1..escaped.len() - 1].to_owned(),
+                rust_escaped[1..rust_escaped.len() - 1].to_owned(),
+            ]
         })
         .collect::<Vec<_>>();
     forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
@@ -507,6 +559,7 @@ pub enum ExecutorTransportError {
     InvalidRequest(String),
     RequestSerialization,
     Spawn(String),
+    Start(String),
     RequestDelivery,
     Wait(String),
     Capabilities(&'static str),
@@ -520,6 +573,7 @@ impl fmt::Display for ExecutorTransportError {
             Self::InvalidRequest(error) => write!(f, "invalid executor request: {error}"),
             Self::RequestSerialization => f.write_str("could not serialize executor request"),
             Self::Spawn(error) => write!(f, "could not start executor transport: {error}"),
+            Self::Start(error) => write!(f, "could not initialize executor transport: {error}"),
             Self::RequestDelivery => {
                 f.write_str("executor closed stdin before receiving the complete request")
             }
@@ -535,6 +589,38 @@ impl Error for ExecutorTransportError {}
 mod tests {
     use super::{ExecutionRequest, safe_executor_environment};
     use std::ffi::OsString;
+
+    #[test]
+    fn review_debug_escaped_stderr_secret_is_redacted() {
+        let mut request = request();
+        request.assignment.env[0].value = "prefix\u{8}suffix".to_owned();
+        let diagnostic = format!("{:?}", request.assignment.env[0].value);
+        let mut stderr = super::BoundedStderr::new(&request);
+        stderr.push(diagnostic.as_bytes());
+        let diagnostic = stderr.finish();
+        assert!(
+            !diagnostic.contains("prefix\\u{8}suffix"),
+            "escaped secret remains in operator diagnostic: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn truncation_guard_accounts_for_rust_debug_escaped_secrets() {
+        let mut request = request();
+        request.assignment.env[0].value = format!("prefix{}suffix", "\u{8}".repeat(64));
+        let debug_secret = format!("{:?}", request.assignment.env[0].value);
+        let mut output = vec![b'x'; super::MAX_STDERR_DIAGNOSTIC_BYTES - 200];
+        output.extend_from_slice(debug_secret.as_bytes());
+
+        let mut stderr = super::BoundedStderr::new(&request);
+        stderr.push(&output);
+        let diagnostic = stderr.finish();
+        assert!(diagnostic.contains(super::STDERR_TRUNCATION_MARKER));
+        assert!(
+            !diagnostic.contains("prefix"),
+            "truncated secret prefix remains in operator diagnostic"
+        );
+    }
 
     fn request() -> ExecutionRequest {
         serde_json::from_value(serde_json::json!({
