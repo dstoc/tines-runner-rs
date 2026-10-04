@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::cancellation::CancellationToken;
 
+const MAX_OUTPUT_CHUNKS_PER_PASS: usize = 32;
+
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
@@ -501,14 +503,16 @@ impl SupervisedProcess {
                 let status = self.terminate_group(grace)?;
                 return self.collect_with(status, false, false, true, &mut on_output);
             }
-            if let Some(status) = self.child.try_wait()? {
-                self.terminate_remaining_group(grace)?;
-                return self.collect_with(status, false, false, false, &mut on_output);
-            }
             let now = Instant::now();
             if now >= deadline {
                 let status = self.terminate_group(grace)?;
-                return self.collect_with(status, true, false, false, &mut on_output);
+                // Drain the readers after termination, but do not let a slow
+                // output consumer extend the deadline after the process stops.
+                return self.collect_with(status, true, false, false, &mut |_| {});
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.terminate_remaining_group(grace)?;
+                return self.collect_with(status, false, false, false, &mut on_output);
             }
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
@@ -698,7 +702,10 @@ impl SupervisedProcess {
         let Some(output) = &self.output else {
             return;
         };
-        while let Ok((stream, bytes)) = output.try_recv() {
+        for _ in 0..MAX_OUTPUT_CHUNKS_PER_PASS {
+            let Ok((stream, bytes)) = output.try_recv() else {
+                break;
+            };
             on_output(ProcessChunk { stream, bytes });
         }
     }

@@ -2,12 +2,17 @@
 
 use std::env;
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::raw::{c_char, c_int};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 use crate::assignment::ResolvedAssignment;
 use crate::config::{ResolvedRunConfig, RunnerType, WorkspaceRetention};
@@ -20,6 +25,11 @@ use crate::process::{ProcessExit as ChildExit, ProcessStream, SupervisedProcess}
 const EXECUTOR_MODE: &str = "execute";
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 const STDERR_TRUNCATION_MARKER: &str = "\n[executor stderr truncated]";
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn access(pathname: *const c_char, mode: c_int) -> c_int;
+}
 
 /// Build the complete executor request from an assignment after daemon-side
 /// matching has selected its effective policy.
@@ -166,6 +176,7 @@ fn validate_executor_cwd(
             ),
         ));
     }
+    validate_executor_cwd_search_access(path, request)?;
     fs::read_dir(path).map_err(|error| {
         ExecutorTransportError::InvalidWorkingDirectory(redact_text(
             &format!(
@@ -184,6 +195,44 @@ fn validate_executor_cwd(
             request,
         ))
     })
+}
+
+#[cfg(unix)]
+fn validate_executor_cwd_search_access(
+    path: &Path,
+    request: &ExecutionRequest,
+) -> Result<(), ExecutorTransportError> {
+    const X_OK: c_int = 1;
+    let path_bytes = path.as_os_str().as_bytes();
+    let path_c = CString::new(path_bytes).map_err(|_| {
+        ExecutorTransportError::InvalidWorkingDirectory(redact_text(
+            "configured executor_cwd contains a null byte",
+            request,
+        ))
+    })?;
+    // access(X_OK) checks the permission needed to enter a directory without
+    // changing the daemon's current working directory.
+    if unsafe { access(path_c.as_ptr(), X_OK) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    Err(ExecutorTransportError::InvalidWorkingDirectory(
+        redact_text(
+            &format!(
+                "configured executor_cwd {} is inaccessible: {error}",
+                path.display()
+            ),
+            request,
+        ),
+    ))
+}
+
+#[cfg(not(unix))]
+fn validate_executor_cwd_search_access(
+    _path: &Path,
+    _request: &ExecutionRequest,
+) -> Result<(), ExecutorTransportError> {
+    Ok(())
 }
 
 fn sanitize_executor_environment(command: &mut Command, request: &ExecutionRequest) {

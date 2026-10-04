@@ -304,3 +304,51 @@ fn parses_stub_output_as_jsonl_machine_channel() {
         })]
     );
 }
+
+#[test]
+fn review_deadline_with_continuous_output() {
+    let directory = TestDirectory::new();
+    let stub = directory.0.join("flood-executor");
+    write_executable(
+        &stub,
+        "#!/bin/sh\ncat >/dev/null\nhead -c 4194304 /dev/zero\n",
+    );
+    let transport = ExecutorTransport::new(vec![stub.to_string_lossy().into_owned()], &directory.0);
+    let started = std::time::Instant::now();
+    let output = transport
+        .run(
+            &request("flood".to_owned()),
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+            |_| std::thread::sleep(Duration::from_millis(1)),
+        )
+        .unwrap();
+    assert!(
+        output.timed_out,
+        "continuous output must not bypass the deadline"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn review_cwd_without_search_permission() {
+    let directory = TestDirectory::new();
+    let cwd = directory.0.join("readable-but-not-searchable");
+    fs::create_dir(&cwd).unwrap();
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o400)).unwrap();
+    let transport = ExecutorTransport::new(vec!["/bin/true".to_owned()], &cwd);
+    let error = transport
+        .run(
+            &request("cwd".to_owned()),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            |_| {},
+        )
+        .unwrap_err();
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(
+        &error,
+        ExecutorTransportError::InvalidWorkingDirectory(_)
+    ));
+    assert!(error.to_string().contains("executor_cwd"));
+}
