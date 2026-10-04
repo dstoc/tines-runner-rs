@@ -58,11 +58,19 @@ fn main() -> ExitCode {
 }
 
 fn execute_stdin() -> ExitCode {
+    let shutdown = match tines_runner_rs::shutdown::ShutdownSignal::install() {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            eprintln!("executor could not install shutdown handler: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     match tines_runner_rs::execution_protocol::read_execution_request(std::io::stdin().lock()) {
         Ok(request) => tines_runner_rs::executor::execute_request(
             &request,
             &mut std::io::stdout().lock(),
             &mut std::io::stderr().lock(),
+            &shutdown,
         ),
         Err(error) => {
             eprintln!("executor request rejected: {error}");

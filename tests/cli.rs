@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Child;
@@ -358,6 +360,124 @@ fn execute_runs_harness_and_emits_one_terminal_protocol_result() {
             .is_none(),
         "one-shot preparation removes its workspace after successful setup"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn execute_sigterm_stops_harness_descendants_and_cleans_workspace() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("executor-workspaces");
+    let bin_directory = directory.0.join("executor-bin");
+    fs::create_dir_all(&bin_directory).expect("create executor bin directory");
+    let codex = bin_directory.join("codex");
+    let harness_pid_path = directory.0.join("harness.pid");
+    let descendant_pid_path = directory.0.join("descendant.pid");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 600) &\ndescendant=$!\nprintf '%s\\n' \"$$\" > '{}.tmp'\nmv '{}.tmp' '{}'\nprintf '%s\\n' \"$descendant\" > '{}.tmp'\nmv '{}.tmp' '{}'\nwait \"$descendant\"\n",
+            harness_pid_path.display(),
+            harness_pid_path.display(),
+            harness_pid_path.display(),
+            descendant_pid_path.display(),
+            descendant_pid_path.display(),
+            descendant_pid_path.display(),
+        ),
+    )
+    .expect("write Codex stub");
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
+        .expect("make Codex stub executable");
+
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/execution-request-v1.json"))
+            .expect("valid execution request fixture");
+    fixture["execution"]["workspace"]["parent"] =
+        serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
+    fixture["execution"]["retention"]["mode"] = serde_json::Value::String("always".to_owned());
+    fixture["assignment"]["effort"] = serde_json::Value::Null;
+
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin_directory).chain(std::env::split_paths(&current_path)),
+    )
+    .expect("compose executor PATH");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command
+        .arg("execute")
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.process_group(0);
+    let mut executor = command.spawn().expect("start executor CLI");
+    executor
+        .stdin
+        .take()
+        .expect("executor stdin")
+        .write_all(fixture.to_string().as_bytes())
+        .expect("write executor request");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let harness_pid = wait_for_pid_file(&mut executor, &harness_pid_path, deadline);
+    let descendant_pid = wait_for_pid_file(&mut executor, &descendant_pid_path, deadline);
+
+    let signal = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{}", executor.id())])
+        .status()
+        .expect("send SIGTERM to executor process group");
+    assert!(signal.success(), "SIGTERM command failed");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = executor.try_wait().expect("wait for executor shutdown") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "executor did not stop after SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success(), "interrupted executor reported success");
+    assert_process_stopped(harness_pid);
+    assert_process_stopped(descendant_pid);
+
+    let output = executor
+        .wait_with_output()
+        .expect("collect executor output after shutdown");
+    let stdout = String::from_utf8(output.stdout).expect("executor output is UTF-8");
+    let results = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .count();
+    assert_eq!(
+        results, 0,
+        "supervisor cancellation emitted a terminal result"
+    );
+    assert!(
+        fs::read_dir(&workspace_parent)
+            .expect("read workspace parent after interruption")
+            .next()
+            .is_none(),
+        "interruption left a workspace or retained-workspace marker"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pid_file(child: &mut Child, path: &std::path::Path, deadline: Instant) -> u32 {
+    loop {
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Ok(process_id) = contents.trim().parse::<u32>()
+        {
+            return process_id;
+        }
+        if let Some(status) = child.try_wait().expect("check executor startup") {
+            panic!("executor exited before harness startup: {status}");
+        }
+        assert!(Instant::now() < deadline, "harness did not publish its PID");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

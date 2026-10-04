@@ -19,6 +19,7 @@ use crate::harness::{HarnessExit, adapter_for};
 use crate::process::{ProcessExit, ProcessStream, SupervisedProcess};
 use crate::protocol::FinishStatus;
 use crate::retention;
+use crate::shutdown::ShutdownSignal;
 use crate::workspace::{MaterializedWorkspace, WorkspaceError};
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
@@ -107,6 +108,7 @@ pub fn execute_request(
     request: &ExecutionRequest,
     output: &mut impl Write,
     diagnostics: &mut impl Write,
+    shutdown: &ShutdownSignal,
 ) -> ExitCode {
     if let Err(error) = request.validate() {
         let _ = writeln!(diagnostics, "executor request rejected: {error}");
@@ -198,10 +200,11 @@ pub fn execute_request(
                             let timeout = Duration::from_secs(
                                 request.assignment.timeout_minutes.saturating_mul(60),
                             );
-                            match process.wait_timeout_with_output(
+                            match process.wait_timeout_with_output_or_shutdown(
                                 timeout,
                                 TERMINATION_GRACE,
                                 || false,
+                                || shutdown.is_requested(),
                                 |chunk| {
                                     if streamed_error.is_some() {
                                         return;
@@ -270,6 +273,16 @@ pub fn execute_request(
                                             .err()
                                             .map(|error| error.to_string());
                                         }
+                                    }
+
+                                    if output_status.interrupted {
+                                        if workspace.cleanup().is_err() {
+                                            let _ = writeln!(
+                                                diagnostics,
+                                                "executor could not clean workspace after interruption"
+                                            );
+                                        }
+                                        return ExitCode::FAILURE;
                                     }
 
                                     let output_failed = streamed_error.is_some();
