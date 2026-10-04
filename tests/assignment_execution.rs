@@ -166,19 +166,66 @@ fn capabilities() -> EffortCapabilities {
 
 fn run_case(exit_code: i32, expected_status: &str) {
     let directory = TestDirectory::new();
-    let fixture_path = directory.0.join("codex-output.jsonl");
-    fs::write(&fixture_path, include_str!("fixtures/codex-stream.jsonl"))
-        .expect("write Codex fixture");
-    let script_path = directory.0.join("stub-codex-wrapper");
+    let fixture_path = directory.0.join("executor-events.jsonl");
+    let script_path = directory.0.join("stub-executor");
+    let status = if exit_code == 0 {
+        "completed"
+    } else {
+        "failed"
+    };
+    let error = (exit_code != 0)
+        .then(|| format!("executor exited with code {exit_code}; fixture failed: issue-run-key"));
+    let evidence_status = if exit_code == 0 {
+        "complete"
+    } else {
+        "incomplete_attempt"
+    };
+    let events = [
+        json!({"version":1,"type":"log","stream":"stdout","message":"[session] started; fixture failed: issue-run-key"}),
+        json!({"version":1,"type":"session","provider":"codex","id":"01a09e68-24d8-78d3-8bc7-67037a0cd7de"}),
+        json!({"version":1,"type":"usage","input_tokens":8913,"output_tokens":1980,"cache_read_tokens":101888,"cache_write_tokens":0}),
+        json!({
+            "version":1,
+            "type":"result",
+            "status":status,
+            "exit_code":exit_code,
+            "error":error,
+            "provider_session_id":"01a09e68-24d8-78d3-8bc7-67037a0cd7de",
+            "usage":{"input_tokens":8913,"output_tokens":1980,"cache_read_tokens":101888,"cache_write_tokens":0},
+            "pricing_evidence":{
+                "provider":"codex",
+                "version":1,
+                "payload":{
+                    "version":1,
+                    "harness":"codex",
+                    "model":"gpt-5.1-codex",
+                    "identity_source":"launch_argument",
+                    "usage_scope":"thread_total",
+                    "session_mode":"cold",
+                    "normalization":"codex-jsonl-v1",
+                    "model_rerouted":false,
+                    "measurement_status":evidence_status,
+                    "terminal_snapshots":1
+                }
+            },
+            "interrupted":false
+        }),
+    ];
+    let mut fixture = String::new();
+    for event in events {
+        fixture.push_str(&serde_json::to_string(&event).expect("encode executor event"));
+        fixture.push('\n');
+    }
+    fs::write(&fixture_path, fixture).expect("write executor event fixture");
     let script = format!(
-        "#!/bin/sh\ncat '{}'\nif [ '{}' -ne 0 ]; then echo \"fixture failed: $TINES_API_KEY\" >&2; fi\nexit '{}'\n",
+        "#!/bin/sh\ncat > '{}.request'\ncat '{}'\nif [ '{}' -ne 0 ]; then echo 'executor diagnostic: issue-run-key' >&2; fi\n",
+        directory.0.join("capture").display(),
         fixture_path.display(),
-        exit_code,
         exit_code
     );
-    fs::write(&script_path, script).expect("write stub Codex wrapper");
+    fs::write(&script_path, script).expect("write stub executor");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-        .expect("make stub wrapper executable");
+        .expect("make stub executor executable");
 
     let workspace_parent = directory.0.join("workspaces");
     fs::create_dir_all(&workspace_parent).expect("create workspace parent");
@@ -192,12 +239,12 @@ fn run_case(exit_code: i32, expected_status: &str) {
             "runner-token",
         ))
         .expect("write runner credentials");
-    let wrapper = serde_json::to_string(&vec![script_path.to_string_lossy().into_owned()])
-        .expect("encode wrapper config");
+    let executor = serde_json::to_string(&vec![script_path.to_string_lossy().into_owned()])
+        .expect("encode executor config");
     let workspace_parent = serde_json::to_string(&workspace_parent.to_string_lossy().as_ref())
         .expect("encode workspace path");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nwrapper = {wrapper}\nworkspace_parent = {workspace_parent}\n[storage]\ncredentials_file = {}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nexecutor = {executor}\nworkspace_parent = {workspace_parent}\n[storage]\ncredentials_file = {}\n",
         serde_json::to_string(&credentials_path.to_string_lossy().as_ref())
             .expect("encode credentials path")
     ))
@@ -250,18 +297,12 @@ fn run_case(exit_code: i32, expected_status: &str) {
     let (_, first_log_body) = requests[1].split_once("\r\n\r\n").expect("first log body");
     let first_log: Value = serde_json::from_str(first_log_body).expect("decode first log");
     assert_eq!(first_log["seq"], 1);
-    assert!(
-        first_log["chunk"]
-            .as_str()
-            .unwrap()
-            .contains("# tines runner: version=")
-    );
+    assert_eq!(first_log["chunk"], "");
     let (_, log_body) = requests[2].split_once("\r\n\r\n").expect("log body");
     let log: Value = serde_json::from_str(log_body).expect("decode log payload");
     let chunk = log["chunk"].as_str().unwrap();
     assert_eq!(log["seq"], 2);
     assert!(chunk.contains("[session] started"));
-    assert!(chunk.contains(&format!("# tines runner: exit code={exit_code}")));
     assert!(!chunk.contains("issue-run-key"));
     if expected_status == "failed" {
         assert!(chunk.contains("[REDACTED]"));
@@ -309,11 +350,11 @@ fn run_case(exit_code: i32, expected_status: &str) {
 }
 
 #[test]
-fn real_executor_reports_completed_run_and_cleans_after_finish_retry() {
+fn stub_executor_reports_completed_run_and_cleans_after_finish_retry() {
     run_case(0, "completed");
 }
 
 #[test]
-fn real_executor_reports_failed_run_with_usage_and_cleans_after_finish_retry() {
+fn stub_executor_reports_failed_run_with_usage_and_cleans_after_finish_retry() {
     run_case(7, "failed");
 }

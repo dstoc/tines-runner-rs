@@ -32,17 +32,29 @@ impl TestDirectory {
     }
 
     fn create_stub(&self) -> std::path::PathBuf {
-        let path = self.path.join("stub-codex");
-        fs::write(&path, include_str!("support/stub_codex.sh")).expect("write Codex stub");
+        let path = self.path.join("stub-executor");
+        fs::write(&path, include_str!("support/stub_executor.sh")).expect("write executor stub");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .expect("make Codex stub executable");
+            .expect("make executor stub executable");
         let bin = self.path.join("bin");
         fs::create_dir_all(&bin).expect("create isolated Codex PATH directory");
         let codex = bin.join("codex");
-        fs::copy(&path, &codex).expect("install fake Codex CLI");
+        fs::write(&codex, include_str!("support/stub_codex.sh")).expect("install fake Codex CLI");
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
             .expect("make fake Codex CLI executable");
         path
+    }
+
+    fn write_events(&self, run_id: &str, events: impl IntoIterator<Item = Value>) {
+        let directory = self.path.join("events");
+        fs::create_dir_all(&directory).expect("create executor event fixture directory");
+        let mut contents = String::new();
+        for event in events {
+            contents.push_str(&serde_json::to_string(&event).expect("encode executor event"));
+            contents.push('\n');
+        }
+        fs::write(directory.join(format!("{run_id}.jsonl")), contents)
+            .expect("write executor event fixture");
     }
 
     fn configure(
@@ -56,19 +68,23 @@ impl TestDirectory {
         fs::create_dir_all(&config_dir).expect("create runner config directory");
         let credentials = self.path.join("credentials.toml");
         let workspaces = self.path.join("workspaces");
-        let default_wrapper = wrapper(stub, "default");
-        let executor = serde_json::to_string(&[env!("CARGO_BIN_EXE_tines-runner-rs")])
-            .expect("serialize native executor command");
+        let events = self.path.join("events");
+        let captures = self.path.join("captures");
+        let control = self.path.join("control");
+        for directory in [&events, &captures, &control] {
+            fs::create_dir_all(directory).expect("create executor fixture directory");
+        }
+        let default_executor = executor(stub, "default", &events, &captures, &control);
         let override_section = if selected_override {
             format!(
-                "\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nwrapper = {}\n",
-                wrapper(stub, "selected")
+                "\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor = {}\n",
+                executor(stub, "selected", &events, &captures, &control)
             )
         } else {
             String::new()
         };
         let config = format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor = {executor}\nexecutor_cwd = \"~\"\nwrapper = {default_wrapper}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nexecutor = {default_executor}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
             workspaces, credentials
         );
         fs::write(config_dir.join("config.toml"), config).expect("write runner config");
@@ -171,9 +187,21 @@ impl Drop for RunnerProcess {
     }
 }
 
-fn wrapper(stub: &std::path::Path, label: &str) -> String {
-    serde_json::to_string(&vec![stub.to_string_lossy().into_owned(), label.to_owned()])
-        .expect("encode wrapper argv")
+fn executor(
+    stub: &std::path::Path,
+    label: &str,
+    events: &std::path::Path,
+    captures: &std::path::Path,
+    control: &std::path::Path,
+) -> String {
+    serde_json::to_string(&vec![
+        stub.to_string_lossy().into_owned(),
+        label.to_owned(),
+        events.to_string_lossy().into_owned(),
+        captures.to_string_lossy().into_owned(),
+        control.to_string_lossy().into_owned(),
+    ])
+    .expect("encode executor argv")
 }
 
 fn assignment(run_id: &str, timeout_minutes: u64, env: Vec<Value>) -> Value {
@@ -195,16 +223,6 @@ fn assignment(run_id: &str, timeout_minutes: u64, env: Vec<Value>) -> Value {
         "timeout_minutes": timeout_minutes,
         "env": env
     })
-}
-
-fn env(name: &str, value: impl Into<String>) -> Value {
-    json!({"name": name, "value": value.into(), "secret": false})
-}
-
-fn write_jsonl(directory: &TestDirectory, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = directory.path.join(name);
-    fs::write(&path, contents).expect("write controlled Codex JSONL");
-    path
 }
 
 fn create_local_repository(directory: &std::path::Path) -> std::path::PathBuf {
@@ -275,35 +293,43 @@ fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 1, true);
     let local_repository = create_local_repository(&directory.path.join("acceptance-repository"));
-
-    let jsonl = write_jsonl(
-        &directory,
-        "success.jsonl",
-        concat!(
-            "{\"type\":\"thread.started\",\"thread_id\":\"thread-from-stub\"}\n",
-            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":20,\"cache_write_input_tokens\":5,\"output_tokens\":7}}\n"
-        ),
+    directory.write_events(
+        "arun_happy",
+        [
+            json!({"version":1,"type":"log","stream":"stdout","message":"thread-from-stub started"}),
+            json!({"version":1,"type":"session","provider":"codex","id":"thread-from-stub"}),
+            json!({"version":1,"type":"usage","input_tokens":75,"output_tokens":7,"cache_read_tokens":20,"cache_write_tokens":5}),
+            json!({
+                "version":1,
+                "type":"result",
+                "status":"completed",
+                "exit_code":0,
+                "provider_session_id":"thread-from-stub",
+                "usage":{"input_tokens":75,"output_tokens":7,"cache_read_tokens":20,"cache_write_tokens":5},
+                "pricing_evidence":{
+                    "provider":"codex",
+                    "version":1,
+                    "payload":{
+                        "version":1,
+                        "harness":"codex",
+                        "model":"gpt-5.1-codex",
+                        "identity_source":"launch_argument",
+                        "usage_scope":"thread_total",
+                        "session_mode":"cold",
+                        "normalization":"codex-jsonl-v1",
+                        "model_rerouted":false,
+                        "measurement_status":"complete",
+                        "terminal_snapshots":1
+                    }
+                },
+                "interrupted":false
+            }),
+        ],
     );
-    let wrapper_marker = directory.path.join("wrapper-selected.txt");
-    let args_file = directory.path.join("codex-args.txt");
-    let workspace_probe = directory.path.join("workspace-probe.txt");
-    let run_key_probe = directory.path.join("run-key-api.json");
     let mut routed_assignment = assignment(
         "arun_happy",
         5,
-        vec![
-            env("FAKE_CODEX_JSONL_FILE", jsonl.to_string_lossy()),
-            env("FAKE_CODEX_WRAPPER_FILE", wrapper_marker.to_string_lossy()),
-            env("FAKE_CODEX_ARGS_FILE", args_file.to_string_lossy()),
-            env(
-                "FAKE_CODEX_WORKSPACE_PROBE_FILE",
-                workspace_probe.to_string_lossy(),
-            ),
-            env(
-                "FAKE_CODEX_RUN_KEY_PROBE_FILE",
-                run_key_probe.to_string_lossy(),
-            ),
-        ],
+        vec![json!({"name":"DEPLOY_TOKEN","value":"integration-secret","secret":true})],
     );
     routed_assignment["run"]["issue_ref"]["number"] = json!(2301);
     routed_assignment["run"]["issue_ref"]["title"] = json!("Acceptance fixture issue");
@@ -326,33 +352,34 @@ fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
     assert_eq!(finish["usage"]["cache_read_tokens"], 20);
     assert_eq!(finish["usage"]["cache_write_tokens"], 5);
     assert_eq!(finish["usage"]["output_tokens"], 7);
+    let captures = directory.path.join("captures");
     assert_eq!(
-        fs::read_to_string(&wrapper_marker)
-            .expect("read selected wrapper marker")
+        fs::read_to_string(captures.join("arun_happy.executor"))
+            .expect("read selected executor marker")
             .trim(),
         "selected",
-        "project, workflow, and state selectors choose the override"
+        "project, workflow, and state selectors choose the executor override"
     );
-    let workspace_evidence = fs::read_to_string(&workspace_probe)
-        .expect("read workspace materialization evidence from the harness");
-    assert!(
-        workspace_evidence.contains("workspace=")
-            && workspace_evidence.contains("prompt=exercise arun_happy")
-            && workspace_evidence.contains("repo=materialized from routed test repository"),
-        "harness sees the assignment prompt and cloned repository: {workspace_evidence:?}"
+    let executor_request: Value = serde_json::from_slice(
+        &fs::read(captures.join("arun_happy.request.json")).expect("read executor request"),
+    )
+    .expect("decode executor request");
+    assert_eq!(
+        executor_request["assignment"]["prompt"],
+        "exercise arun_happy"
     );
-    let run_key_response = fs::read_to_string(&run_key_probe)
-        .expect("read successful Tines API response fetched by the Codex stub");
-    assert!(
-        run_key_response.contains("\"id\":\"iss_arun_happy\"")
-            && run_key_response.contains("\"name\":\"Implementation\""),
-        "Codex stub can use its run key to read issue details: {run_key_response:?}"
+    assert_eq!(
+        executor_request["assignment"]["run_key"],
+        "issue-run-key-arun_happy"
     );
-    let args = fs::read_to_string(args_file).expect("read captured Codex argv");
-    assert!(
-        args.starts_with("codex\nexec\n--json\n--skip-git-repo-check\n--model\ngpt-5.1-codex\n")
+    assert_eq!(
+        executor_request["assignment"]["env"][0]["value"],
+        "integration-secret"
     );
-    assert!(args.ends_with("exercise arun_happy\n"));
+    assert_eq!(
+        executor_request["assignment"]["bundle"]["repos"][0]["dir"],
+        "materialized"
+    );
 
     wait_for_quiet_poll(&fake, "arun_happy");
     stop_gracefully(&fake, &mut runner);
@@ -395,8 +422,8 @@ fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
         .collect::<Vec<_>>();
     assert_eq!(
         issue_detail_requests.len(),
-        2,
-        "both the runner and harness use the run-key issue API"
+        1,
+        "the daemon resolves issue metadata before it launches the executor"
     );
     assert!(issue_detail_requests.iter().all(|request| {
         request.header("authorization") == Some("Bearer issue-run-key-arun_happy")
@@ -416,11 +443,12 @@ fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
         log_attempts[1].json()["chunk"]
     );
     let accepted_logs = fake.accepted_logs();
-    assert!(accepted_logs.iter().any(|log| {
-        log["chunk"]
-            .as_str()
-            .is_some_and(|chunk| chunk.contains("thread-from-stub"))
-    }));
+    let accepted_log_output = accepted_logs
+        .iter()
+        .filter_map(|log| log["chunk"].as_str())
+        .collect::<String>();
+    assert!(accepted_log_output.contains("thread-from-stub"));
+    assert!(!accepted_log_output.contains("integration-secret"));
     assert!(
         requests.iter().any(|request| {
             request.target == "/api/v1/runs/arun_happy/logs"
@@ -456,25 +484,24 @@ fn stub_rate_limit_jsonl_is_reported_as_a_failed_rate_limited_run() {
     let fake = FakeTines::start();
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 1, false);
-    let jsonl = write_jsonl(
-        &directory,
-        "rate-limit.jsonl",
-        concat!(
-            "{\"type\":\"thread.started\",\"thread_id\":\"thread-limited\"}\n",
-            "{\"type\":\"turn.failed\",\"error\":{\"codex_error_info\":\"rate_limit_exceeded\",\"message\":\"Rate limit exceeded.\",\"retry_at\":2000000000000}}\n"
-        ),
+    directory.write_events(
+        "arun_rate_limit",
+        [
+            json!({"version":1,"type":"session","provider":"codex","id":"thread-limited"}),
+            json!({
+                "version":1,
+                "type":"result",
+                "status":"rate_limited",
+                "exit_code":17,
+                "error":"Rate limit exceeded.",
+                "provider_session_id":"thread-limited",
+                "rate_limit":{"resume_at":2_000_000_000_000_u64,"message":"Rate limit exceeded."},
+                "interrupted":false
+            }),
+        ],
     );
     fake.enqueue_poll(json!({
-        "assignments": [assignment(
-            "arun_rate_limit",
-            5,
-            vec![
-                env("FAKE_CODEX_JSONL_FILE", jsonl.to_string_lossy()),
-                env("FAKE_CODEX_WRAPPER_FILE", directory.path.join("wrapper.txt").to_string_lossy()),
-                env("FAKE_CODEX_ARGS_FILE", directory.path.join("args.txt").to_string_lossy()),
-                env("FAKE_CODEX_EXIT_CODE", "17"),
-            ],
-        )],
+        "assignments": [assignment("arun_rate_limit", 5, Vec::new())],
         "cancels": []
     }));
 
@@ -489,39 +516,53 @@ fn stub_rate_limit_jsonl_is_reported_as_a_failed_rate_limited_run() {
 }
 
 #[test]
+fn malformed_executor_output_fails_without_leaking_assignment_secrets() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    directory.configure(fake.url().as_str(), &stub, 1, false);
+    let events = directory.path.join("events");
+    fs::write(
+        events.join("arun_broken.jsonl"),
+        "not-json issue-run-key-arun_broken\n",
+    )
+    .expect("write malformed executor output");
+    fs::write(
+        directory.path.join("control/arun_broken.stderr"),
+        "executor diagnostic issue-run-key-arun_broken\n",
+    )
+    .expect("write executor stderr diagnostic");
+    fake.enqueue_poll(json!({
+        "assignments": [assignment("arun_broken", 5, Vec::new())],
+        "cancels": []
+    }));
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    let finishes = fake.wait_for_finishes(1, Duration::from_secs(20));
+    assert_eq!(finishes[0]["status"], "failed");
+    let error = finishes[0]["error"].as_str().expect("finish error");
+    assert!(error.contains("malformed executor JSONL at line 1"));
+    assert!(error.contains("Executor stderr:"));
+    assert!(error.contains("[REDACTED]"));
+    assert!(!error.contains("issue-run-key-arun_broken"));
+    wait_for_quiet_poll(&fake, "arun_broken");
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
 fn concurrent_assignments_run_in_parallel_and_finish_independently() {
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 2, false);
-    let barrier = directory.path.join("barrier");
-    fs::create_dir_all(&barrier).expect("create Codex concurrency barrier");
+    let control = directory.path.join("control");
+    let barrier = control.join("barrier");
     let assignments = ["arun_parallel_a", "arun_parallel_b"]
         .into_iter()
         .map(|run_id| {
-            assignment(
-                run_id,
-                5,
-                vec![
-                    env("FAKE_CODEX_BARRIER_DIR", barrier.to_string_lossy()),
-                    env("FAKE_CODEX_BARRIER_NAME", run_id),
-                    env("FAKE_CODEX_BARRIER_COUNT", "2"),
-                    env(
-                        "FAKE_CODEX_WRAPPER_FILE",
-                        directory
-                            .path
-                            .join(format!("{run_id}.wrapper"))
-                            .to_string_lossy(),
-                    ),
-                    env(
-                        "FAKE_CODEX_ARGS_FILE",
-                        directory
-                            .path
-                            .join(format!("{run_id}.args"))
-                            .to_string_lossy(),
-                    ),
-                ],
-            )
+            fs::write(control.join(format!("{run_id}.barrier")), "2")
+                .expect("configure executor concurrency barrier");
+            assignment(run_id, 5, Vec::new())
         })
         .collect::<Vec<_>>();
     fake.enqueue_poll(json!({"assignments": assignments, "cancels": []}));
@@ -556,17 +597,12 @@ fn supervisor_cancellation_kills_stub_descendants_and_is_acknowledged() {
     let fake = FakeTines::start();
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 1, false);
-    let child_pid_file = directory.path.join("codex-child.pid");
+    let control = directory.path.join("control");
+    fs::write(control.join("arun_cancel.child"), "spawn child")
+        .expect("configure executor child process");
+    let child_pid_file = control.join("arun_cancel.pid");
     fake.enqueue_poll(json!({
-        "assignments": [assignment(
-            "arun_cancel",
-            5,
-            vec![
-                env("FAKE_CODEX_CHILD_PID_FILE", child_pid_file.to_string_lossy()),
-                env("FAKE_CODEX_WRAPPER_FILE", directory.path.join("wrapper.txt").to_string_lossy()),
-                env("FAKE_CODEX_ARGS_FILE", directory.path.join("args.txt").to_string_lossy()),
-            ],
-        )],
+        "assignments": [assignment("arun_cancel", 5, Vec::new())],
         "cancels": []
     }));
 
@@ -616,16 +652,10 @@ fn zero_minute_assignment_timeout_uses_the_protocol_finish_path() {
     let fake = FakeTines::start();
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 1, false);
+    fs::write(directory.path.join("control/arun_timeout.sleep"), "30")
+        .expect("configure executor timeout");
     fake.enqueue_poll(json!({
-        "assignments": [assignment(
-            "arun_timeout",
-            0,
-            vec![
-                env("FAKE_CODEX_SLEEP_SECONDS", "30"),
-                env("FAKE_CODEX_WRAPPER_FILE", directory.path.join("wrapper.txt").to_string_lossy()),
-                env("FAKE_CODEX_ARGS_FILE", directory.path.join("args.txt").to_string_lossy()),
-            ],
-        )],
+        "assignments": [assignment("arun_timeout", 0, Vec::new())],
         "cancels": []
     }));
 
@@ -648,17 +678,12 @@ fn restart_recovers_a_crashed_run_before_polling_with_empty_ownership() {
     let fake = FakeTines::start();
     let stub = directory.create_stub();
     directory.configure(fake.url().as_str(), &stub, 1, false);
-    let child_pid_file = directory.path.join("crash-child.pid");
+    let control = directory.path.join("control");
+    fs::write(control.join("arun_crash.child"), "spawn child")
+        .expect("configure executor child process");
+    let child_pid_file = control.join("arun_crash.pid");
     fake.enqueue_poll(json!({
-        "assignments": [assignment(
-            "arun_crash",
-            5,
-            vec![
-                env("FAKE_CODEX_CHILD_PID_FILE", child_pid_file.to_string_lossy()),
-                env("FAKE_CODEX_WRAPPER_FILE", directory.path.join("wrapper.txt").to_string_lossy()),
-                env("FAKE_CODEX_ARGS_FILE", directory.path.join("args.txt").to_string_lossy()),
-            ],
-        )],
+        "assignments": [assignment("arun_crash", 5, Vec::new())],
         "cancels": []
     }));
 

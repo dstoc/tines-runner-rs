@@ -196,24 +196,24 @@ fn executor_capabilities(accepts_asserted_effort: bool) -> ExecutorCapabilities 
 fn configured(
     directory: &TestDirectory,
     server_url: &str,
-    wrapper: Option<&PathBuf>,
+    executor: Option<&PathBuf>,
 ) -> (Config, Client, RunnerConnection) {
     let credentials_path = directory.0.join("credentials.toml");
     CredentialStore::at(&credentials_path)
         .save(&RunnerCredentials::new("rnr_cancel", "runner-token"))
         .expect("save runner credentials");
-    let wrapper = wrapper
+    let executor = executor
         .map(|path| {
             format!(
-                "wrapper = {}\n",
+                "executor = {}\n",
                 serde_json::to_string(&vec![path.to_string_lossy().into_owned()])
-                    .expect("encode wrapper")
+                    .expect("encode executor")
             )
         })
         .unwrap_or_default();
     let workspace_parent = directory.0.join("workspaces");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\n{wrapper}executor_cwd = \"~\"\nworkspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\nexecutor_cwd = \"~\"\n{executor}workspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
         workspace_parent,
         credentials_path
     ))
@@ -271,13 +271,13 @@ fn cancellation_before_spawn_cleans_the_workspace_without_logs_or_finish() {
 #[test]
 fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
     let directory = TestDirectory::new();
-    let wrapper = directory.0.join("slow-wrapper");
-    fs::write(&wrapper, "#!/bin/sh\nexec sleep 30\n").expect("write wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make wrapper executable");
+    let executor = directory.0.join("slow-executor");
+    fs::write(&executor, "#!/bin/sh\nexec sleep 30\n").expect("write executor");
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755))
+        .expect("make executor executable");
 
-    let (server_url, server, _log_seen) = cancellation_server(4);
-    let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
+    let (server_url, server, _log_seen) = cancellation_server(3);
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let mut assignment = assignment(None);
     assignment.timeout_minutes = 0;
     let prepared = prepared(&config, &client, &assignment);
@@ -299,12 +299,11 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
 
     assert_eq!(outcome, ExecutionOutcome::Finished);
     let requests = server.join().expect("join fake Tines server");
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 3);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
     assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/logs "));
-    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/logs "));
-    assert!(requests[3].starts_with("POST /api/v1/runs/arun_cancel/finish "));
-    let (_, body) = requests[3].split_once("\r\n\r\n").expect("finish body");
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/finish "));
+    let (_, body) = requests[2].split_once("\r\n\r\n").expect("finish body");
     let finish: serde_json::Value = serde_json::from_str(body).expect("decode finish payload");
     assert_eq!(finish["status"], "failed");
     assert!(
@@ -319,17 +318,20 @@ fn local_timeout_kills_the_harness_and_reports_a_failed_finish() {
 fn cancellation_while_running_kills_the_process_group_without_logs_or_finish() {
     let directory = TestDirectory::new();
     let pid_file = directory.0.join("descendant.pid");
-    let wrapper = directory.0.join("slow-wrapper");
+    let executor = directory.0.join("slow-executor");
     fs::write(
-        &wrapper,
-        "#!/bin/sh\n(trap '' TERM; exec sleep 30) &\necho $! > \"$PID_FILE\"\nwait\n",
+        &executor,
+        format!(
+            "#!/bin/sh\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        ),
     )
-    .expect("write wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make wrapper executable");
+    .expect("write executor");
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755))
+        .expect("make executor executable");
 
     let (server_url, server, log_seen) = cancellation_server(2);
-    let (config, client, connection) = configured(&directory, &server_url, Some(&wrapper));
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let assignment = assignment(Some(&pid_file));
     let prepared = prepared(&config, &client, &assignment);
     let workspace_path = prepared.workspace().path().to_path_buf();

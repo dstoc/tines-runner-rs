@@ -672,7 +672,7 @@ fn explicit_configs_register_separate_runners_and_credentials() {
         fs::write(
             &config_path,
             format!(
-                "[server]\nurl = {server_url:?}\n[runner]\nname = {runner_name:?}\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {credentials_value}\n"
+                "[server]\nurl = {server_url:?}\n[runner]\nname = {runner_name:?}\n[storage]\ncredentials_file = {credentials_value}\n"
             ),
         )
         .expect("write selected runner config");
@@ -768,7 +768,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -830,7 +830,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("update runner config for restart");
@@ -881,7 +881,7 @@ fn daemon_uses_its_first_poll_to_authenticate_and_detect_fencing() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nmax_concurrent = 2\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -944,7 +944,7 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"cli-test-runner\"\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -1001,7 +1001,7 @@ fn startup_fails_when_tines_is_unavailable() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = \"http://{address}\"\n[runner]\nname = \"cli-test-runner\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {credentials_path}\n"
+            "[server]\nurl = \"http://{address}\"\n[runner]\nname = \"cli-test-runner\"\n[storage]\ncredentials_file = {credentials_path}\n"
         ),
     )
     .expect("write runner config");
@@ -1046,39 +1046,31 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
         "runner_id = \"rnr_shutdown\"\nrunner_token = \"shutdown-token\"\n",
     )
     .expect("write runner credentials");
-    let wrapper_path = directory.0.join("stub-codex");
-    let executor_path = directory.0.join("capability-executor");
+    let executor_path = directory.0.join("stub-executor");
     let descendant_path = directory.0.join("descendant.pid");
+    let capabilities_document = r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#;
     fs::write(
-        &wrapper_path,
+        &executor_path,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"codex\" ] && [ \"$2\" = \"--version\" ]; then printf 'codex-fake 0.1.0\\n'; exit 0; fi\nif [ \"$1\" = \"codex\" ] && [ \"$2\" = \"app-server\" ]; then exit 1; fi\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\necho running\nwait\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"capabilities\" ]; then printf '%s\\n' '{}'; exit 0; fi\ntrap '' TERM\n(trap '' TERM; exec sleep 30) &\necho $! > '{}'\nwait\n",
+            capabilities_document,
             descendant_path.display()
         ),
     )
-    .expect("write harness wrapper");
+    .expect("write executor stub");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
-            .expect("make wrapper executable");
-        fs::write(
-            &executor_path,
-            "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"harnesses\":{\"codex\":{\"version\":\"codex-fake 0.1.0\",\"effort\":{\"version\":1,\"daemon_version\":\"0.1.0\",\"harness\":\"codex\",\"harness_version\":\"codex-fake 0.1.0\",\"catalog_digest\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"models\":[],\"accepts_asserted_effort\":true}}}}'\n",
-        )
-        .expect("write executor capability stub");
         fs::set_permissions(&executor_path, fs::Permissions::from_mode(0o755))
-            .expect("make executor capability stub executable");
+            .expect("make executor executable");
     }
     let workspace_parent = directory.0.join("workspaces");
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nexecutor = [{}]\nexecutor_cwd = \"~\"\nwrapper = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nexecutor_cwd = \"~\"\nexecutor = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
             serde_json::to_string(&executor_path.to_string_lossy().as_ref())
-                .expect("encode executor capability path"),
-            serde_json::to_string(&wrapper_path.to_string_lossy().as_ref())
-                .expect("encode wrapper path"),
+                .expect("encode executor path"),
             workspace_parent,
             credentials_path
         ),
