@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/dstoc/tines-runner-rs/compare/v0.3.0...v0.4.0) (2026-10-05)
+
+
+### Features
+
+* **config:** add capabilities_executor for capability discovery ([#51](https://github.com/dstoc/tines-runner-rs/issues/51)) ([09e77d3](https://github.com/dstoc/tines-runner-rs/commit/09e77d3f11db02dbfe6c3529f6a2e388a1cf8c0d))
+
 ## [0.3.0](https://github.com/dstoc/tines-runner-rs/compare/v0.2.0...v0.3.0) (2026-10-05)
 
 
