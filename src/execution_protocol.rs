@@ -89,24 +89,7 @@ impl ExecutionRequest {
 
     /// Return secret values and their escaped forms for safe diagnostics.
     pub(crate) fn secret_patterns(&self) -> Vec<String> {
-        let mut secrets = self
-            .secret_values()
-            .into_iter()
-            .flat_map(|secret| {
-                let json_escaped =
-                    serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
-                let rust_escaped = format!("{secret:?}");
-                [
-                    secret.to_owned(),
-                    json_escaped[1..json_escaped.len() - 1].to_owned(),
-                    rust_escaped[1..rust_escaped.len() - 1].to_owned(),
-                ]
-            })
-            .filter(|secret| !secret.is_empty())
-            .collect::<Vec<_>>();
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
-        secrets
+        secret_patterns_from_values(self.secret_values())
     }
 
     /// Remove request secrets from a diagnostic before it is retained.
@@ -115,6 +98,28 @@ impl ExecutionRequest {
             *value = value.replace(&secret, "***");
         }
     }
+}
+
+pub(crate) fn secret_patterns_from_values<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut secrets = values
+        .into_iter()
+        .flat_map(|secret| {
+            let json_escaped =
+                serde_json::to_string(secret).expect("a Rust string always serializes to JSON");
+            let rust_escaped = format!("{secret:?}");
+            [
+                secret.to_owned(),
+                json_escaped[1..json_escaped.len() - 1].to_owned(),
+                rust_escaped[1..rust_escaped.len() - 1].to_owned(),
+            ]
+        })
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    secrets
 }
 
 /// Read and validate exactly one execution request without exposing parser

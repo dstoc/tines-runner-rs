@@ -20,6 +20,7 @@ use url::Url;
 use crate::cancellation::CancellationToken;
 use crate::config::RepositoryCheckoutPolicy;
 use crate::diagnostic::{DIAGNOSTIC_EVENT_LIMIT, KeepPart, format_bounded_diagnostic};
+use crate::execution_protocol::secret_patterns_from_values;
 use crate::process::{ProcessExit, ProcessStream, SupervisedProcess};
 use crate::protocol::{RunnerAssignment, RunnerAssignmentEnv};
 
@@ -196,14 +197,17 @@ impl MaterializedWorkspace {
         mut on_workspace_created: impl FnMut(&Path) -> io::Result<()>,
         mut on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
+        let inherited_api_key = env::var("TINES_API_KEY").ok();
         let environment = LaunchEnvironment::new(
             assignment
                 .run_key
                 .clone()
-                .or_else(|| env::var("TINES_API_KEY").ok()),
+                .or_else(|| inherited_api_key.clone()),
+            inherited_api_key,
             api_url.as_str().trim_end_matches('/').to_owned(),
             &assignment.env,
         )?;
+        let secret_patterns = environment.secret_patterns();
         if cancellation.is_cancelled() {
             return Err(WorkspaceError::Cancelled);
         }
@@ -224,6 +228,7 @@ impl MaterializedWorkspace {
                     assignment,
                     cancellation,
                     checkout,
+                    &secret_patterns,
                     &mut on_git_output,
                 )
             });
@@ -280,6 +285,7 @@ impl fmt::Debug for MaterializedWorkspace {
 #[derive(Clone)]
 pub struct LaunchEnvironment {
     run_key: Option<String>,
+    inherited_api_key: Option<String>,
     api_url: String,
     variables: BTreeMap<String, RunnerAssignmentEnv>,
 }
@@ -287,6 +293,7 @@ pub struct LaunchEnvironment {
 impl LaunchEnvironment {
     fn new(
         run_key: Option<String>,
+        inherited_api_key: Option<String>,
         api_url: String,
         entries: &[RunnerAssignmentEnv],
     ) -> Result<Self, WorkspaceError> {
@@ -304,6 +311,7 @@ impl LaunchEnvironment {
         }
         Ok(Self {
             run_key,
+            inherited_api_key,
             api_url,
             variables,
         })
@@ -316,12 +324,20 @@ impl LaunchEnvironment {
 
     /// Values marked secret by Tines, for output redaction by the executor.
     pub fn secret_values(&self) -> impl Iterator<Item = &str> {
-        self.run_key.iter().map(String::as_str).chain(
-            self.variables
-                .values()
-                .filter(|entry| entry.secret)
-                .map(|entry| entry.value.as_str()),
-        )
+        self.run_key
+            .iter()
+            .chain(self.inherited_api_key.iter())
+            .map(String::as_str)
+            .chain(
+                self.variables
+                    .values()
+                    .filter(|entry| entry.secret)
+                    .map(|entry| entry.value.as_str()),
+            )
+    }
+
+    fn secret_patterns(&self) -> Vec<String> {
+        secret_patterns_from_values(self.secret_values())
     }
 
     /// Add the assignment environment to a command.
@@ -507,6 +523,7 @@ fn materialize_contents(
     assignment: &RunnerAssignment,
     cancellation: &CancellationToken,
     checkout: CheckoutOptions<'_>,
+    secret_patterns: &[String],
     on_git_output: &mut impl FnMut(&str),
 ) -> Result<(), WorkspaceError> {
     if cancellation.is_cancelled() {
@@ -544,6 +561,7 @@ fn materialize_contents(
             &repositories,
             cancellation,
             checkout.git_program,
+            secret_patterns,
             on_git_output,
         ),
         RepositoryCheckoutPolicy::MetadataOnly => Ok(()),
@@ -617,6 +635,7 @@ fn clone_repositories(
     repositories: &[Repository],
     cancellation: &CancellationToken,
     git_program: &OsStr,
+    secret_patterns: &[String],
     on_git_output: &mut impl FnMut(&str),
 ) -> Result<(), WorkspaceError> {
     for repository in repositories {
@@ -651,7 +670,7 @@ fn clone_repositories(
         let waiter = thread::spawn(move || {
             process.wait_or_cancel(Duration::from_secs(2), &wait_cancellation)
         });
-        let mut stderr = GitStderrCapture::default();
+        let mut stderr = GitStderrCapture::new(secret_patterns);
         while !waiter.is_finished() {
             match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok((ProcessStream::Stderr, chunk)) => stderr.push(&chunk),
@@ -686,7 +705,11 @@ fn clone_repositories(
             } else {
                 &repository.name
             };
-            let safe_name = format_bounded_diagnostic(name, 80, KeepPart::Prefix);
+            let safe_name = format_bounded_diagnostic(
+                &redact_secrets(name, secret_patterns),
+                80,
+                KeepPart::Prefix,
+            );
             let last_diagnostic = captured
                 .lines()
                 .rev()
@@ -762,8 +785,9 @@ fn ensure_safe_repository_parent(root: &Path, directory: &str) -> Result<(), Wor
     }
 }
 
-#[derive(Default)]
 struct GitStderrCapture {
+    decoder: super::Utf8StreamDecoder,
+    redactor: StreamingSecretRedactor,
     line: Vec<u8>,
     line_truncated: bool,
     tail: VecDeque<char>,
@@ -771,8 +795,25 @@ struct GitStderrCapture {
 }
 
 impl GitStderrCapture {
+    fn new(secret_patterns: &[String]) -> Self {
+        Self {
+            decoder: super::Utf8StreamDecoder::default(),
+            redactor: StreamingSecretRedactor::new(secret_patterns),
+            line: Vec::new(),
+            line_truncated: false,
+            tail: VecDeque::new(),
+            omitted_chars: 0,
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) {
-        for byte in chunk {
+        let decoded = self.decoder.push(chunk);
+        let redacted = self.redactor.push(&decoded);
+        self.push_text(&redacted);
+    }
+
+    fn push_text(&mut self, text: &str) {
+        for byte in text.bytes() {
             match byte {
                 b'\r' => {
                     // Git uses carriage returns to update progress in place.
@@ -781,7 +822,7 @@ impl GitStderrCapture {
                     self.line_truncated = false;
                 }
                 b'\n' => self.finish_line(),
-                _ if self.line.len() < MAX_GIT_STDERR_LINE_BYTES => self.line.push(*byte),
+                _ if self.line.len() < MAX_GIT_STDERR_LINE_BYTES => self.line.push(byte),
                 _ => self.line_truncated = true,
             }
         }
@@ -812,6 +853,11 @@ impl GitStderrCapture {
     }
 
     fn finish(mut self) -> String {
+        let decoded = self.decoder.finish();
+        let redacted = self.redactor.push(&decoded);
+        self.push_text(&redacted);
+        let redacted = self.redactor.finish();
+        self.push_text(&redacted);
         self.finish_line();
         let tail = self.tail.into_iter().collect::<String>();
         if self.omitted_chars == 0 {
@@ -823,6 +869,77 @@ impl GitStderrCapture {
             )
         }
     }
+}
+
+struct StreamingSecretRedactor {
+    patterns: Vec<String>,
+    max_pattern_chars: usize,
+    pending: String,
+}
+
+impl StreamingSecretRedactor {
+    fn new(patterns: &[String]) -> Self {
+        Self {
+            patterns: patterns.to_vec(),
+            max_pattern_chars: patterns
+                .iter()
+                .map(|pattern| pattern.chars().count())
+                .max()
+                .unwrap_or(0),
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        self.pending.push_str(text);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> String {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, finished: bool) -> String {
+        let mut output = String::new();
+        let mut pending_chars = self.pending.chars().count();
+        loop {
+            if self.pending.is_empty() {
+                break;
+            }
+            if let Some(pattern) = self
+                .patterns
+                .iter()
+                .find(|pattern| self.pending.starts_with(pattern.as_str()))
+            {
+                let pattern_bytes = pattern.len();
+                pending_chars -= pattern.chars().count();
+                self.pending.drain(..pattern_bytes);
+                output.push_str("***");
+                continue;
+            }
+            if !finished && pending_chars < self.max_pattern_chars {
+                break;
+            }
+            let character = self
+                .pending
+                .chars()
+                .next()
+                .expect("non-empty pending secret text");
+            self.pending.drain(..character.len_utf8());
+            pending_chars -= 1;
+            output.push(character);
+        }
+        output
+    }
+}
+
+fn redact_secrets(value: &str, patterns: &[String]) -> String {
+    patterns
+        .iter()
+        .fold(value.to_owned(), |mut value, pattern| {
+            value = value.replace(pattern, "***");
+            value
+        })
 }
 
 fn validate_relative_path(value: &str) -> Result<Vec<&str>, ()> {
@@ -974,12 +1091,15 @@ fn valid_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckoutOptions, MaterializedWorkspace, Skill, SkillFile, WorkspaceError,
-        materialize_skills,
+        CheckoutOptions, GitStderrCapture, LaunchEnvironment, MaterializedWorkspace, Skill,
+        SkillFile, WorkspaceError, materialize_skills,
     };
     use crate::cancellation::CancellationToken;
     use crate::config::RepositoryCheckoutPolicy;
     use crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT;
+    use crate::execution_protocol::{
+        ExecutionEvent, ExecutionEventKind, ExecutionRequest, LogStream, render_event_jsonl,
+    };
     use crate::protocol::RunnerAssignment;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1524,6 +1644,89 @@ mod tests {
         assert!(!output[0].contains("Receiving objects"));
         assert!(!output[0].contains('\r'));
         assert!(output[0].chars().count() <= DIAGNOSTIC_EVENT_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redacts_git_secrets_before_capture_and_event_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new();
+        let fake_git = directory.0.join("fake-git");
+        let secret = "synthetic-secret-123456789";
+        let diagnostic = format!("fatal: {}{}{}", "x".repeat(300), secret, "y".repeat(100));
+        fs::write(
+            &fake_git,
+            format!("#!/bin/sh\nprintf '%s\\n' '{diagnostic}' >&2\nexit 1\n"),
+        )
+        .expect("write fake Git command");
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
+            .expect("make fake Git executable");
+
+        let mut request_value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/execution-request-v1.json"
+        ))
+        .expect("read request fixture");
+        request_value["assignment"]["env"][0]["value"] = serde_json::json!(secret);
+        request_value["assignment"]["bundle"]["repos"] = serde_json::json!([{
+            "name": "fixture",
+            "dir": "fixture",
+            "url": "https://example.test/repo.git",
+            "branch": null
+        }]);
+        let request: ExecutionRequest =
+            serde_json::from_value(request_value).expect("deserialize request");
+        let api_url = Url::parse("https://tines.example.test").expect("valid URL");
+        let mut output = Vec::new();
+
+        let error = MaterializedWorkspace::create_with_git_program(
+            directory.0.join("workspaces"),
+            &request.assignment,
+            &api_url,
+            &CancellationToken::default(),
+            CheckoutOptions {
+                policy: RepositoryCheckoutPolicy::Enabled,
+                git_program: fake_git.as_os_str(),
+            },
+            |_| Ok(()),
+            |message| output.push(message.to_owned()),
+        )
+        .expect_err("fake Git exits with a failure");
+
+        assert!(matches!(error, WorkspaceError::GitCloneFailed { .. }));
+        assert_eq!(output.len(), 1);
+        assert!(output[0].contains("[truncated "));
+        assert!(!output[0].contains("synthetic-secret"));
+        assert!(output[0].contains("***"));
+
+        let event = ExecutionEvent::new(ExecutionEventKind::Log {
+            stream: LogStream::System,
+            message: output[0].trim_end().to_owned(),
+        });
+        let rendered = render_event_jsonl(&event, &request).expect("render final log event");
+        assert!(!rendered.contains("synthetic-secret"));
+        assert!(!rendered.contains("synthetic-s"));
+        assert!(rendered.contains("***"));
+    }
+
+    #[test]
+    fn redacts_git_run_keys_split_across_stderr_reads() {
+        let secret = "environment-delivered-run-key";
+        let environment = LaunchEnvironment::new(
+            Some("assignment-run-key".to_owned()),
+            Some(secret.to_owned()),
+            "https://tines.example.test".to_owned(),
+            &[],
+        )
+        .expect("build launch environment");
+        let mut stderr = GitStderrCapture::new(&environment.secret_patterns());
+
+        stderr.push(b"fatal: rejected environment-delivered-");
+        stderr.push(b"run-key after authentication\n");
+        let captured = stderr.finish();
+
+        assert!(captured.contains("fatal: rejected *** after authentication"));
+        assert!(!captured.contains(secret));
     }
 
     #[test]
