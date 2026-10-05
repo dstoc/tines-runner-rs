@@ -30,6 +30,7 @@ impl Drop for TestDirectory {
 struct ExecutorOutput {
     success: bool,
     events: Vec<Value>,
+    stdout: String,
     stderr: String,
 }
 
@@ -97,6 +98,7 @@ fn run_executor_with_env(
             .into_iter()
             .map(|event| serde_json::to_value(event).expect("event is serializable"))
             .collect(),
+        stdout: String::from_utf8(output.stdout).expect("executor output is valid UTF-8"),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
@@ -308,6 +310,97 @@ fn custom_nonzero_exit_fails_with_redacted_stderr_context() {
             !retained_error.contains(secret),
             "secret fragment {secret} reached retained metadata"
         );
+    }
+}
+
+#[test]
+fn environment_run_key_is_redacted_from_split_output_and_retained_metadata() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("environment-key-workspaces");
+    let run_key = "environment-\"quoted\"-\\key";
+    let (first, second) = run_key.split_at("environment-".len());
+    let json_escaped = serde_json::to_string(run_key).expect("encode fixture run key");
+    let json_escaped = &json_escaped[1..json_escaped.len() - 1];
+    let script_path = directory.0.join("environment-key-check");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s' '{first}'\n\
+         sleep 0.05\n\
+         printf '%s\\n' '{second}'\n\
+         printf '%s\\n' '{json_escaped}'\n\
+         printf '%s' '{first}' >&2\n\
+         sleep 0.05\n\
+         printf '%s\\n' '{second}' >&2\n\
+         printf '%s\\n' '{json_escaped}' >&2\n\
+         exit 1\n"
+    );
+    write_executable(&script_path, &script);
+    let mut request = custom_request(
+        &workspace_parent,
+        vec![script_path.to_string_lossy().into_owned()],
+    );
+    request["assignment"]["run_key"] = Value::Null;
+
+    let output = run_executor_with_env(
+        &directory.0,
+        &request,
+        "#!/bin/sh\nexit 99\n",
+        &[("TINES_API_KEY", run_key)],
+    );
+
+    assert!(!output.success);
+    for secret_form in [run_key, json_escaped] {
+        assert!(
+            !output.stdout.contains(secret_form),
+            "secret form {secret_form:?} reached raw executor JSONL: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stderr.contains(secret_form),
+            "secret form {secret_form:?} reached executor diagnostics"
+        );
+    }
+    let rendered_events = serde_json::to_string(&output.events).expect("serialize events");
+    for secret_form in [run_key, json_escaped] {
+        assert!(!rendered_events.contains(secret_form));
+    }
+    for stream in ["stdout", "stderr"] {
+        assert!(
+            output.events.iter().any(|event| {
+                event["type"] == "log"
+                    && event["stream"] == stream
+                    && event["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("***"))
+            }),
+            "expected a redacted {stream} log: {:?}",
+            output.events
+        );
+    }
+
+    let terminal = result(&output);
+    let error = terminal["error"]
+        .as_str()
+        .expect("terminal failure diagnostic");
+    assert!(error.contains("***"));
+    for secret_form in [run_key, json_escaped] {
+        assert!(!error.contains(secret_form));
+    }
+
+    let workspace = fs::read_dir(workspace_parent)
+        .expect("workspace parent remains")
+        .next()
+        .expect("failed workspace retained")
+        .expect("workspace entry")
+        .path();
+    let marker: Value = serde_json::from_slice(
+        &fs::read(workspace.join(".tines-runner-retained.json")).expect("retention marker"),
+    )
+    .expect("valid retention marker");
+    let retained_error = marker["error"].as_str().expect("retained error diagnostic");
+    assert!(retained_error.contains("***"));
+    for secret_form in [run_key, json_escaped] {
+        assert!(!retained_error.contains(secret_form));
     }
 }
 

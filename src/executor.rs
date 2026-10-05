@@ -122,6 +122,17 @@ pub fn execute_request(
         return ExitCode::FAILURE;
     }
 
+    // Environment delivery keeps the run key out of stdin. Resolve it once
+    // before workspace preparation so all executor redaction paths can use
+    // the same effective secret context as the harness environment.
+    let mut effective_request = request.clone();
+    if effective_request.assignment.run_key.is_none()
+        && let Ok(run_key) = std::env::var("TINES_API_KEY")
+    {
+        effective_request.assignment.run_key = Some(run_key);
+    }
+    let request = &effective_request;
+
     let events = match adapter_for(&request.execution.harness) {
         Ok(adapter) => adapter,
         Err(error) => {

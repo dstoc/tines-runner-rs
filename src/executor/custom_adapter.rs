@@ -99,6 +99,7 @@ impl HarnessAdapter for CustomAdapter {
 
 struct CustomEventParser {
     stderr_diagnostic: String,
+    stdout_pending: String,
     stderr_pending: String,
     secrets: Vec<String>,
     redaction_window: usize,
@@ -114,6 +115,7 @@ impl CustomEventParser {
             .saturating_sub(1);
         Self {
             stderr_diagnostic: String::new(),
+            stdout_pending: String::new(),
             stderr_pending: String::new(),
             secrets,
             redaction_window,
@@ -128,38 +130,24 @@ impl CustomEventParser {
             })
     }
 
+    fn take_safe_stdout_prefix(&mut self, chunk: &str, finish: bool) -> String {
+        take_safe_prefix(
+            &mut self.stdout_pending,
+            chunk,
+            &self.secrets,
+            self.redaction_window,
+            finish,
+        )
+    }
+
     fn take_safe_stderr_prefix(&mut self, chunk: &str, finish: bool) -> String {
-        self.stderr_pending.push_str(chunk);
-        let characters = self.stderr_pending.chars().collect::<Vec<_>>();
-        let safe_starts = if finish {
-            characters.len()
-        } else {
-            characters.len().saturating_sub(self.redaction_window)
-        };
-        let offsets = self
-            .stderr_pending
-            .char_indices()
-            .map(|(offset, _)| offset)
-            .chain(std::iter::once(self.stderr_pending.len()))
-            .collect::<Vec<_>>();
-        let mut output = String::new();
-        let mut index = 0;
-        while index < safe_starts {
-            let byte_index = offsets[index];
-            if let Some(secret) = self
-                .secrets
-                .iter()
-                .find(|secret| self.stderr_pending[byte_index..].starts_with(secret.as_str()))
-            {
-                output.push_str("***");
-                index += secret.chars().count();
-            } else {
-                output.push(characters[index]);
-                index += 1;
-            }
-        }
-        self.stderr_pending = characters[index..].iter().collect();
-        output
+        take_safe_prefix(
+            &mut self.stderr_pending,
+            chunk,
+            &self.secrets,
+            self.redaction_window,
+            finish,
+        )
     }
 
     fn flush_stderr_diagnostic(&mut self) {
@@ -176,7 +164,8 @@ impl CustomEventParser {
 
 impl HarnessEventParser for CustomEventParser {
     fn push(&mut self, chunk: &str) -> Vec<ExecutionEvent> {
-        log_event(LogStream::Stdout, chunk)
+        let safe_output = self.take_safe_stdout_prefix(chunk, false);
+        log_event(LogStream::Stdout, &safe_output)
     }
 
     fn push_stderr(&mut self, chunk: &str) -> Vec<ExecutionEvent> {
@@ -189,7 +178,8 @@ impl HarnessEventParser for CustomEventParser {
     }
 
     fn finish(&mut self) -> Vec<ExecutionEvent> {
-        Vec::new()
+        let final_chunk = self.take_safe_stdout_prefix("", true);
+        log_event(LogStream::Stdout, &final_chunk)
     }
 
     fn finish_stderr(&mut self) -> Vec<ExecutionEvent> {
@@ -242,6 +232,51 @@ impl HarnessEventParser for CustomEventParser {
             },
         })
     }
+}
+
+fn take_safe_prefix(
+    pending: &mut String,
+    chunk: &str,
+    secrets: &[String],
+    redaction_window: usize,
+    finish: bool,
+) -> String {
+    pending.push_str(chunk);
+    let characters = pending.chars().collect::<Vec<_>>();
+    let mut safe_starts = if finish {
+        characters.len()
+    } else {
+        characters.len().saturating_sub(redaction_window)
+    };
+    if !finish && !secrets.iter().any(|secret| secret.contains('\n')) {
+        let complete_line = characters
+            .iter()
+            .rposition(|character| *character == '\n')
+            .map_or(0, |index| index + 1);
+        safe_starts = safe_starts.max(complete_line);
+    }
+    let offsets = pending
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(pending.len()))
+        .collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < safe_starts {
+        let byte_index = offsets[index];
+        if let Some(secret) = secrets
+            .iter()
+            .find(|secret| pending[byte_index..].starts_with(secret.as_str()))
+        {
+            output.push_str("***");
+            index += secret.chars().count();
+        } else {
+            output.push(characters[index]);
+            index += 1;
+        }
+    }
+    *pending = characters[index..].iter().collect();
+    output
 }
 
 fn log_event(stream: LogStream, message: &str) -> Vec<ExecutionEvent> {
