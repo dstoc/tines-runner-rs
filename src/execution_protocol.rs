@@ -569,6 +569,7 @@ pub fn render_event_jsonl(
     let mut value = serde_json::to_value(event).map_err(|_| ProtocolError::Serialization)?;
     let secrets = request.secret_patterns();
     redact_value(&mut value, &secrets);
+    bound_diagnostic_log(&mut value);
     let mut line = serde_json::to_string(&value).map_err(|_| ProtocolError::Serialization)?;
     if line.len() > MAX_EXECUTION_EVENT_LINE_BYTES {
         return Err(ProtocolError::OversizedLine {
@@ -578,6 +579,36 @@ pub fn render_event_jsonl(
     }
     line.push('\n');
     Ok(line)
+}
+
+fn bound_diagnostic_log(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("log") {
+        return;
+    }
+
+    let Some(stream) = object
+        .get("stream")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let keep = match stream.as_str() {
+        "system" => crate::diagnostic::KeepPart::Prefix,
+        "stderr" => crate::diagnostic::KeepPart::Suffix,
+        _ => return,
+    };
+    let Some(Value::String(message)) = object.get_mut("message") else {
+        return;
+    };
+    *message = crate::diagnostic::format_bounded_diagnostic(
+        message,
+        crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+        keep,
+    );
 }
 
 fn redact_value(value: &mut Value, secrets: &[String]) {

@@ -1,6 +1,6 @@
 //! Per-assignment workspace materialization and retention.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -19,10 +19,13 @@ use url::Url;
 
 use crate::cancellation::CancellationToken;
 use crate::config::RepositoryCheckoutPolicy;
+use crate::diagnostic::{DIAGNOSTIC_EVENT_LIMIT, KeepPart, format_bounded_diagnostic};
 use crate::process::{ProcessExit, ProcessStream, SupervisedProcess};
 use crate::protocol::{RunnerAssignment, RunnerAssignmentEnv};
 
 const SKILLS_PATH: &str = ".agents/skills";
+const MAX_GIT_STDERR_LINE_BYTES: usize = 8 * 1024;
+const MAX_GIT_STDERR_TAIL_CHARS: usize = 8 * 1024;
 
 #[derive(Clone, Copy)]
 struct CheckoutOptions<'a> {
@@ -626,7 +629,8 @@ fn clone_repositories(
         let mut command = Command::new(git_program);
         command
             .arg("clone")
-            .arg("--progress")
+            .arg("--quiet")
+            .arg("--no-progress")
             .env("GIT_TERMINAL_PROMPT", "0");
         if let Some(branch) = repository.branch.as_deref() {
             command
@@ -647,17 +651,10 @@ fn clone_repositories(
         let waiter = thread::spawn(move || {
             process.wait_or_cancel(Duration::from_secs(2), &wait_cancellation)
         });
-        let mut line = Vec::new();
+        let mut stderr = GitStderrCapture::default();
         while !waiter.is_finished() {
             match receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok((ProcessStream::Stderr, chunk)) => stream_git_chunk(
-                    &mut line,
-                    &chunk,
-                    &repository.url,
-                    &repository.name,
-                    &repository.dir,
-                    on_git_output,
-                ),
+                Ok((ProcessStream::Stderr, chunk)) => stderr.push(&chunk),
                 Ok((ProcessStream::Stdout, _)) => {}
                 Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
             }
@@ -674,14 +671,7 @@ fn clone_repositories(
             })?;
         loop {
             match receiver.try_recv() {
-                Ok((ProcessStream::Stderr, chunk)) => stream_git_chunk(
-                    &mut line,
-                    &chunk,
-                    &repository.url,
-                    &repository.name,
-                    &repository.dir,
-                    on_git_output,
-                ),
+                Ok((ProcessStream::Stderr, chunk)) => stderr.push(&chunk),
                 Ok((ProcessStream::Stdout, _)) => {}
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -689,19 +679,44 @@ fn clone_repositories(
         if output.cancelled {
             return Err(WorkspaceError::Cancelled);
         }
-        emit_git_line(
-            &mut line,
-            &repository.url,
-            &repository.name,
-            &repository.dir,
-            on_git_output,
-        );
         if output.exit != ProcessExit::Code(0) {
+            let captured = stderr.finish().replace(&repository.url, "<repository URL>");
+            let name = if repository.name.is_empty() {
+                &repository.dir
+            } else {
+                &repository.name
+            };
+            let safe_name = format_bounded_diagnostic(name, 80, KeepPart::Prefix);
+            let last_diagnostic = captured
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default();
+            let detail = if last_diagnostic.is_empty() {
+                "no diagnostic output".to_owned()
+            } else {
+                format_bounded_diagnostic(
+                    last_diagnostic.trim(),
+                    DIAGNOSTIC_EVENT_LIMIT.saturating_sub(160),
+                    KeepPart::Prefix,
+                )
+            };
+            let diagnostic = format!("git [{safe_name}] clone failed: {detail}");
+            on_git_output(&format!(
+                "{}\n",
+                format_bounded_diagnostic(&diagnostic, DIAGNOSTIC_EVENT_LIMIT, KeepPart::Prefix,)
+            ));
             return Err(WorkspaceError::GitCloneFailed {
                 directory: repository.dir.clone(),
                 status: format!("{:?}", output.exit),
             });
         }
+        let name = if repository.name.is_empty() {
+            &repository.dir
+        } else {
+            &repository.name
+        };
+        on_git_output(&format!("git [{}]: checkout complete\n", name));
     }
     Ok(())
 }
@@ -747,48 +762,67 @@ fn ensure_safe_repository_parent(root: &Path, directory: &str) -> Result<(), Wor
     }
 }
 
-fn stream_git_chunk(
-    line: &mut Vec<u8>,
-    chunk: &[u8],
-    repository_url: &str,
-    repository_name: &str,
-    directory: &str,
-    on_git_output: &mut impl FnMut(&str),
-) {
-    const MAX_LINE_BYTES: usize = 8192;
-    for byte in chunk {
-        if *byte == b'\n' || *byte == b'\r' {
-            emit_git_line(
-                line,
-                repository_url,
-                repository_name,
-                directory,
-                on_git_output,
-            );
-        } else if line.len() < MAX_LINE_BYTES {
-            line.push(*byte);
-        }
-    }
+#[derive(Default)]
+struct GitStderrCapture {
+    line: Vec<u8>,
+    line_truncated: bool,
+    tail: VecDeque<char>,
+    omitted_chars: usize,
 }
 
-fn emit_git_line(
-    line: &mut Vec<u8>,
-    repository_url: &str,
-    repository_name: &str,
-    directory: &str,
-    on_git_output: &mut impl FnMut(&str),
-) {
-    if line.is_empty() {
-        return;
+impl GitStderrCapture {
+    fn push(&mut self, chunk: &[u8]) {
+        for byte in chunk {
+            match byte {
+                b'\r' => {
+                    // Git uses carriage returns to update progress in place.
+                    // Discard that fragment instead of replaying it as a log line.
+                    self.line.clear();
+                    self.line_truncated = false;
+                }
+                b'\n' => self.finish_line(),
+                _ if self.line.len() < MAX_GIT_STDERR_LINE_BYTES => self.line.push(*byte),
+                _ => self.line_truncated = true,
+            }
+        }
     }
-    let text = String::from_utf8_lossy(line).replace(repository_url, "<repository URL>");
-    let name = if repository_name.is_empty() {
-        directory
-    } else {
-        repository_name
-    };
-    on_git_output(&format!("git [{name}]: {text}\n"));
-    line.clear();
+
+    fn finish_line(&mut self) {
+        if self.line.is_empty() && !self.line_truncated {
+            return;
+        }
+        let mut text = String::from_utf8_lossy(&self.line).into_owned();
+        if self.line_truncated {
+            text.push_str(" [line truncated]");
+        }
+        text.push('\n');
+        self.append_tail(&text);
+        self.line.clear();
+        self.line_truncated = false;
+    }
+
+    fn append_tail(&mut self, text: &str) {
+        for character in text.chars() {
+            self.tail.push_back(character);
+            if self.tail.len() > MAX_GIT_STDERR_TAIL_CHARS {
+                self.tail.pop_front();
+                self.omitted_chars += 1;
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        self.finish_line();
+        let tail = self.tail.into_iter().collect::<String>();
+        if self.omitted_chars == 0 {
+            tail
+        } else {
+            format!(
+                "[earlier Git stderr omitted {} chars]\n{tail}",
+                self.omitted_chars
+            )
+        }
+    }
 }
 
 fn validate_relative_path(value: &str) -> Result<Vec<&str>, ()> {
@@ -945,6 +979,7 @@ mod tests {
     };
     use crate::cancellation::CancellationToken;
     use crate::config::RepositoryCheckoutPolicy;
+    use crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT;
     use crate::protocol::RunnerAssignment;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1294,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn clones_repository_into_assignment_workspace_and_streams_git_output() {
+    fn clones_repository_into_assignment_workspace_and_reports_concise_completion() {
         let directory = TestDirectory::new();
         let source = directory.0.join("source");
         source_repository(&source);
@@ -1319,7 +1354,10 @@ mod tests {
         );
         let repos = fs::read_to_string(workspace.path().join("repos.json")).unwrap();
         assert!(repos.contains("checkouts/fixture"));
-        assert!(output.iter().any(|chunk| chunk.contains("git [fixture]:")));
+        assert_eq!(output.len(), 1);
+        assert!(output[0].contains("git [fixture]: checkout complete"));
+        assert!(!output[0].contains("Enumerating objects"));
+        assert!(!output[0].contains("Receiving objects"));
     }
 
     #[cfg(unix)]
@@ -1420,13 +1458,72 @@ mod tests {
         .expect_err("missing source repository must fail the run preparation");
 
         assert!(matches!(error, WorkspaceError::GitCloneFailed { .. }));
+        assert_eq!(output.len(), 1);
         assert!(output.iter().any(|chunk| chunk.contains("fatal")));
+        assert!(output[0].chars().count() <= DIAGNOSTIC_EVENT_LIMIT);
         assert_eq!(
             fs::read_dir(directory.0.join("workspaces"))
                 .unwrap()
                 .count(),
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn suppresses_carriage_return_git_progress_and_bounds_failure_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new();
+        let fake_git = directory.0.join("fake-git");
+        let long_error = format!("fatal: remote rejected the request {}", "x".repeat(900));
+        fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nprintf '%s\\r' 'Enumerating objects: 10% (1/10)' >&2\nprintf '%s\\r' 'Receiving objects: 20%' >&2\nprintf '%s\\n' '{}' >&2\nexit 1\n",
+                long_error
+            ),
+        )
+        .expect("write fake Git command");
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
+            .expect("make fake Git executable");
+        let assignment = assignment(
+            json!({
+                "skills": [],
+                "repos": [{
+                    "name": "fixture",
+                    "dir": "fixture",
+                    "url": "https://example.test/repo.git",
+                    "branch": null
+                }]
+            }),
+            json!([]),
+        );
+        let api_url = Url::parse("https://tines.example.test").expect("valid URL");
+        let mut output = Vec::new();
+
+        let error = MaterializedWorkspace::create_with_git_program(
+            directory.0.join("workspaces"),
+            &assignment,
+            &api_url,
+            &CancellationToken::default(),
+            CheckoutOptions {
+                policy: RepositoryCheckoutPolicy::Enabled,
+                git_program: fake_git.as_os_str(),
+            },
+            |_| Ok(()),
+            |message| output.push(message.to_owned()),
+        )
+        .expect_err("fake Git exits with a failure");
+
+        assert!(matches!(error, WorkspaceError::GitCloneFailed { .. }));
+        assert_eq!(output.len(), 1);
+        assert!(output[0].contains("fatal: remote rejected the request"));
+        assert!(output[0].contains("[truncated "));
+        assert!(!output[0].contains("Enumerating objects"));
+        assert!(!output[0].contains("Receiving objects"));
+        assert!(!output[0].contains('\r'));
+        assert!(output[0].chars().count() <= DIAGNOSTIC_EVENT_LIMIT);
     }
 
     #[test]

@@ -105,14 +105,17 @@ fn semantic_selection_builds_codex_command_in_executor_path_with_safe_diagnostic
     let diagnostic = launch.diagnostics();
     assert!(!diagnostic.contains("fixture-run-key"));
     assert!(!diagnostic.contains("fixture-secret"));
-    assert!(diagnostic.contains("[REDACTED]"));
+    assert!(diagnostic.contains(&format!(
+        "<prompt: {} chars>",
+        request.assignment.prompt.chars().count()
+    )));
 
     workspace.cleanup().expect("remove executor workspace");
     fs::remove_dir_all(_parent).expect("remove workspace parent");
 }
 
 #[test]
-fn codex_adapter_redacts_debug_escaped_secrets_before_formatting_launch_diagnostics() {
+fn codex_adapter_elides_prompts_with_debug_escaped_secrets_from_launch_diagnostics() {
     let secret = "review-secret\u{1b}-suffix";
     let mut request = request();
     let digest = "64bb2725f058a9a926043594cf046b5dfbade9206ffa8af7668a9aacd328c98a";
@@ -154,7 +157,10 @@ fn codex_adapter_redacts_debug_escaped_secrets_before_formatting_launch_diagnost
             !output.contains(&rust_escaped_secret),
             "Rust Debug-escaped secret leaked: {output}"
         );
-        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains(&format!(
+            "<prompt: {} chars>",
+            request.assignment.prompt.chars().count()
+        )));
     }
 
     workspace.cleanup().expect("remove executor workspace");
