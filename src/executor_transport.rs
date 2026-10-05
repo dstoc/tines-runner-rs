@@ -15,7 +15,7 @@ use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 
 use crate::assignment::ResolvedAssignment;
-use crate::config::{ResolvedRunConfig, RunnerType, WorkspaceRetention};
+use crate::config::{ResolvedRunConfig, RunKeyDelivery, RunnerType, WorkspaceRetention};
 use crate::execution_protocol::{
     EXECUTION_PROTOCOL_VERSION, ExecutionRequest, ExecutionRetentionPolicy, LocalExecutionPolicy,
     TinesExecutionContext, WorkspacePolicy,
@@ -65,7 +65,13 @@ pub fn execution_request(
                 max_count: retention.max_count,
             },
         },
-        assignment: resolved.assignment().clone(),
+        assignment: {
+            let mut assignment = resolved.assignment().clone();
+            if policy.run_key_delivery == RunKeyDelivery::Environment {
+                assignment.run_key = None;
+            }
+            assignment
+        },
     }
 }
 
@@ -180,6 +186,42 @@ impl ExecutorTransport {
         termination_grace: Duration,
         is_cancelled: C,
         is_interrupted: I,
+        on_started: S,
+        on_stdout: F,
+        on_tick: T,
+    ) -> Result<ExecutorOutput, ExecutorTransportError>
+    where
+        F: FnMut(&[u8]),
+        C: FnMut() -> bool,
+        I: FnMut() -> bool,
+        S: FnMut(&ProcessIdentity, Instant) -> Result<(), String>,
+        T: FnMut(),
+    {
+        self.run_with_callbacks_and_environment_key(
+            request,
+            None,
+            deadline,
+            termination_grace,
+            is_cancelled,
+            is_interrupted,
+            on_started,
+            on_stdout,
+            on_tick,
+        )
+    }
+
+    /// Run the executor and optionally deliver the run key in its environment.
+    /// `request` remains the serialized stdin document, so environment delivery
+    /// does not add a run key to that document.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_callbacks_and_environment_key<F, C, I, S, T>(
+        &self,
+        request: &ExecutionRequest,
+        environment_run_key: Option<&str>,
+        deadline: Duration,
+        termination_grace: Duration,
+        is_cancelled: C,
+        is_interrupted: I,
         mut on_started: S,
         mut on_stdout: F,
         on_tick: T,
@@ -196,30 +238,36 @@ impl ExecutorTransport {
             .map_err(|error| ExecutorTransportError::InvalidRequest(error.to_string()))?;
         let input = serde_json::to_vec(request)
             .map_err(|_| ExecutorTransportError::RequestSerialization)?;
+        let mut redaction_request = request.clone();
+        if redaction_request.assignment.run_key.is_none() {
+            redaction_request.assignment.run_key = environment_run_key.map(str::to_owned);
+        }
         let program = self
             .argv
             .first()
             .filter(|program| !program.trim().is_empty())
             .ok_or(ExecutorTransportError::MissingCommand)?;
-        let working_directory = validate_executor_cwd(&self.executor_cwd, request)?;
+        let working_directory = validate_executor_cwd(&self.executor_cwd, &redaction_request)?;
 
         let mut command = Command::new(program);
         command
             .args(self.argv.iter().skip(1))
             .arg(EXECUTOR_MODE)
             .current_dir(&working_directory);
-        sanitize_executor_environment(&mut command, request);
+        sanitize_executor_environment(&mut command, &redaction_request, environment_run_key);
 
         let process = SupervisedProcess::spawn_with_stdin_and_output(&mut command, input).map_err(
-            |error| ExecutorTransportError::Spawn(redact_text(&error.to_string(), request)),
+            |error| {
+                ExecutorTransportError::Spawn(redact_text(&error.to_string(), &redaction_request))
+            },
         )?;
         let execution_deadline = Instant::now() + deadline;
         if let Err(error) = on_started(process.identity(), execution_deadline) {
-            let error = redact_text(&error, request);
+            let error = redact_text(&error, &redaction_request);
             let _ = process.terminate(termination_grace);
             return Err(ExecutorTransportError::Start(error));
         }
-        let mut stderr = BoundedStderr::new(request);
+        let mut stderr = BoundedStderr::new(&redaction_request);
         let output = process
             .wait_timeout_with_output_or_shutdown(
                 execution_deadline.saturating_duration_since(Instant::now()),
@@ -233,7 +281,7 @@ impl ExecutorTransport {
                 on_tick,
             )
             .map_err(|error| {
-                ExecutorTransportError::Wait(redact_text(&error.to_string(), request))
+                ExecutorTransportError::Wait(redact_text(&error.to_string(), &redaction_request))
             })?;
 
         if output.stdin_error.is_some()
@@ -389,9 +437,16 @@ fn validate_executor_cwd_search_access(
     Ok(())
 }
 
-fn sanitize_executor_environment(command: &mut Command, request: &ExecutionRequest) {
+fn sanitize_executor_environment(
+    command: &mut Command,
+    request: &ExecutionRequest,
+    environment_run_key: Option<&str>,
+) {
     command.env_clear();
     command.envs(safe_executor_environment(env::vars_os(), request));
+    if let Some(run_key) = environment_run_key {
+        command.env("TINES_API_KEY", run_key);
+    }
 }
 
 fn safe_executor_environment(
@@ -441,8 +496,10 @@ fn safe_capabilities_environment(
 
 fn secret_values(request: &ExecutionRequest) -> Vec<String> {
     let mut values = Vec::new();
-    if !request.assignment.run_key.is_empty() {
-        values.push(request.assignment.run_key.clone());
+    if let Some(run_key) = request.assignment.run_key.as_ref()
+        && !run_key.is_empty()
+    {
+        values.push(run_key.clone());
     }
     values.extend(
         request

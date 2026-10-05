@@ -20,9 +20,17 @@ pub struct ExecutorEventStream {
 impl ExecutorEventStream {
     /// Create a stream that removes assignment secrets from every event field.
     pub fn new(request: &crate::execution_protocol::ExecutionRequest) -> Self {
+        Self::new_with_secrets(request, &[])
+    }
+
+    /// Create a stream with daemon-side secrets that are not present in the request.
+    pub fn new_with_secrets(
+        request: &crate::execution_protocol::ExecutionRequest,
+        additional_secrets: &[&str],
+    ) -> Self {
         Self {
             parser: ExecutionEventParser::default(),
-            report: ExecutorRunReport::new(request),
+            report: ExecutorRunReport::new(request, additional_secrets),
         }
     }
 
@@ -110,8 +118,16 @@ struct ExecutorRunReport {
 }
 
 impl ExecutorRunReport {
-    fn new(request: &crate::execution_protocol::ExecutionRequest) -> Self {
-        let mut secrets = std::iter::once(request.assignment.run_key.as_str())
+    fn new(
+        request: &crate::execution_protocol::ExecutionRequest,
+        additional_secrets: &[&str],
+    ) -> Self {
+        let mut secrets = request
+            .assignment
+            .run_key
+            .iter()
+            .map(String::as_str)
+            .chain(additional_secrets.iter().copied())
             .chain(
                 request
                     .assignment
@@ -411,6 +427,22 @@ mod tests {
         assert_eq!(together_finish.usage, split_finish.usage);
         assert_eq!(together_finish.judgment, split_finish.judgment);
         assert_eq!(together_finish.resume_at, split_finish.resume_at);
+    }
+
+    #[test]
+    fn environment_delivered_run_key_is_redacted_from_executor_events() {
+        let mut request = request();
+        request.assignment.run_key = None;
+        let mut stream = ExecutorEventStream::new_with_secrets(&request, &["environment-run-key"]);
+        let logs = stream
+            .push(&line(json!({
+                "version": 1,
+                "type": "log",
+                "stream": "stdout",
+                "message": "credential=environment-run-key"
+            })))
+            .expect("parse event");
+        assert_eq!(logs, ["credential=[REDACTED]\n"]);
     }
 
     fn request() -> ExecutionRequest {

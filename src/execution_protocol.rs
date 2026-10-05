@@ -72,8 +72,10 @@ impl ExecutionRequest {
     /// Return the values that must be redacted from rendered executor events.
     fn secret_values(&self) -> Vec<&str> {
         let mut values = Vec::new();
-        if !self.assignment.run_key.is_empty() {
-            values.push(self.assignment.run_key.as_str());
+        if let Some(run_key) = self.assignment.run_key.as_deref()
+            && !run_key.is_empty()
+        {
+            values.push(run_key);
         }
         values.extend(
             self.assignment

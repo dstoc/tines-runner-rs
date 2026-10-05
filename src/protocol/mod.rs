@@ -122,7 +122,9 @@ pub struct RunnerAssignment {
     pub effort: Option<RunnerAssignmentEffort>,
     pub prompt: String,
     pub bundle: Value,
-    pub run_key: String,
+    /// Optional only in executor requests when the daemon uses environment delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
     /// Resolved environment values for the child process. These values are
     /// never written into the assignment workspace.
     #[serde(default)]
@@ -360,7 +362,10 @@ mod tests {
                 .number,
             4
         );
-        assert_eq!(response.assignments[0].run_key, "fixture-run-key");
+        assert_eq!(
+            response.assignments[0].run_key.as_deref(),
+            Some("fixture-run-key")
+        );
         assert_eq!(response.assignments[0].env[0].name, "FIXTURE_TOKEN");
         assert_eq!(response.assignments[0].env[0].value, "fixture-secret");
         assert!(response.assignments[0].env[0].secret);

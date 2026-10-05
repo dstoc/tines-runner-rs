@@ -603,7 +603,7 @@ mod tests {
             }),
             prompt: String::new(),
             bundle: serde_json::Value::Null,
-            run_key: String::new(),
+            run_key: None,
             env: Vec::new(),
             timeout_minutes: 1,
         }

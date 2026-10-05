@@ -217,12 +217,14 @@ pub fn resolve_assignment(
     if issue_id.is_empty() {
         return Err(missing("issue ID in assignment.run.issue_id"));
     }
-    if assignment.run_key.trim().is_empty() {
-        return Err(missing("assignment run key"));
-    }
+    let run_key = assignment
+        .run_key
+        .as_deref()
+        .filter(|run_key| !run_key.trim().is_empty())
+        .ok_or_else(|| missing("assignment run key"))?;
 
     let issue = client
-        .get_issue(issue_id, &assignment.run_key)
+        .get_issue(issue_id, run_key)
         .map_err(|error| AssignmentResolutionError {
             run_id: run_id.clone(),
             cause: AssignmentResolutionCause::IssueLookup(error),

@@ -61,6 +61,24 @@ fn missing_repository_checkout_policy_keeps_the_existing_clone_behavior() {
 }
 
 #[test]
+fn execution_request_can_omit_the_run_key_entirely_for_environment_delivery() {
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
+    fixture["assignment"]
+        .as_object_mut()
+        .unwrap()
+        .remove("run_key");
+
+    let request: ExecutionRequest = serde_json::from_value(fixture).unwrap();
+    request
+        .validate()
+        .expect("run key is optional in the request model");
+    let serialized = serde_json::to_value(request).unwrap();
+    assert!(serialized["assignment"].get("run_key").is_none());
+    assert!(!serialized.to_string().contains("fixture-run-key"));
+}
+
+#[test]
 fn unsupported_request_versions_are_rejected_during_deserialization() {
     let mut fixture: Value =
         serde_json::from_str(include_str!("fixtures/execution-request-v1.json")).unwrap();
@@ -385,7 +403,7 @@ fn request_debug_and_rendered_events_redact_the_run_key_and_secret_environment_v
 fn request_debug_redacts_secrets_before_rust_escapes_them() {
     let (mut request, _) = request_fixture();
     for secret in ["private\nvalue", "private\"value", "private\\value"] {
-        request.assignment.run_key = secret.into();
+        request.assignment.run_key = Some(secret.to_owned());
         request.assignment.env[0].value = secret.into();
         request.execution.workspace.parent = Some(format!("/workspace/{secret}").into());
 
@@ -405,7 +423,7 @@ fn request_debug_redacts_secrets_before_rust_escapes_them() {
 fn rendered_events_redact_rust_escaped_secret_values() {
     let (mut request, _) = request_fixture();
     for secret in ["private\nvalue", "private\"value"] {
-        request.assignment.run_key = secret.into();
+        request.assignment.run_key = Some(secret.to_owned());
         request.assignment.env[0].value = secret.into();
         let rust_escaped = format!("{secret:?}");
         let rust_escaped = &rust_escaped[1..rust_escaped.len() - 1];

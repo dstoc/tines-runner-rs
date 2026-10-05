@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use tines_runner_rs::effort::{EffortCapabilities, EffortModelCapability};
 use tines_runner_rs::execution_protocol::{
-    ExecutionEventKind, ExecutionEventParser, ExecutionRequest, TerminalStatus, render_event_jsonl,
+    ExecutionEvent, ExecutionEventKind, ExecutionEventParser, ExecutionRequest, TerminalStatus,
+    render_event_jsonl,
 };
 use tines_runner_rs::executor::harness::{HarnessExit, adapter_for};
 use tines_runner_rs::executor::workspace::MaterializedWorkspace;
@@ -33,6 +34,19 @@ fn fixture(name: &str) -> &'static str {
         "codex-usage-limit.jsonl" => include_str!("fixtures/codex-usage-limit.jsonl"),
         _ => unreachable!("known Codex fixture"),
     }
+}
+
+fn stderr_log_text(events: &[ExecutionEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ExecutionEventKind::Log {
+                stream: tines_runner_rs::execution_protocol::LogStream::Stderr,
+                message,
+            } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -186,6 +200,51 @@ fn codex_fixture_events_become_generic_protocol_events_without_native_jsonl() {
         .push(rendered.as_bytes())
         .expect("generic events use protocol v1");
     assert_eq!(decoded, events);
+}
+
+#[test]
+fn codex_stderr_redacts_run_keys_split_across_reads_in_raw_and_escaped_forms() {
+    let secret = r#"review"fixture\environment-key"#;
+    let escaped_secret = r#"review\"fixture\\environment-key"#;
+    let mut request = request();
+    request.assignment.run_key = Some(secret.to_owned());
+    let adapter = adapter_for(&request.execution.harness).expect("select Codex adapter");
+
+    for chunks in [
+        vec![
+            r#"raw prefix review""#,
+            r#"fixture\env"#,
+            "ironment-key raw suffix",
+        ],
+        vec![
+            r#"escaped prefix review\"#,
+            r#""fixture\\envi"#,
+            "ronment-key escaped suffix",
+        ],
+    ] {
+        let mut parser = adapter.event_parser_for_request(&request);
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(parser.push_stderr(chunk));
+        }
+        events.extend(parser.finish_stderr());
+        let rendered = events
+            .iter()
+            .map(|event| render_event_jsonl(event, &request).expect("render stderr event"))
+            .collect::<String>();
+        let mut protocol_parser = ExecutionEventParser::default();
+        let decoded = protocol_parser
+            .push(rendered.as_bytes())
+            .expect("stderr events use protocol v1");
+        let text = stderr_log_text(&decoded);
+
+        assert!(text.contains("***"), "run key was not redacted: {text:?}");
+        assert!(!text.contains(secret), "raw run key leaked: {text:?}");
+        assert!(
+            !text.contains(escaped_secret),
+            "escaped run key leaked: {text:?}"
+        );
+    }
 }
 
 #[test]

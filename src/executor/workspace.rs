@@ -1,6 +1,7 @@
 //! Per-assignment workspace materialization and retention.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
@@ -193,7 +194,10 @@ impl MaterializedWorkspace {
         mut on_git_output: impl FnMut(&str),
     ) -> Result<Self, WorkspaceError> {
         let environment = LaunchEnvironment::new(
-            assignment.run_key.clone(),
+            assignment
+                .run_key
+                .clone()
+                .or_else(|| env::var("TINES_API_KEY").ok()),
             api_url.as_str().trim_end_matches('/').to_owned(),
             &assignment.env,
         )?;
@@ -272,14 +276,14 @@ impl fmt::Debug for MaterializedWorkspace {
 /// contain secrets and the run key is always secret.
 #[derive(Clone)]
 pub struct LaunchEnvironment {
-    run_key: String,
+    run_key: Option<String>,
     api_url: String,
     variables: BTreeMap<String, RunnerAssignmentEnv>,
 }
 
 impl LaunchEnvironment {
     fn new(
-        run_key: String,
+        run_key: Option<String>,
         api_url: String,
         entries: &[RunnerAssignmentEnv],
     ) -> Result<Self, WorkspaceError> {
@@ -309,7 +313,7 @@ impl LaunchEnvironment {
 
     /// Values marked secret by Tines, for output redaction by the executor.
     pub fn secret_values(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.run_key.as_str()).chain(
+        self.run_key.iter().map(String::as_str).chain(
             self.variables
                 .values()
                 .filter(|entry| entry.secret)
@@ -323,6 +327,7 @@ impl LaunchEnvironment {
     /// cannot replace the Tines-owned API key or API URL.
     pub fn apply_to(&self, command: &mut Command) {
         command
+            .env_remove("TINES_API_KEY")
             .env_remove("TINES_RUNNER_TOKEN")
             .env_remove("TYPESAFE_API_KEY");
         for entry in self.variables.values() {
@@ -335,9 +340,10 @@ impl LaunchEnvironment {
                 command.env(&entry.name, &entry.value);
             }
         }
-        command
-            .env("TINES_API_KEY", &self.run_key)
-            .env("TINES_API_URL", &self.api_url);
+        if let Some(run_key) = &self.run_key {
+            command.env("TINES_API_KEY", run_key);
+        }
+        command.env("TINES_API_URL", &self.api_url);
     }
 }
 

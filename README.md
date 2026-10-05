@@ -181,6 +181,7 @@ The main settings are:
 | `[runner].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
 | `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
 | `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
+| `[runner].run_key_delivery` | How the daemon sends each assignment's run key to the executor transport: `request` (default) or `environment`. |
 | `[runner].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
 | `[runner].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |
 | `[runner].allow_remote_concurrency` | Allow Tines to change the runner's concurrency. Defaults to `false`. |
@@ -264,8 +265,8 @@ assignments with enforced effort. An invalid report or unsupported harness or
 effort causes the daemon to decline the incompatible assignment.
 
 Use `[[override]]` entries to change a workspace parent, repository checkout
-mode, runner type, custom harness command, executor command, or executor
-working directory for matching assignments.
+mode, run key delivery, runner type, custom harness command, executor command,
+or executor working directory for matching assignments.
 Each selector is optional. Every selector in one entry must match. Names match
 exactly and without regard to case. Entries apply in file order; later entries
 replace only the fields they set.
@@ -303,12 +304,42 @@ Custom harness commands are argv arrays. The runner starts them directly
 without a shell and sets their working directory to the assignment workspace.
 Use `{prompt_file}` for the workspace's `prompt.md` path and `{workspace}` for
 the workspace path. The runner replaces these placeholders inside each argv
-item. It passes the Tines run key as `TINES_API_KEY`, the Tines instance URL as
-`TINES_API_URL`, and delivered assignment environment values as environment
-variables. Assignment values cannot override `PATH` or the two Tines API
-variables. The runner removes inherited `TINES_RUNNER_TOKEN` and
-`TYPESAFE_API_KEY` values before it starts the harness. Values marked secret
-use the same output redaction as Codex.
+item. It sets `TINES_API_KEY` from the run key in the request or from its
+environment when available. It sets `TINES_API_URL` from the request and adds
+delivered assignment environment values. Assignment values cannot override
+`PATH` or the two Tines API variables. The runner removes inherited
+`TINES_RUNNER_TOKEN` and `TYPESAFE_API_KEY` values before it starts the
+harness. Values marked secret use the same output redaction as Codex.
+
+### Choose run key delivery
+
+`[runner].run_key_delivery` controls only how the daemon sends the per-run
+Tines key to the configured executor transport. The default, `request`, keeps
+the key in the JSON request written to executor stdin. Set it to `environment`
+to omit the key from that request and set `TINES_API_KEY` on the executor
+transport process instead:
+
+```toml
+[runner]
+run_key_delivery = "environment"
+
+[[override]]
+project = "Payments"
+run_key_delivery = "request"
+```
+
+An executor transport can consume, transform, or forward the environment key.
+For example, a container transport must choose whether to pass the host value
+into the container. The bundled executor reads the request key or its own
+`TINES_API_KEY` environment and gives that key to the harness. A transport can
+omit the key from the inner executor environment; the executor request allows
+that key to be absent, and the harness then starts without `TINES_API_KEY`.
+
+The executor-to-harness delivery is separate from the daemon-to-transport
+setting. `TINES_API_URL` remains in the request and the bundled executor sets
+it for the harness in either mode. The long-lived runner token is never sent
+through this setting. Environment delivery is opt-in because local process
+inspection can expose environment values more readily than stdin data.
 
 One runner registration can select different commands by project, workflow,
 or state. The command must be available on the executor's `PATH` or use an
