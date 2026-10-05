@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/dstoc/tines-runner-rs/compare/v0.2.0...v0.3.0) (2026-10-05)
+
+
+### Features
+
+* **security:** add configurable run key delivery ([#49](https://github.com/dstoc/tines-runner-rs/issues/49)) ([6d08003](https://github.com/dstoc/tines-runner-rs/commit/6d080032cb0d777ef47bdc626d86044f1a00839f))
+
 ## [0.2.0](https://github.com/dstoc/tines-runner-rs/compare/v0.1.0...v0.2.0) (2026-10-04)
 
 
