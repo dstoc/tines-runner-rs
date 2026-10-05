@@ -44,6 +44,10 @@ impl HarnessAdapter for CodexAdapter {
     fn event_parser(&self) -> Box<dyn HarnessEventParser> {
         Box::<CodexEventParser>::default()
     }
+
+    fn event_parser_for_request(&self, request: &ExecutionRequest) -> Box<dyn HarnessEventParser> {
+        Box::new(CodexEventParser::with_secrets(request.secret_patterns()))
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +56,73 @@ struct CodexEventParser {
     thread_ids: BTreeSet<String>,
     usage: Option<ExecutionUsage>,
     rate_limit: Option<CodexRateLimit>,
+    stderr_pending: String,
+    stderr_secrets: Vec<String>,
+    stderr_redaction_window: usize,
+}
+
+impl CodexEventParser {
+    fn with_secrets(stderr_secrets: Vec<String>) -> Self {
+        let stderr_redaction_window = stderr_secrets
+            .iter()
+            .map(|secret| secret.chars().count())
+            .max()
+            .unwrap_or_default()
+            .saturating_sub(1);
+        Self {
+            stderr_secrets,
+            stderr_redaction_window,
+            ..Self::default()
+        }
+    }
+
+    fn take_safe_stderr_prefix(&mut self, chunk: &str, finish: bool) -> String {
+        self.stderr_pending.push_str(chunk);
+        let characters = self.stderr_pending.chars().collect::<Vec<_>>();
+        let mut safe_starts = if finish {
+            characters.len()
+        } else {
+            characters
+                .len()
+                .saturating_sub(self.stderr_redaction_window)
+        };
+        if !finish
+            && !self
+                .stderr_secrets
+                .iter()
+                .any(|secret| secret.contains('\n'))
+        {
+            let complete_line = characters
+                .iter()
+                .rposition(|character| *character == '\n')
+                .map_or(0, |index| index + 1);
+            safe_starts = safe_starts.max(complete_line);
+        }
+        let offsets = self
+            .stderr_pending
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(self.stderr_pending.len()))
+            .collect::<Vec<_>>();
+        let mut output = String::new();
+        let mut index = 0;
+        while index < safe_starts {
+            let byte_index = offsets[index];
+            if let Some(secret) = self
+                .stderr_secrets
+                .iter()
+                .find(|secret| self.stderr_pending[byte_index..].starts_with(secret.as_str()))
+            {
+                output.push_str("***");
+                index += secret.chars().count();
+            } else {
+                output.push(characters[index]);
+                index += 1;
+            }
+        }
+        self.stderr_pending = characters[index..].iter().collect();
+        output
+    }
 }
 
 impl HarnessEventParser for CodexEventParser {
@@ -69,6 +140,16 @@ impl HarnessEventParser for CodexEventParser {
             .into_iter()
             .flat_map(|event| self.translate(event))
             .collect()
+    }
+
+    fn push_stderr(&mut self, chunk: &str) -> Vec<ExecutionEvent> {
+        let message = self.take_safe_stderr_prefix(chunk, false);
+        log_stderr(&message)
+    }
+
+    fn finish_stderr(&mut self) -> Vec<ExecutionEvent> {
+        let message = self.take_safe_stderr_prefix("", true);
+        log_stderr(&message)
     }
 
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent {
@@ -122,6 +203,16 @@ impl HarnessEventParser for CodexEventParser {
             },
         })
     }
+}
+
+fn log_stderr(message: &str) -> Vec<ExecutionEvent> {
+    if message.is_empty() {
+        return Vec::new();
+    }
+    vec![ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: crate::execution_protocol::LogStream::Stderr,
+        message: message.to_owned(),
+    })]
 }
 
 impl CodexEventParser {
