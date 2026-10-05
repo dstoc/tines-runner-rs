@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0](https://github.com/dstoc/tines-runner-rs/compare/v0.1.0...v0.2.0) (2026-10-04)
+
+
+### Features
+
+* add daemon executor transport ([#34](https://github.com/dstoc/tines-runner-rs/issues/34)) ([a58f783](https://github.com/dstoc/tines-runner-rs/commit/a58f783edeb6accb6a337f9588e61dc1949c11f7))
+* add executor harness adapters ([#36](https://github.com/dstoc/tines-runner-rs/issues/36)) ([4d5b0d9](https://github.com/dstoc/tines-runner-rs/commit/4d5b0d991ced566e47354bfe53baa791e81b0417))
+* **cli:** support selecting config file ([#29](https://github.com/dstoc/tines-runner-rs/issues/29)) ([3df8a95](https://github.com/dstoc/tines-runner-rs/commit/3df8a953d3354dca3b03bcc8f69e315cc4e03a9e))
+* **config:** require daemon executor working directory ([#38](https://github.com/dstoc/tines-runner-rs/issues/38)) ([a726b28](https://github.com/dstoc/tines-runner-rs/commit/a726b28e89d7bcb93cc431c6038323ca032de3b2))
+* **execution:** report generic executor events ([#40](https://github.com/dstoc/tines-runner-rs/issues/40)) ([fb79c64](https://github.com/dstoc/tines-runner-rs/commit/fb79c64d41fda22408a615d3ded8a1f8d63910b2))
+* **executor:** add one-shot execute CLI ([#33](https://github.com/dstoc/tines-runner-rs/issues/33)) ([2172fb7](https://github.com/dstoc/tines-runner-rs/commit/2172fb7b05269b45b3713e059d7483b995cab621))
+* **executor:** discover capabilities through configured transport ([#39](https://github.com/dstoc/tines-runner-rs/issues/39)) ([590f49f](https://github.com/dstoc/tines-runner-rs/commit/590f49f9be2e2638c7d9ec7ce8118d1e442145fc))
+* **executor:** prepare workspaces from requests ([#35](https://github.com/dstoc/tines-runner-rs/issues/35)) ([c4e5bff](https://github.com/dstoc/tines-runner-rs/commit/c4e5bff792ca1d7e2e674564e21e5953ededc6c6))
+* **executor:** supervise harness lifecycle ([#37](https://github.com/dstoc/tines-runner-rs/issues/37)) ([c29e059](https://github.com/dstoc/tines-runner-rs/commit/c29e059d9f08855cd41b2ba72b4abb56cf011800))
+* **harness:** add configurable custom command support ([#46](https://github.com/dstoc/tines-runner-rs/issues/46)) ([ec663ec](https://github.com/dstoc/tines-runner-rs/commit/ec663ec7eab6400164e3a15ef85625063396b4e8))
+* **protocol:** define local execution protocol v1 ([#32](https://github.com/dstoc/tines-runner-rs/issues/32)) ([04edc3c](https://github.com/dstoc/tines-runner-rs/commit/04edc3c94dbaa4870bcd87700483e3dc57fa4659))
+* **supervision:** track executor lifecycle state ([#42](https://github.com/dstoc/tines-runner-rs/issues/42)) ([37aa4bf](https://github.com/dstoc/tines-runner-rs/commit/37aa4bf80a2d7a70a85be3f25649a02bea0c4dff))
+* **workspace:** add repository checkout policy ([#47](https://github.com/dstoc/tines-runner-rs/issues/47)) ([2a62f4a](https://github.com/dstoc/tines-runner-rs/commit/2a62f4ab973a5a86b08033ca0170c686426bd37a))
+
 ## 0.1.0 (2026-10-03)
 
 
