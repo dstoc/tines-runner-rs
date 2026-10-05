@@ -28,7 +28,7 @@ pub fn run_assignment(
     issue_client: &Client,
     assignment: RunnerAssignment,
     run_logs: crate::protocol::client::RunLogBuffer,
-    default_executor: &ExecutorTransport,
+    default_capabilities_transport: &ExecutorTransport,
     advertised_capabilities: &ExecutorCapabilities,
     cancellation: &CancellationToken,
     context: &execution::ExecutionContext<'_>,
@@ -38,7 +38,7 @@ pub fn run_assignment(
             config,
             connection,
             issue_client,
-            default_executor,
+            default_capabilities_transport,
             advertised_capabilities,
             cancellation,
             context,
@@ -52,7 +52,7 @@ struct AssignmentContext<'a> {
     config: &'a Config,
     connection: &'a RunnerConnection,
     issue_client: &'a Client,
-    default_executor: &'a ExecutorTransport,
+    default_capabilities_transport: &'a ExecutorTransport,
     advertised_capabilities: &'a ExecutorCapabilities,
     cancellation: &'a CancellationToken,
     context: &'a execution::ExecutionContext<'a>,
@@ -67,7 +67,7 @@ fn run_assignment_inner(
         config,
         connection,
         issue_client,
-        default_executor,
+        default_capabilities_transport,
         advertised_capabilities,
         cancellation,
         context,
@@ -115,11 +115,12 @@ fn run_assignment_inner(
         );
     }
 
-    let executor = ExecutorTransport::from_resolved(&resolved.resolution().config);
-    let capabilities = if &executor == default_executor {
+    let capabilities_transport =
+        ExecutorTransport::for_resolved_capabilities(&resolved.resolution().config);
+    let capabilities = if &capabilities_transport == default_capabilities_transport {
         advertised_capabilities.clone()
     } else {
-        executor
+        capabilities_transport
             .discover_capabilities()
             .unwrap_or_else(|error| ExecutorCapabilities::unavailable(error.to_string()))
     };
