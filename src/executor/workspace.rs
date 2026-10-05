@@ -906,6 +906,9 @@ impl StreamingSecretRedactor {
             if self.pending.is_empty() {
                 break;
             }
+            if !finished && pending_chars < self.max_pattern_chars {
+                break;
+            }
             if let Some(pattern) = self
                 .patterns
                 .iter()
@@ -916,9 +919,6 @@ impl StreamingSecretRedactor {
                 self.pending.drain(..pattern_bytes);
                 output.push_str("***");
                 continue;
-            }
-            if !finished && pending_chars < self.max_pattern_chars {
-                break;
             }
             let character = self
                 .pending
@@ -1727,6 +1727,38 @@ mod tests {
 
         assert!(captured.contains("fatal: rejected *** after authentication"));
         assert!(!captured.contains(secret));
+    }
+
+    #[test]
+    fn redacts_overlapping_git_secrets_split_across_stderr_reads_in_final_log() {
+        let longer_secret = "synthetic-secret-123456789";
+        let shorter_secret = "synthetic-secret";
+        let mut request_value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/execution-request-v1.json"
+        ))
+        .expect("read request fixture");
+        request_value["assignment"]["run_key"] = json!("fixture-run-key");
+        request_value["assignment"]["env"] = json!([
+            { "name": "LONG_SECRET", "value": longer_secret, "secret": true },
+            { "name": "SHORT_SECRET", "value": shorter_secret, "secret": true }
+        ]);
+        let request: ExecutionRequest =
+            serde_json::from_value(request_value).expect("deserialize request");
+
+        let mut stderr = GitStderrCapture::new(&request.secret_patterns());
+        stderr.push(b"fatal: synthetic-secret-12345678");
+        stderr.push(b"9 rejected\n");
+        let captured = stderr.finish();
+        assert_eq!(captured, "fatal: *** rejected\n");
+
+        let event = ExecutionEvent::new(ExecutionEventKind::Log {
+            stream: LogStream::System,
+            message: captured.trim_end().to_owned(),
+        });
+        let rendered = render_event_jsonl(&event, &request).expect("render final Git log event");
+        assert!(rendered.contains("fatal: *** rejected"));
+        assert!(!rendered.contains(longer_secret));
+        assert!(!rendered.contains("synthetic-secret"));
     }
 
     #[test]
