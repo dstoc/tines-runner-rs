@@ -5,6 +5,7 @@ pub mod assignment_worker;
 pub mod cancellation;
 pub mod config;
 pub mod credentials;
+pub mod diagnostic;
 pub mod effort;
 pub mod execution;
 pub mod execution_protocol;

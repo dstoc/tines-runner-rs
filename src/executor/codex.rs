@@ -138,10 +138,24 @@ impl CodexLaunch {
         secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         secret_values.dedup();
 
-        let argv = std::iter::once(&self.invocation.program)
-            .chain(self.invocation.args.iter())
-            .map(|argument| redact_diagnostic_value(argument, &secret_values))
-            .collect::<Vec<_>>();
+        let mut argv = vec![redact_diagnostic_value(
+            &self.invocation.program,
+            &secret_values,
+        )];
+        let prompt_index = self.invocation.args.len().checked_sub(1);
+        argv.extend(
+            self.invocation
+                .args
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    if Some(index) == prompt_index {
+                        format!("<prompt: {} chars>", argument.chars().count())
+                    } else {
+                        redact_diagnostic_value(argument, &secret_values)
+                    }
+                }),
+        );
         let mut environment_names = self
             .environment
             .variable_names()
@@ -389,8 +403,12 @@ mod tests {
     #[test]
     fn command_uses_workspace_and_assignment_environment_without_logging_secrets() {
         let (_directory, workspace) = launch_environment();
-        let invocation = build_invocation("sensitive-run-key", Some("gpt-5.6-codex"), Some("high"))
-            .expect("build invocation");
+        let invocation = build_invocation(
+            "sensitive-run-key",
+            Some("gpt-5.6-codex-sensitive-run-key"),
+            Some("high"),
+        )
+        .expect("build invocation");
         assert!(
             invocation
                 .args()
@@ -442,6 +460,12 @@ mod tests {
         assert!(diagnostics.contains("workspace="));
         assert!(diagnostics.contains("version="));
         assert!(diagnostics.contains("$ [\"codex\""));
+        assert!(diagnostics.contains("[REDACTED]"));
+        assert!(diagnostics.contains(&format!(
+            "<prompt: {} chars>",
+            "sensitive-run-key".chars().count()
+        )));
+        assert!(!diagnostics.contains("sensitive-run-key"));
         assert!(!format!("{launch:?}").contains("sensitive-run-key"));
     }
 

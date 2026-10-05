@@ -400,6 +400,42 @@ fn request_debug_and_rendered_events_redact_the_run_key_and_secret_environment_v
 }
 
 #[test]
+fn system_and_stderr_events_are_bounded_after_redaction_while_stdout_keeps_model_text() {
+    let (request, _) = request_fixture();
+    let system = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::System,
+        message: format!("{}fixture-run-key{}", "x".repeat(470), "y".repeat(100)),
+    });
+    let rendered_system = render_event_jsonl(&system, &request).unwrap();
+    let rendered_system: Value = serde_json::from_str(rendered_system.trim_end()).unwrap();
+    let system_message = rendered_system["message"].as_str().unwrap();
+    assert!(system_message.chars().count() <= 500);
+    assert!(system_message.contains("[truncated "));
+    assert!(system_message.contains("***"));
+    assert!(!system_message.contains("fixture-run-key"));
+
+    let stderr = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stderr,
+        message: format!("{}fatal: remote rejected the request", "x".repeat(900)),
+    });
+    let rendered_stderr = render_event_jsonl(&stderr, &request).unwrap();
+    let rendered_stderr: Value = serde_json::from_str(rendered_stderr.trim_end()).unwrap();
+    let stderr_message = rendered_stderr["message"].as_str().unwrap();
+    assert!(stderr_message.chars().count() <= 500);
+    assert!(stderr_message.starts_with("… [truncated "));
+    assert!(stderr_message.ends_with("fatal: remote rejected the request"));
+
+    let model_text = "useful model text ".repeat(80);
+    let stdout = ExecutionEvent::new(ExecutionEventKind::Log {
+        stream: LogStream::Stdout,
+        message: model_text.clone(),
+    });
+    let rendered_stdout = render_event_jsonl(&stdout, &request).unwrap();
+    let rendered_stdout: Value = serde_json::from_str(rendered_stdout.trim_end()).unwrap();
+    assert_eq!(rendered_stdout["message"], model_text);
+}
+
+#[test]
 fn request_debug_redacts_secrets_before_rust_escapes_them() {
     let (mut request, _) = request_fixture();
     for secret in ["private\nvalue", "private\"value", "private\\value"] {
