@@ -38,7 +38,7 @@ pub struct PollState {
     applied_concurrency: Option<RunnerConcurrencyApplied>,
     draining: bool,
     draining_poll_reported: bool,
-    executor_transport: ExecutorTransport,
+    capabilities_transport: ExecutorTransport,
     executor_harness: String,
     executor_capabilities: Option<ExecutorCapabilities>,
     executor_capabilities_refreshed_at: Option<Instant>,
@@ -71,10 +71,7 @@ impl PollState {
             applied_concurrency: None,
             draining: false,
             draining_poll_reported: false,
-            executor_transport: ExecutorTransport::new(
-                config.executor.clone(),
-                config.executor_cwd.clone(),
-            ),
+            capabilities_transport: ExecutorTransport::for_capabilities(config),
             executor_harness: match config.runner_type {
                 crate::config::RunnerType::Codex => "codex".to_owned(),
                 crate::config::RunnerType::Custom => "custom".to_owned(),
@@ -190,7 +187,7 @@ impl PollState {
             });
         if force || expired {
             self.executor_capabilities = Some(
-                self.executor_transport
+                self.capabilities_transport
                     .discover_capabilities()
                     .unwrap_or_else(|error| ExecutorCapabilities::unavailable(error.to_string())),
             );

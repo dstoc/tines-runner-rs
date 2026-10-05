@@ -73,6 +73,9 @@ pub struct Config {
     legacy_workspace_roots: Vec<PathBuf>,
     /// The argv prefix used to reach the local or isolated executor.
     pub executor: Vec<String>,
+    /// Optional argv prefix used only for capability discovery. When absent,
+    /// capability discovery uses the resolved executor command.
+    pub capabilities_executor: Option<Vec<String>>,
     /// Default argv command for assignments using the custom harness.
     pub custom_command: Option<Vec<String>>,
     pub repository_checkout: RepositoryCheckoutPolicy,
@@ -96,6 +99,9 @@ pub struct ResolvedRunConfig {
     pub workspace_parent: Option<PathBuf>,
     /// The argv prefix used to reach the executor; `execute` is appended.
     pub executor: Vec<String>,
+    /// Optional argv prefix used only for capability discovery. When absent,
+    /// capability discovery uses this assignment's resolved executor command.
+    pub capabilities_executor: Option<Vec<String>>,
     /// Command argv for the semantic custom harness, if configured.
     pub custom_command: Option<Vec<String>>,
     /// Repository materialization mode selected for this assignment.
@@ -207,6 +213,7 @@ impl Config {
             runner_type: self.runner_type,
             workspace_parent: self.workspace_parent.clone(),
             executor: self.executor.clone(),
+            capabilities_executor: self.capabilities_executor.clone(),
             custom_command: self.custom_command.clone(),
             repository_checkout: self.repository_checkout,
             run_key_delivery: self.run_key_delivery,
@@ -233,6 +240,11 @@ impl Config {
             }
             if let Some(executor) = &rule.executor {
                 resolved.executor.clone_from(executor);
+            }
+            if let Some(capabilities_executor) = &rule.capabilities_executor {
+                resolved
+                    .capabilities_executor
+                    .clone_from(&Some(capabilities_executor.clone()));
             }
             if let Some(custom_command) = &rule.custom_command {
                 resolved
@@ -338,6 +350,7 @@ impl Config {
                 if rule.workspace_parent.is_none()
                     && rule.runner_type.is_none()
                     && rule.executor.is_none()
+                    && rule.capabilities_executor.is_none()
                     && rule.executor_cwd.is_none()
                     && rule.custom_command.is_none()
                     && rule.repository_checkout.is_none()
@@ -357,6 +370,7 @@ impl Config {
                     workspace_parent: rule.workspace_parent,
                     runner_type: rule.runner_type,
                     executor: rule.executor,
+                    capabilities_executor: rule.capabilities_executor,
                     custom_command: rule.custom_command,
                     repository_checkout: rule.repository_checkout,
                     run_key_delivery: rule.run_key_delivery,
@@ -379,6 +393,7 @@ impl Config {
                 .runner
                 .executor
                 .unwrap_or_else(|| vec!["tines-runner-rs".to_owned()]),
+            capabilities_executor: raw.runner.capabilities_executor,
             custom_command: raw
                 .runner
                 .custom_command
@@ -423,6 +438,7 @@ struct ConfigOverride {
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     executor: Option<Vec<String>>,
+    capabilities_executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
     repository_checkout: Option<RepositoryCheckoutPolicy>,
     run_key_delivery: Option<RunKeyDelivery>,
@@ -471,6 +487,7 @@ struct RawRunner {
     runner_type: Option<RunnerType>,
     workspace_parent: Option<PathBuf>,
     executor: Option<Vec<String>>,
+    capabilities_executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
     repository_checkout: Option<RepositoryCheckoutPolicy>,
     run_key_delivery: Option<RunKeyDelivery>,
@@ -499,6 +516,7 @@ struct RawOverride {
     workspace_parent: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     executor: Option<Vec<String>>,
+    capabilities_executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
     repository_checkout: Option<RepositoryCheckoutPolicy>,
     run_key_delivery: Option<RunKeyDelivery>,
@@ -1153,6 +1171,75 @@ executor_cwd = "review"
         let fallback = config.resolve(context("Other", "Build", "Ready"));
         assert_eq!(fallback.executor, ["tines-runner-rs"]);
         assert_eq!(fallback.executor_cwd, PathBuf::from("/host/default"));
+    }
+
+    #[test]
+    fn capabilities_executor_resolves_by_field_in_override_declaration_order() {
+        let config = parse_with_overrides(
+            r#"executor = ["default-executor"]
+capabilities_executor = ["default-capabilities"]
+
+[[override]]
+project = "Payments"
+executor = ["payments-executor"]
+capabilities_executor = ["payments-capabilities"]
+
+[[override]]
+workflow = "Implementation"
+capabilities_executor = ["implementation-capabilities"]
+
+[[override]]
+state = "Review"
+capabilities_executor = ["review-capabilities"]
+"#,
+        );
+
+        assert_eq!(
+            config
+                .resolve(context("Payments", "Build", "Ready"))
+                .executor,
+            ["payments-executor"]
+        );
+        assert_eq!(
+            config
+                .resolve(context("Payments", "Build", "Ready"))
+                .capabilities_executor,
+            Some(vec!["payments-capabilities".to_owned()])
+        );
+        assert_eq!(
+            config
+                .resolve(context("Other", "Implementation", "Ready"))
+                .capabilities_executor,
+            Some(vec!["implementation-capabilities".to_owned()])
+        );
+        assert_eq!(
+            config
+                .resolve(context("Other", "Build", "Review"))
+                .capabilities_executor,
+            Some(vec!["review-capabilities".to_owned()])
+        );
+        assert_eq!(
+            config
+                .resolve(context("Payments", "Implementation", "Review"))
+                .capabilities_executor,
+            Some(vec!["review-capabilities".to_owned()])
+        );
+    }
+
+    #[test]
+    fn capabilities_executor_falls_back_to_the_resolved_executor_when_absent() {
+        let config = parse_with_overrides(
+            r#"executor = ["default-executor"]
+
+[[override]]
+state = "Review"
+executor = ["review-executor"]
+"#,
+        );
+
+        let resolved = config.resolve(context("Other", "Build", "Review"));
+        assert_eq!(resolved.executor, ["review-executor"]);
+        assert_eq!(resolved.capabilities_executor, None);
     }
 
     #[test]

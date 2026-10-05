@@ -135,10 +135,8 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
     }
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
     let execution_connection = connection.clone();
-    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
-        config.executor.clone(),
-        config.executor_cwd.clone(),
-    );
+    let default_capabilities_transport =
+        tines_runner_rs::executor_transport::ExecutorTransport::for_capabilities(&config);
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
@@ -217,7 +215,8 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                 let worker_config = config.clone();
                 let worker_connection = execution_connection.clone();
                 let worker_client = issue_client.clone();
-                let worker_default_executor = default_executor.clone();
+                let worker_default_capabilities_transport =
+                    default_capabilities_transport.clone();
                 let worker_capabilities = capabilities.clone();
                 let worker_assignment = assignment.clone();
                 let worker_shutdown = shutdown.clone();
@@ -235,7 +234,7 @@ fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn E
                             &worker_client,
                             worker_assignment,
                             run_logs,
-                            &worker_default_executor,
+                            &worker_default_capabilities_transport,
                             &worker_capabilities,
                             &worker_cancellation,
                             &context,

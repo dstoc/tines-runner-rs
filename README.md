@@ -180,6 +180,7 @@ The main settings are:
 | `[runner].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |
 | `[runner].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
 | `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
+| `[runner].capabilities_executor` | Optional argument array used only for capability discovery. The runner appends `capabilities`; when unset, it uses the resolved `executor` command. |
 | `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
 | `[runner].run_key_delivery` | How the daemon sends each assignment's run key to the executor transport: `request` (default) or `environment`. |
 | `[runner].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
@@ -256,7 +257,9 @@ workspace path to persistent storage to keep executor workspaces after the
 container exits.
 
 Capability discovery also crosses the executor boundary. The daemon invokes
-the configured executor in `capabilities` mode and caches its versioned
+`capabilities_executor` when it is set and otherwise uses the resolved
+`executor` command. It appends `capabilities` and runs the command from the same
+required `executor_cwd` used for assignments. The daemon caches the versioned
 report for ten minutes. The report includes the built-in custom harness. The
 native executor discovers Codex on the daemon account's `PATH`; a container
 executor discovers Codex inside the container. Custom commands do not support
@@ -264,9 +267,42 @@ Codex model effort settings. The daemon refreshes the report before it accepts
 assignments with enforced effort. An invalid report or unsupported harness or
 effort causes the daemon to decline the incompatible assignment.
 
+Use `capabilities_executor` when the normal transport needs per-run credentials
+that a capability probe does not need. For example, with
+`run_key_delivery = "environment"`, a Docker `executor` can pass
+`TINES_API_KEY` into the container while `capabilities_executor` starts the
+same image without forwarding that key:
+
+```toml
+[runner]
+run_key_delivery = "environment"
+executor = [
+  "docker", "run", "--rm", "-i", "--env", "TINES_API_KEY",
+  "--mount", "type=bind,src=/var/lib/tines-runner-rs/workspaces,dst=/var/lib/tines-runner-rs/workspaces",
+  "runner-image", "tines-runner-rs"
+]
+capabilities_executor = [
+  "docker", "run", "--rm", "-i",
+  "--mount", "type=bind,src=/var/lib/tines-runner-rs/workspaces,dst=/var/lib/tines-runner-rs/workspaces",
+  "runner-image", "tines-runner-rs"
+]
+executor_cwd = "/var/lib/tines-runner-rs"
+```
+
+Keep both commands pointed at the same effective harness environment, such as
+the same image and mounts, so the probe reports the harness that assignments
+will use. If an override changes `executor` to a different harness environment,
+set `capabilities_executor` in a matching override to probe that environment.
+Capability discovery does not receive the assignment run key, and the daemon
+removes inherited Tines credentials from the probe environment.
+`capabilities_executor` is also resolved per assignment through `[[override]]`
+entries. Like `executor`, it is an argv array and the daemon launches it
+without a shell.
+
 Use `[[override]]` entries to change a workspace parent, repository checkout
 mode, run key delivery, runner type, custom harness command, executor command,
-or executor working directory for matching assignments.
+capability discovery command, or executor working directory for matching
+assignments.
 Each selector is optional. Every selector in one entry must match. Names match
 exactly and without regard to case. Entries apply in file order; later entries
 replace only the fields they set.

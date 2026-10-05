@@ -15,7 +15,7 @@ use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 
 use crate::assignment::ResolvedAssignment;
-use crate::config::{ResolvedRunConfig, RunKeyDelivery, RunnerType, WorkspaceRetention};
+use crate::config::{Config, ResolvedRunConfig, RunKeyDelivery, RunnerType, WorkspaceRetention};
 use crate::execution_protocol::{
     EXECUTION_PROTOCOL_VERSION, ExecutionRequest, ExecutionRetentionPolicy, LocalExecutionPolicy,
     TinesExecutionContext, WorkspacePolicy,
@@ -80,6 +80,7 @@ pub fn execution_request(
 pub struct ExecutorTransport {
     argv: Vec<String>,
     executor_cwd: PathBuf,
+    capabilities_transport_name: &'static str,
 }
 
 impl ExecutorTransport {
@@ -87,10 +88,45 @@ impl ExecutorTransport {
         Self::new(config.executor.clone(), config.executor_cwd.clone())
     }
 
+    /// Build the default capability-probe transport from the global config.
+    /// An explicit capability command is kept separate from the run command.
+    pub fn for_capabilities(config: &Config) -> Self {
+        match &config.capabilities_executor {
+            Some(argv) => Self::new_named(
+                argv.clone(),
+                config.executor_cwd.clone(),
+                "[runner].capabilities_executor",
+            ),
+            None => Self::new(config.executor.clone(), config.executor_cwd.clone()),
+        }
+    }
+
+    /// Build an assignment-specific capability-probe transport. When no
+    /// capability command is resolved, use that assignment's normal executor.
+    pub fn for_resolved_capabilities(config: &ResolvedRunConfig) -> Self {
+        match &config.capabilities_executor {
+            Some(argv) => Self::new_named(
+                argv.clone(),
+                config.executor_cwd.clone(),
+                "[runner].capabilities_executor",
+            ),
+            None => Self::new(config.executor.clone(), config.executor_cwd.clone()),
+        }
+    }
+
     pub fn new(argv: Vec<String>, executor_cwd: impl Into<PathBuf>) -> Self {
+        Self::new_named(argv, executor_cwd, "[runner].executor")
+    }
+
+    fn new_named(
+        argv: Vec<String>,
+        executor_cwd: impl Into<PathBuf>,
+        capabilities_transport_name: &'static str,
+    ) -> Self {
         Self {
             argv,
             executor_cwd: executor_cwd.into(),
+            capabilities_transport_name,
         }
     }
 
@@ -100,8 +136,9 @@ impl ExecutorTransport {
             .argv
             .first()
             .filter(|program| !program.trim().is_empty())
-            .ok_or(ExecutorTransportError::MissingCommand)?;
-        let working_directory = validate_capabilities_cwd(&self.executor_cwd)?;
+            .ok_or_else(|| self.capabilities_error("command is empty"))?;
+        let working_directory = validate_capabilities_cwd(&self.executor_cwd)
+            .map_err(|_| self.capabilities_error("executor_cwd is invalid or inaccessible"))?;
         let mut command = Command::new(program);
         command
             .args(self.argv.iter().skip(1))
@@ -112,7 +149,7 @@ impl ExecutorTransport {
         command.envs(safe_capabilities_environment(env::vars_os()));
 
         let process = SupervisedProcess::spawn_with_output(&mut command)
-            .map_err(|_| ExecutorTransportError::Capabilities("could not start executor"))?;
+            .map_err(|_| self.capabilities_error("could not start command"))?;
         let mut stdout = Vec::new();
         let mut stdout_too_large = false;
         let output = process
@@ -130,25 +167,26 @@ impl ExecutorTransport {
                 },
                 || {},
             )
-            .map_err(|_| ExecutorTransportError::Capabilities("could not wait for executor"))?;
+            .map_err(|_| self.capabilities_error("could not wait for command"))?;
 
         if output.timed_out {
-            return Err(ExecutorTransportError::Capabilities(
-                "executor capability discovery timed out",
-            ));
+            return Err(self.capabilities_error("capability discovery timed out"));
         }
         if output.exit != ChildExit::Code(0) {
-            return Err(ExecutorTransportError::Capabilities(
-                "executor capability command failed",
-            ));
+            return Err(self.capabilities_error("command failed"));
         }
         if stdout_too_large {
-            return Err(ExecutorTransportError::Capabilities(
-                "executor capability document exceeded 64 KiB",
-            ));
+            return Err(self.capabilities_error("capability document exceeded 64 KiB"));
         }
         ExecutorCapabilities::parse(&stdout)
-            .map_err(|_| ExecutorTransportError::Capabilities("invalid capability document"))
+            .map_err(|_| self.capabilities_error("invalid capability document"))
+    }
+
+    fn capabilities_error(&self, reason: &'static str) -> ExecutorTransportError {
+        ExecutorTransportError::Capabilities {
+            transport_name: self.capabilities_transport_name,
+            reason,
+        }
     }
 
     /// Launch `<argv...> execute`, deliver one JSON document on stdin, and
@@ -607,7 +645,10 @@ pub enum ExecutorTransportError {
     Start(String),
     RequestDelivery,
     Wait(String),
-    Capabilities(&'static str),
+    Capabilities {
+        transport_name: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ExecutorTransportError {
@@ -623,7 +664,13 @@ impl fmt::Display for ExecutorTransportError {
                 f.write_str("executor closed stdin before receiving the complete request")
             }
             Self::Wait(error) => write!(f, "could not wait for executor transport: {error}"),
-            Self::Capabilities(error) => write!(f, "executor capabilities unavailable: {error}"),
+            Self::Capabilities {
+                transport_name,
+                reason,
+            } => write!(
+                f,
+                "executor capabilities unavailable using {transport_name}: {reason}"
+            ),
         }
     }
 }

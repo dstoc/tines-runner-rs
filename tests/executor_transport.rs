@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tines_runner_rs::config::{Config, MatchContext, RepositoryCheckoutPolicy};
+use tines_runner_rs::config::{Config, MatchContext, RepositoryCheckoutPolicy, RunKeyDelivery};
 #[cfg(target_os = "linux")]
 use tines_runner_rs::config::{RetentionMode, WorkspaceRetention};
 use tines_runner_rs::execution_protocol::{
@@ -69,6 +69,17 @@ fn configured_transport(argv: Vec<String>, cwd: &Path) -> ExecutorTransport {
         state: "Implement",
     });
     ExecutorTransport::from_resolved(&resolved)
+}
+
+fn configured_capabilities_transport(argv: Vec<String>, cwd: &Path) -> ExecutorTransport {
+    let argv = serde_json::to_string(&argv).expect("serialize executor argv");
+    let cwd =
+        serde_json::to_string(&cwd.to_string_lossy().as_ref()).expect("serialize executor cwd");
+    let config = Config::from_toml_str(&format!(
+        "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"transport-test\"\nexecutor = {argv}\nexecutor_cwd = {cwd}\n"
+    ))
+    .expect("parse executor config");
+    ExecutorTransport::for_capabilities(&config)
 }
 
 fn request(prompt: String) -> ExecutionRequest {
@@ -316,7 +327,7 @@ fn discovers_capabilities_through_the_configured_executor_command() {
     );
     let working_directory = directory.0.join("executor-cwd");
     fs::create_dir_all(&working_directory).expect("create executor cwd");
-    let transport = configured_transport(
+    let transport = configured_capabilities_transport(
         vec![
             stub.to_string_lossy().into_owned(),
             "run".to_owned(),
@@ -340,6 +351,132 @@ fn discovers_capabilities_through_the_configured_executor_command() {
 }
 
 #[test]
+fn capabilities_executor_probes_without_run_key_while_executor_receives_it() {
+    let directory = TestDirectory::new();
+    let working_directory = directory.0.join("executor-cwd");
+    fs::create_dir_all(&working_directory).expect("create executor cwd");
+
+    let capability_cwd_path = directory.0.join("capability-cwd");
+    let capability_stub = directory.0.join("credential-free-capabilities");
+    write_executable(
+        &capability_stub,
+        &format!(
+            "#!/bin/sh\nif [ \"$#\" -ne 1 ] || [ \"$1\" != capabilities ]; then exit 27; fi\nif [ -n \"${{TINES_API_KEY:-}}${{TINES_API_URL:-}}${{TINES_RUNNER_TOKEN:-}}${{TYPESAFE_API_KEY:-}}\" ]; then exit 28; fi\npwd > '{}'\nprintf '%s\\n' '{}'\n",
+            capability_cwd_path.display(),
+            codex_capabilities_document()
+        ),
+    );
+
+    let normal_cwd_path = directory.0.join("normal-cwd");
+    let normal_key_path = directory.0.join("normal-key");
+    let normal_stub = directory.0.join("run-key-executor");
+    write_executable(
+        &normal_stub,
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nif [ \"$#\" -ne 1 ] || [ \"$1\" != execute ]; then exit 27; fi\nif [ \"${{TINES_API_KEY:-}}\" != ephemeral-run-key ]; then exit 28; fi\npwd > '{}'\nprintf '%s' \"$TINES_API_KEY\" > '{}'\nprintf '%s\\n' '{}'\n",
+            normal_cwd_path.display(),
+            normal_key_path.display(),
+            result_event()
+        ),
+    );
+
+    let normal_argv = serde_json::to_string(&[normal_stub.to_string_lossy()])
+        .expect("serialize normal executor argv");
+    let capability_argv = serde_json::to_string(&[capability_stub.to_string_lossy()])
+        .expect("serialize capability executor argv");
+    let cwd = serde_json::to_string(&working_directory.to_string_lossy().as_ref())
+        .expect("serialize executor cwd");
+    let config = Config::from_toml_str(&format!(
+        "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"separate-capabilities-transport\"\nexecutor = {normal_argv}\ncapabilities_executor = {capability_argv}\nexecutor_cwd = {cwd}\nrun_key_delivery = \"environment\"\n"
+    ))
+    .expect("parse split executor configuration");
+    let resolved = config.resolve(MatchContext {
+        project: "Tines",
+        workflow: "Implementation",
+        state: "Implement",
+    });
+    assert_eq!(resolved.run_key_delivery, RunKeyDelivery::Environment);
+
+    let capabilities_transport = ExecutorTransport::for_resolved_capabilities(&resolved);
+    let capabilities = capabilities_transport
+        .discover_capabilities()
+        .expect("discover capabilities without a run key");
+    assert!(capabilities.supports("codex"));
+    assert_eq!(
+        fs::read_to_string(capability_cwd_path)
+            .expect("read capability cwd")
+            .trim(),
+        working_directory.to_string_lossy()
+    );
+
+    let normal_transport = ExecutorTransport::from_resolved(&resolved);
+    let mut execution_request = request("run with environment credentials".to_owned());
+    let environment_run_key = match resolved.run_key_delivery {
+        RunKeyDelivery::Request => None,
+        RunKeyDelivery::Environment => execution_request.assignment.run_key.take(),
+    };
+    assert_eq!(environment_run_key.as_deref(), Some("ephemeral-run-key"));
+    assert!(execution_request.assignment.run_key.is_none());
+    let mut stdout = Vec::new();
+    let output = normal_transport
+        .run_with_callbacks_and_environment_key(
+            &execution_request,
+            environment_run_key.as_deref(),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            || false,
+            || false,
+            |_, _| Ok(()),
+            |chunk| stdout.extend_from_slice(chunk),
+            || {},
+        )
+        .expect("run normal executor with its required run key");
+
+    assert_eq!(output.exit, ProcessExit::Code(0));
+    assert_eq!(
+        fs::read_to_string(normal_key_path).unwrap(),
+        "ephemeral-run-key"
+    );
+    assert_eq!(
+        fs::read_to_string(normal_cwd_path)
+            .expect("read normal executor cwd")
+            .trim(),
+        working_directory.to_string_lossy()
+    );
+    assert_eq!(
+        String::from_utf8(stdout).expect("executor event is UTF-8"),
+        format!("{}\n", result_event())
+    );
+}
+
+#[test]
+fn capability_probe_errors_name_the_transport_without_echoing_argv() {
+    let directory = TestDirectory::new();
+    let stub = directory.0.join("invalid-capability-command");
+    write_executable(&stub, "#!/bin/sh\nprintf '%s\\n' '{not-json}'\n");
+    let cwd = serde_json::to_string(&directory.0.to_string_lossy().as_ref())
+        .expect("serialize executor cwd");
+    let stub_argv = serde_json::to_string(&[
+        stub.to_string_lossy().into_owned(),
+        "argv-secret-must-not-be-reported".to_owned(),
+    ])
+    .expect("serialize capabilities executor argv");
+    let config = Config::from_toml_str(&format!(
+        "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"capability-error-test\"\nexecutor = [\"executor-secret-must-not-be-reported\"]\ncapabilities_executor = {stub_argv}\nexecutor_cwd = {cwd}\n"
+    ))
+    .expect("parse capabilities executor config");
+    let transport = ExecutorTransport::for_capabilities(&config);
+
+    let error = transport
+        .discover_capabilities()
+        .expect_err("invalid capability report must fail");
+    let message = error.to_string();
+    assert!(message.contains("[runner].capabilities_executor"));
+    assert!(!message.contains("argv-secret-must-not-be-reported"));
+    assert!(!message.contains("executor-secret-must-not-be-reported"));
+}
+
+#[test]
 fn malformed_executor_capability_response_fails_closed() {
     let directory = TestDirectory::new();
     let stub = directory.0.join("malformed-capability-executor");
@@ -348,7 +485,7 @@ fn malformed_executor_capability_response_fails_closed() {
 
     assert!(matches!(
         transport.discover_capabilities(),
-        Err(ExecutorTransportError::Capabilities(_))
+        Err(ExecutorTransportError::Capabilities { .. })
     ));
 }
 
