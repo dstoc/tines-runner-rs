@@ -240,7 +240,10 @@ fn poll_queue_retains_resolved_context_config_and_original_assignment() {
         .expect("executor can take resolved assignment");
     assert_eq!(claimed.context(), queued.context());
     assert_eq!(claimed.resolution(), queued.resolution());
-    assert_eq!(claimed.assignment().run_key, "ephemeral-run-key");
+    assert_eq!(
+        claimed.assignment().run_key.as_deref(),
+        Some("ephemeral-run-key")
+    );
 }
 
 #[test]

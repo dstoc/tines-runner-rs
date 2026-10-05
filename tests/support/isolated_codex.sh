@@ -24,6 +24,8 @@ fi
     printf 'workspace=%s\n' "$PWD"
     printf 'executor_marker=%s\n' "${TRANSPORT_EXECUTOR_MARKER:-}"
     printf 'daemon_marker=%s\n' "${TRANSPORT_DAEMON_MARKER:-}"
+    printf 'tines_api_key_present=%s\n' "${TINES_API_KEY+x}"
+    printf 'tines_api_url=%s\n' "${TINES_API_URL:-}"
     printf 'path=%s\n' "$PATH"
     printf 'prompt='
     cat prompt.md

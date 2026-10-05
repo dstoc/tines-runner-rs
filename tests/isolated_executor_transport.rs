@@ -99,7 +99,7 @@ impl TestDirectory {
         let credentials = self.0.join("daemon-state/credentials.toml");
         fs::create_dir_all(credentials.parent().unwrap()).expect("create daemon state directory");
         let config = format!(
-            "[server]\nurl = {}\n[runner]\nname = \"isolated-transport-acceptance\"\nexecutor = {}\nexecutor_cwd = {}\nworkspace_parent = {}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {}\nkeep_workspaces = \"never\"\n\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\n\n[[override]]\nproject = \"Alternate\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\n",
+            "[server]\nurl = {}\n[runner]\nname = \"isolated-transport-acceptance\"\nexecutor = {}\nexecutor_cwd = {}\nworkspace_parent = {}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {}\nkeep_workspaces = \"never\"\n\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\n\n[[override]]\nproject = \"Alternate\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\nrun_key_delivery = \"environment\"\n",
             path_value(Path::new(server_url)),
             executor_argv,
             path_value(&capability_cwd),
@@ -574,6 +574,37 @@ fn isolated_transport_covers_capabilities_overrides_protocol_cancellation_and_ti
         alternate_transport["executor_exit_status"], 0,
         "the shim preserves the nested executor's zero exit status"
     );
+    assert!(
+        alternate_transport["outer_has_tines_api_key"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        alternate_transport["outer_run_key_matches_assignment"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        !alternate_transport["request_has_run_key"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        !alternate_transport["inner_receives_tines_api_key"]
+            .as_bool()
+            .unwrap()
+    );
+    let alternate_request: Value = serde_json::from_slice(
+        &fs::read(paths.captures.join("arun_transport_alternate.request.json"))
+            .expect("read environment-delivery request"),
+    )
+    .expect("decode environment-delivery request");
+    assert!(alternate_request["assignment"].get("run_key").is_none());
+    assert!(
+        !alternate_request
+            .to_string()
+            .contains("issue-run-key-arun_transport_alternate")
+    );
     let alternate_workspace = fs::read_to_string(
         paths
             .captures
@@ -583,6 +614,9 @@ fn isolated_transport_covers_capabilities_overrides_protocol_cancellation_and_ti
     assert!(
         alternate_workspace.contains(&format!("workspace={}", paths.second_workspaces.display()))
     );
+    assert!(alternate_workspace.contains("tines_api_key_present="));
+    assert!(!alternate_workspace.contains("tines_api_key_present=x"));
+    assert!(alternate_workspace.contains("tines_api_url=http://127.0.0.1:"));
     assert!(!alternate_workspace.contains(&format!("workspace={}", paths.second_cwd.display())));
 
     let failure = assignment(&paths, "arun_transport_failure", "Tines", 5, "failure");

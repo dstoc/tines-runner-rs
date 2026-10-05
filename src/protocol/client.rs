@@ -405,7 +405,7 @@ impl RunLogBuffer {
 
     /// Build a redacting buffer from the run key and secret assignment values.
     pub fn for_assignment(assignment: &crate::protocol::RunnerAssignment) -> Self {
-        let secrets = std::iter::once(assignment.run_key.clone()).chain(
+        let secrets = assignment.run_key.iter().cloned().chain(
             assignment
                 .env
                 .iter()

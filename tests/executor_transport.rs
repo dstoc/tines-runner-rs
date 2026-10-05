@@ -108,6 +108,47 @@ fn result_event() -> &'static str {
     "{\"version\":1,\"type\":\"result\",\"status\":\"completed\",\"exit_code\":0}\n"
 }
 
+#[test]
+fn environment_delivery_sets_transport_key_without_serializing_it_and_redacts_stderr() {
+    let directory = TestDirectory::new();
+    let request_path = directory.0.join("environment-request.json");
+    let key_path = directory.0.join("transport-key.txt");
+    let stub = directory.0.join("environment-transport");
+    write_executable(
+        &stub,
+        &format!(
+            "#!/bin/sh\ncat > '{}'\nprintf '%s' \"${{TINES_API_KEY:-}}\" > '{}'\nprintf 'diagnostic=%s\\n' \"$TINES_API_KEY\" >&2\nprintf '%s' '{}'\n",
+            request_path.display(),
+            key_path.display(),
+            result_event()
+        ),
+    );
+    let mut request = request("environment delivery".to_owned());
+    request.assignment.run_key = None;
+    let transport = ExecutorTransport::new(vec![stub.to_string_lossy().into_owned()], &directory.0);
+
+    let output = transport
+        .run_with_callbacks_and_environment_key(
+            &request,
+            Some("environment-run-key"),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            || false,
+            || false,
+            |_, _| Ok(()),
+            |_| {},
+            || {},
+        )
+        .expect("launch executor with environment delivery");
+
+    let delivered: Value =
+        serde_json::from_slice(&fs::read(request_path).unwrap()).expect("decode request");
+    assert!(delivered["assignment"].get("run_key").is_none());
+    assert_eq!(fs::read_to_string(key_path).unwrap(), "environment-run-key");
+    assert!(!output.stderr.contains("environment-run-key"));
+    assert!(output.stderr.contains("[REDACTED]"));
+}
+
 fn codex_capabilities_document() -> &'static str {
     r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#
 }

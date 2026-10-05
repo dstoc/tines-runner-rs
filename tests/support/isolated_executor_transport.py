@@ -87,6 +87,10 @@ else:
         "outer_daemon_marker": os.environ.get("TRANSPORT_DAEMON_MARKER"),
         "outer_has_tines_api_key": "TINES_API_KEY" in os.environ,
         "outer_has_assignment_secret": "DEPLOY_TOKEN" in os.environ,
+        "outer_run_key_matches_assignment": os.environ.get("TINES_API_KEY")
+        == f"issue-run-key-{run_id}",
+        "request_has_run_key": "run_key" in request["assignment"],
+        "inner_receives_tines_api_key": "TINES_API_KEY" in child_environment,
         "executor_path": child_environment["PATH"],
         "executor_marker": child_environment["TRANSPORT_EXECUTOR_MARKER"],
     }

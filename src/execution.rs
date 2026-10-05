@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::assignment::PreparedAssignment;
 use crate::cancellation::CancellationToken;
-use crate::config::WorkspaceRetention;
+use crate::config::{RunKeyDelivery, WorkspaceRetention};
 use crate::executor_events::ExecutorEventStream;
 use crate::executor_transport::{ExecutorTransport, execution_request};
 use crate::protocol::client::{Client, ErrorCategory, RunLogBuffer};
@@ -153,7 +153,12 @@ fn run_executor(
     let resolved = assignment.resolved();
     let config = &resolved.resolution().config;
     let request = execution_request(resolved, assignment.api_url(), retention);
-    let mut stream = ExecutorEventStream::new(&request);
+    let environment_run_key = match config.run_key_delivery {
+        RunKeyDelivery::Request => None,
+        RunKeyDelivery::Environment => assignment.assignment().run_key.as_deref(),
+    };
+    let additional_secrets = environment_run_key.into_iter().collect::<Vec<_>>();
+    let mut stream = ExecutorEventStream::new_with_secrets(&request, &additional_secrets);
     let transport = ExecutorTransport::from_resolved(config);
     let run_id = assignment.assignment().run.id.clone();
     let runner_token = connection.credentials().runner_token().to_owned();
@@ -162,8 +167,9 @@ fn run_executor(
     let last_flush = Cell::new(Instant::now());
     let protocol_failure = RefCell::new(None::<String>);
 
-    let result = transport.run_with_callbacks(
+    let result = transport.run_with_callbacks_and_environment_key(
         &request,
+        environment_run_key,
         timeout,
         TERMINATION_GRACE,
         || {

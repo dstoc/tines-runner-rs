@@ -41,6 +41,17 @@ pub enum RepositoryCheckoutPolicy {
     MetadataOnly,
 }
 
+/// How the daemon delivers an assignment run key to its executor transport.
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RunKeyDelivery {
+    /// Keep the run key in the JSON request written to executor stdin.
+    #[default]
+    Request,
+    /// Set the run key on the executor transport process environment.
+    Environment,
+}
+
 /// Bounds and mode for retained assignment workspaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceRetention {
@@ -65,6 +76,7 @@ pub struct Config {
     /// Default argv command for assignments using the custom harness.
     pub custom_command: Option<Vec<String>>,
     pub repository_checkout: RepositoryCheckoutPolicy,
+    pub run_key_delivery: RunKeyDelivery,
     /// The daemon-side working directory for the executor transport process.
     pub executor_cwd: PathBuf,
     pub max_concurrent: usize,
@@ -88,6 +100,8 @@ pub struct ResolvedRunConfig {
     pub custom_command: Option<Vec<String>>,
     /// Repository materialization mode selected for this assignment.
     pub repository_checkout: RepositoryCheckoutPolicy,
+    /// How this assignment's Tines run key crosses the daemon/executor boundary.
+    pub run_key_delivery: RunKeyDelivery,
     /// Absolute daemon-side working directory for the executor process.
     pub executor_cwd: PathBuf,
 }
@@ -195,6 +209,7 @@ impl Config {
             executor: self.executor.clone(),
             custom_command: self.custom_command.clone(),
             repository_checkout: self.repository_checkout,
+            run_key_delivery: self.run_key_delivery,
             executor_cwd: self.executor_cwd.clone(),
         };
         let mut matching_overrides = Vec::new();
@@ -209,6 +224,9 @@ impl Config {
             }
             if let Some(repository_checkout) = rule.repository_checkout {
                 resolved.repository_checkout = repository_checkout;
+            }
+            if let Some(run_key_delivery) = rule.run_key_delivery {
+                resolved.run_key_delivery = run_key_delivery;
             }
             if let Some(workspace_parent) = &rule.workspace_parent {
                 resolved.workspace_parent = Some(workspace_parent.clone());
@@ -323,6 +341,7 @@ impl Config {
                     && rule.executor_cwd.is_none()
                     && rule.custom_command.is_none()
                     && rule.repository_checkout.is_none()
+                    && rule.run_key_delivery.is_none()
                 {
                     return Err(ConfigError::Invalid(
                         "each [[override]] must set at least one override value".to_owned(),
@@ -340,6 +359,7 @@ impl Config {
                     executor: rule.executor,
                     custom_command: rule.custom_command,
                     repository_checkout: rule.repository_checkout,
+                    run_key_delivery: rule.run_key_delivery,
                     executor_cwd: rule
                         .executor_cwd
                         .as_deref()
@@ -365,6 +385,7 @@ impl Config {
                 .map(|command| validate_custom_command(&command).map(|()| command))
                 .transpose()?,
             repository_checkout: raw.runner.repository_checkout.unwrap_or_default(),
+            run_key_delivery: raw.runner.run_key_delivery.unwrap_or_default(),
             executor_cwd,
             max_concurrent,
             allow_remote_concurrency: raw.runner.allow_remote_concurrency,
@@ -404,6 +425,7 @@ struct ConfigOverride {
     executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
     repository_checkout: Option<RepositoryCheckoutPolicy>,
+    run_key_delivery: Option<RunKeyDelivery>,
     executor_cwd: Option<PathBuf>,
 }
 
@@ -451,6 +473,7 @@ struct RawRunner {
     executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
     repository_checkout: Option<RepositoryCheckoutPolicy>,
+    run_key_delivery: Option<RunKeyDelivery>,
     executor_cwd: Option<PathBuf>,
     max_concurrent: Option<usize>,
     #[serde(default)]
@@ -478,6 +501,7 @@ struct RawOverride {
     executor: Option<Vec<String>>,
     custom_command: Option<Vec<String>>,
     repository_checkout: Option<RepositoryCheckoutPolicy>,
+    run_key_delivery: Option<RunKeyDelivery>,
     executor_cwd: Option<PathBuf>,
 }
 
@@ -914,6 +938,51 @@ repository_checkout = "enabled"
                 .resolve(context("Other", "Build", "Review"))
                 .repository_checkout,
             RepositoryCheckoutPolicy::Enabled
+        );
+    }
+
+    #[test]
+    fn run_key_delivery_defaults_to_request_and_can_be_selected_by_each_override_kind() {
+        let defaults = parse_with_overrides("");
+        assert_eq!(
+            defaults
+                .resolve(context("Other", "Build", "Ready"))
+                .run_key_delivery,
+            RunKeyDelivery::Request
+        );
+
+        let config = parse_with_overrides(
+            r#"run_key_delivery = "request"
+
+[[override]]
+project = "Project"
+run_key_delivery = "environment"
+
+[[override]]
+workflow = "Workflow"
+run_key_delivery = "environment"
+
+[[override]]
+state = "State"
+run_key_delivery = "environment"
+"#,
+        );
+
+        for context in [
+            context("Project", "Other", "Other"),
+            context("Other", "Workflow", "Other"),
+            context("Other", "Other", "State"),
+        ] {
+            assert_eq!(
+                config.resolve(context).run_key_delivery,
+                RunKeyDelivery::Environment
+            );
+        }
+        assert_eq!(
+            config
+                .resolve(context("Other", "Other", "Other"))
+                .run_key_delivery,
+            RunKeyDelivery::Request
         );
     }
 
