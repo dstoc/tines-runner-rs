@@ -14,6 +14,7 @@ pub mod executor_capabilities;
 pub mod executor_events;
 pub mod executor_transport;
 pub mod logging;
+pub mod ownership;
 pub mod poll;
 pub mod process;
 pub mod protocol;

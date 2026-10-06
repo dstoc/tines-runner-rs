@@ -176,6 +176,14 @@ fn start_runner(
         Some(tines_runner_rs::shutdown::ShutdownSignal::install()?)
     };
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
+    let _ownership = if check {
+        None
+    } else {
+        Some(tines_runner_rs::ownership::DaemonOwnershipGuard::acquire(
+            &config.server_url,
+            connection.credentials(),
+        )?)
+    };
     if check {
         connection.verify()?;
     }
