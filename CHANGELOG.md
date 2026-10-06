@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/dstoc/tines-runner-rs/compare/v0.4.1...v0.5.0) (2026-10-06)
+
+
+### Features
+
+* **config:** require explicit --config path ([#59](https://github.com/dstoc/tines-runner-rs/issues/59)) ([8b5e4ae](https://github.com/dstoc/tines-runner-rs/commit/8b5e4ae4548d0b0e14750f8b00556c9522127314))
+* **config:** support multiple named runners ([#62](https://github.com/dstoc/tines-runner-rs/issues/62)) ([23a5e09](https://github.com/dstoc/tines-runner-rs/commit/23a5e094cfe046de088e1d5be829930c4ff66df7))
+* **credentials:** add explicit runner registration command ([#61](https://github.com/dstoc/tines-runner-rs/issues/61)) ([aea8712](https://github.com/dstoc/tines-runner-rs/commit/aea871243b18c2af41d9f7a0a67f96ce961fb617))
+* **logging:** improve daemon operational diagnostics ([#60](https://github.com/dstoc/tines-runner-rs/issues/60)) ([a60b632](https://github.com/dstoc/tines-runner-rs/commit/a60b6323b9d693411904649f2e524432b2f48518))
+
+
+### Bug Fixes
+
+* **credentials:** allow read-only external credential files ([#57](https://github.com/dstoc/tines-runner-rs/issues/57)) ([ee9bb78](https://github.com/dstoc/tines-runner-rs/commit/ee9bb784e41cfac31b90e925fd028b2c64fe9f0b))
+
 ## [0.4.1](https://github.com/dstoc/tines-runner-rs/compare/v0.4.0...v0.4.1) (2026-10-06)
 
 
