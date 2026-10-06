@@ -609,19 +609,14 @@ fn active_runs_file(state_dir: &Path, runner_id: &str) -> PathBuf {
 }
 
 fn runner_state_namespace(runner_id: &str) -> String {
-    let mut namespace = String::new();
-    for byte in runner_id.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-            namespace.push(char::from(byte));
-        } else {
-            namespace.push_str(&format!("%{byte:02X}"));
-        }
+    let digest = Sha256::digest(runner_id.as_bytes());
+    let mut namespace = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespace.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    if namespace.is_empty() {
-        "default".to_owned()
-    } else {
-        namespace
-    }
+    namespace
 }
 
 fn legacy_named_active_runs_file(credentials_file: &Path) -> PathBuf {
@@ -996,7 +991,7 @@ state_dir = "/var/lib/tines/state"
         assert_eq!(codex.state_dir, PathBuf::from("/var/lib/tines/state"));
         assert_eq!(
             codex.active_runs_file(),
-            Path::new("/var/lib/tines/state/runner-codex/active-runs.json")
+            active_runs_file(Path::new("/var/lib/tines/state"), "codex")
         );
         assert_eq!(codex.executor, ["codex-executor".to_owned()]);
         assert_eq!(
@@ -1028,7 +1023,7 @@ state_dir = "/var/lib/tines/state"
         assert_eq!(antigravity.state_dir, PathBuf::from("/var/lib/tines/state"));
         assert_eq!(
             antigravity.active_runs_file(),
-            Path::new("/var/lib/tines/state/runner-antigravity/active-runs.json")
+            active_runs_file(Path::new("/var/lib/tines/state"), "antigravity")
         );
         assert_eq!(antigravity.executor, ["antigravity-executor".to_owned()]);
         assert_eq!(
@@ -1110,7 +1105,7 @@ executor_cwd = "/srv/antigravity"
         );
         assert_eq!(
             config.active_runs_file(),
-            Path::new("/var/lib/tines-runner-rs/state/runner-default/active-runs.json")
+            active_runs_file(Path::new("/var/lib/tines-runner-rs/state"), "default")
         );
     }
 
@@ -1152,7 +1147,11 @@ executor_cwd = "/srv/antigravity"
         );
         assert_eq!(
             default.active_runs_file().parent(),
-            Some(default.state_dir.join("runner-default").as_path())
+            Some(
+                active_runs_file(&default.state_dir, "default")
+                    .parent()
+                    .unwrap()
+            )
         );
 
         let relative = Config::from_toml_str_with_defaults(
@@ -1178,18 +1177,37 @@ executor_cwd = "/srv/antigravity"
     fn runner_state_namespaces_are_collision_safe_path_components() {
         let state_dir = Path::new("/var/lib/tines-runner");
         let codex = active_runs_file(state_dir, "codex");
+        let codex_uppercase = active_runs_file(state_dir, "Codex");
         let checks = active_runs_file(state_dir, "checks");
         let separator_id = active_runs_file(state_dir, "../codex");
         let encoded_id = active_runs_file(state_dir, "..%2Fcodex");
 
-        assert_eq!(codex, state_dir.join("runner-codex/active-runs.json"));
-        assert_eq!(checks, state_dir.join("runner-checks/active-runs.json"));
-        assert_eq!(
-            separator_id,
-            state_dir.join("runner-%2E%2E%2Fcodex/active-runs.json")
-        );
-        assert_ne!(separator_id, encoded_id);
+        assert!(codex.starts_with(state_dir));
+        assert!(checks.starts_with(state_dir));
         assert!(separator_id.starts_with(state_dir));
+        assert_eq!(
+            codex.file_name().and_then(|name| name.to_str()),
+            Some("active-runs.json")
+        );
+        let namespace = codex.parent().and_then(Path::file_name).unwrap();
+        let namespace = namespace.to_str().unwrap();
+        assert!(namespace.starts_with("runner-"));
+        assert_eq!(namespace.len(), "runner-".len() + 64);
+        assert!(
+            namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        assert_ne!(codex, codex_uppercase);
+        let folded_namespace = |path: &Path| {
+            path.parent()
+                .and_then(Path::file_name)
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        };
+        assert_ne!(folded_namespace(&codex), folded_namespace(&codex_uppercase));
+        assert_ne!(separator_id, encoded_id);
     }
 
     #[test]

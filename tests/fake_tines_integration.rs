@@ -115,7 +115,19 @@ impl TestDirectory {
     }
 
     fn active_runs_path(&self) -> std::path::PathBuf {
-        self.path.join("state/runner-default/active-runs.json")
+        let state_dir = self.path.join("state");
+        let runner_dir = fs::read_dir(&state_dir)
+            .expect("read runner state directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("runner-"))
+            })
+            .expect("find runner state namespace");
+        runner_dir.join("active-runs.json")
     }
 
     fn workspace_parent(&self) -> std::path::PathBuf {
@@ -1506,8 +1518,26 @@ fn distinct_named_runner_registrations_can_poll_concurrently() {
             .collect::<std::collections::BTreeSet<_>>();
         registrations.len() >= 2 && poll_targets.len() >= 2
     });
-    assert!(directory.path.join("state/runner-codex").is_dir());
-    assert!(directory.path.join("state/runner-antigravity").is_dir());
+    let state_namespaces = fs::read_dir(directory.path.join("state"))
+        .expect("read named runner state directory")
+        .map(|entry| {
+            entry
+                .expect("read state entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(state_namespaces.len(), 2);
+    assert!(
+        state_namespaces
+            .iter()
+            .all(|name| name.starts_with("runner-") && name.len() == "runner-".len() + 64)
+    );
+    assert_ne!(
+        state_namespaces[0].to_ascii_lowercase(),
+        state_namespaces[1].to_ascii_lowercase()
+    );
     codex.assert_running();
     antigravity.assert_running();
 

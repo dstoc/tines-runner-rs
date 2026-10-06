@@ -19,6 +19,21 @@ use uuid::Uuid;
 
 struct TestDirectory(PathBuf);
 
+fn runner_active_runs_file(state_dir: &Path) -> PathBuf {
+    fs::read_dir(state_dir)
+        .expect("read runner state directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("runner-"))
+        })
+        .expect("find runner state namespace")
+        .join("active-runs.json")
+}
+
 impl TestDirectory {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -676,7 +691,7 @@ fn isolated_transport_covers_capabilities_overrides_protocol_cancellation_and_ti
     wait_for_file(&cancel_harness_pid_file, Duration::from_secs(10));
     wait_for_file(&cancel_descendant_pid_file, Duration::from_secs(10));
     let transport_state = wait_for_process_identity(
-        &paths.state_dir.join("runner-default/active-runs.json"),
+        &runner_active_runs_file(&paths.state_dir),
         "arun_transport_cancel",
         Duration::from_secs(10),
     );

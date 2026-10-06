@@ -144,7 +144,9 @@ Without an explicit setting, the state directory is:
   `%USERPROFILE%\AppData\Local` if `LOCALAPPDATA` is unset).
 
 Set `[storage].state_dir` once for all runners in the config. The daemon stores
-each runner's active-run file in a separate `runner-<local-ID>` subdirectory.
+each runner's active-run file in a separate subdirectory named with a
+lowercase SHA-256 digest of its exact local ID. This keeps IDs distinct on
+case-insensitive filesystems.
 The daemon creates the selected directory and tests file creation,
 sync, and rename before it polls. If the path is invalid or unwritable, startup
 fails and reports the state path.
