@@ -52,39 +52,8 @@ impl ActiveRunStore {
     /// Open a state file, or start with an empty state when it does not exist.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let runs = match fs::read(&path) {
-            Ok(bytes) => {
-                let state: ActiveRunFile = serde_json::from_slice(&bytes).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid active-run state file: {error}"),
-                    )
-                })?;
-                if !matches!(state.version, 1 | 2 | STATE_VERSION) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unsupported active-run state version {}", state.version),
-                    ));
-                }
-                for (run_id, record) in &state.runs {
-                    if run_id != &record.run_id
-                        || run_id.is_empty()
-                        || record
-                            .workspace
-                            .as_ref()
-                            .is_some_and(|workspace| !workspace.is_absolute())
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "active-run state contains an invalid run ID or workspace path",
-                        ));
-                    }
-                }
-                state.runs
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(error) => return Err(error),
-        };
+        validate_state_location(&path)?;
+        let runs = read_state(&path)?;
 
         Ok(Self {
             inner: Arc::new(StoreInner {
@@ -92,6 +61,52 @@ impl ActiveRunStore {
                 runs: Mutex::new(runs),
             }),
         })
+    }
+
+    /// Import state from the credentials-adjacent path used by older versions.
+    /// The legacy file is only read; a marker in the configured state directory
+    /// prevents stale records from being re-imported after settlement.
+    pub fn import_legacy_state(&self, legacy_path: &Path) -> io::Result<usize> {
+        if legacy_path == self.inner.path {
+            return Ok(0);
+        }
+        let marker = migration_marker(&self.inner.path);
+        match fs::metadata(&marker) {
+            Ok(_) => return Ok(0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(state_path_error(
+                    "could not inspect active-run migration marker for",
+                    &self.inner.path,
+                    error,
+                ));
+            }
+        }
+
+        let state_exists = self
+            .inner
+            .path
+            .try_exists()
+            .map_err(|error| state_path_error("could not inspect", &self.inner.path, error))?;
+        let mut runs = self
+            .inner
+            .runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let imported = if state_exists || !runs.is_empty() {
+            0
+        } else {
+            let legacy_runs = read_state(legacy_path)?;
+            if legacy_runs.is_empty() {
+                0
+            } else {
+                write_state(&self.inner.path, &legacy_runs)?;
+                *runs = legacy_runs.clone();
+                legacy_runs.len()
+            }
+        };
+        write_migration_marker(&marker, &self.inner.path)?;
+        Ok(imported)
     }
 
     /// Persist the executor transport identity after it starts and before
@@ -262,7 +277,9 @@ fn validate_workspace_root(workspace: &Path, roots: &[PathBuf]) -> io::Result<()
 
 fn write_state(path: &Path, runs: &BTreeMap<String, ActiveRunRecord>) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).map_err(|error| {
+        state_path_error("could not create configured runner state path", path, error)
+    })?;
     let state = ActiveRunFile {
         version: STATE_VERSION,
         runs: runs.clone(),
@@ -283,7 +300,125 @@ fn write_state(path: &Path, runs: &BTreeMap<String, ActiveRunRecord>) -> io::Res
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result
+    result.map_err(|error| state_path_error("could not write", path, error))
+}
+
+fn read_state(path: &Path) -> io::Result<BTreeMap<String, ActiveRunRecord>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(state_path_error("could not read", path, error)),
+    };
+    let state: ActiveRunFile = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid active-run state file {}: {error}", path.display()),
+        )
+    })?;
+    if !matches!(state.version, 1 | 2 | STATE_VERSION) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported active-run state version {} in {}",
+                state.version,
+                path.display()
+            ),
+        ));
+    }
+    for (run_id, record) in &state.runs {
+        if run_id != &record.run_id
+            || run_id.is_empty()
+            || record
+                .workspace
+                .as_ref()
+                .is_some_and(|workspace| !workspace.is_absolute())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "active-run state {} contains an invalid run ID or workspace path",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(state.runs)
+}
+
+fn migration_marker(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("active-runs");
+    path.with_file_name(format!(".{name}.legacy-imported"))
+}
+
+fn write_migration_marker(marker: &Path, state_path: &Path) -> io::Result<()> {
+    let parent = marker.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(
+        ".active-run-migration-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let result = write_temporary_state(&temporary, b"imported\n")
+        .and_then(|()| fs::rename(&temporary, marker))
+        .and_then(|()| sync_directory(parent));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| {
+        state_path_error(
+            "could not persist active-run migration marker for",
+            state_path,
+            error,
+        )
+    })
+}
+
+fn validate_state_location(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        state_path_error("configured runner state path is not writable", path, error)
+    })?;
+    let metadata = fs::metadata(parent).map_err(|error| {
+        state_path_error(
+            "could not inspect configured runner state path",
+            path,
+            error,
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(state_path_error(
+            "configured runner state path is not a directory",
+            path,
+            io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "parent path is not a directory",
+            ),
+        ));
+    }
+
+    let token = uuid::Uuid::new_v4();
+    let temporary = parent.join(format!(".active-runs-{token}.probe.tmp"));
+    let renamed = parent.join(format!(".active-runs-{token}.probe"));
+    let result = write_temporary_state(&temporary, b"state path check")
+        .and_then(|()| fs::rename(&temporary, &renamed))
+        .and_then(|()| sync_directory(parent))
+        .and_then(|()| fs::remove_file(&renamed))
+        .and_then(|()| sync_directory(parent));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(&renamed);
+    }
+    result.map_err(|error| {
+        state_path_error("configured runner state path is not writable", path, error)
+    })
+}
+
+fn state_path_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
 }
 
 fn write_temporary_state(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -339,6 +474,105 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn invalid_state_location_reports_the_configured_state_path() {
+        let directory = TestDirectory::new();
+        let not_a_directory = directory.0.join("not-a-directory");
+        fs::write(&not_a_directory, "occupied").expect("create state path obstruction");
+        let state_path = not_a_directory.join("active-runs.json");
+
+        let error = ActiveRunStore::open(&state_path)
+            .expect_err("a file cannot be used as the state directory");
+        let message = error.to_string();
+        assert!(
+            message.contains("configured runner state path"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&state_path.display().to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn legacy_state_is_imported_once_without_writing_to_its_directory() {
+        let directory = TestDirectory::new();
+        let credential_dir = directory.0.join("external-credentials");
+        fs::create_dir_all(&credential_dir).expect("create legacy credentials directory");
+        let legacy_path = credential_dir.join("active-runs.json");
+        let legacy_store = ActiveRunStore::open(&legacy_path).expect("open legacy state file");
+        legacy_store
+            .update_record("arun_legacy".to_owned(), None, None)
+            .expect("write legacy active run");
+        drop(legacy_store);
+        let original_legacy_state = fs::read(&legacy_path).expect("read legacy state bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o400))
+                .expect("make legacy state read-only");
+            fs::set_permissions(&credential_dir, fs::Permissions::from_mode(0o500))
+                .expect("make legacy credentials directory read-only");
+        }
+
+        let state_dir = directory.0.join("writable-state");
+        let state_path = state_dir.join("active-runs.json");
+        let store = ActiveRunStore::open(&state_path).expect("open configured writable state");
+        assert_eq!(
+            store
+                .import_legacy_state(&legacy_path)
+                .expect("import old recovery records"),
+            1
+        );
+        assert_eq!(store.path(), state_path);
+        assert_eq!(
+            store
+                .records()
+                .iter()
+                .map(|record| record.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["arun_legacy"]
+        );
+        assert_eq!(
+            fs::read(&legacy_path).expect("legacy source remains readable"),
+            original_legacy_state,
+            "the old credentials-adjacent state is read but never changed"
+        );
+        assert!(state_path.is_file(), "new state belongs under state_dir");
+
+        store.remove("arun_legacy").expect("settle imported run");
+        drop(store);
+        let reopened = ActiveRunStore::open(&state_path).expect("reopen configured state");
+        assert_eq!(
+            reopened
+                .import_legacy_state(&legacy_path)
+                .expect("do not import stale legacy records again"),
+            0
+        );
+        assert!(reopened.records().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_state_location_fails_before_polling_with_its_path() {
+        let state_path = PathBuf::from(format!(
+            "/proc/tines-runner-state-{}-{}/active-runs.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let error = ActiveRunStore::open(&state_path)
+            .expect_err("procfs does not allow creating runner state directories");
+        let message = error.to_string();
+        assert!(
+            message.contains("configured runner state path"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&state_path.display().to_string()),
+            "{message}"
+        );
     }
 
     fn retention(mode: RetentionMode) -> WorkspaceRetention {

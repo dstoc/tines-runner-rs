@@ -233,6 +233,7 @@ fn run_case(exit_code: i32, expected_status: &str) {
     let client =
         Client::with_timeout(&server_url, Duration::from_secs(5)).expect("create protocol client");
     let credentials_path = directory.0.join("credentials.toml");
+    let state_dir = directory.0.join("runner-state");
     CredentialStore::at(&credentials_path)
         .save(&RunnerCredentials::new(
             "rnr_finish_runtime",
@@ -245,7 +246,9 @@ fn run_case(exit_code: i32, expected_status: &str) {
         serde_json::to_string(&workspace_parent.to_string_lossy().as_ref())
             .expect("encode workspace path");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nexecutor = {executor}\nworkspace_parent = {workspace_parent_value}\n[storage]\ncredentials_file = {}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"finish-test\"\nexecutor_cwd = \"~\"\nexecutor = {executor}\nworkspace_parent = {workspace_parent_value}\n[storage]\nstate_dir = {}\ncredentials_file = {}\n",
+        serde_json::to_string(&state_dir.to_string_lossy().as_ref())
+            .expect("encode state directory"),
         serde_json::to_string(&credentials_path.to_string_lossy().as_ref())
             .expect("encode credentials path")
     ))
@@ -258,8 +261,7 @@ fn run_case(exit_code: i32, expected_status: &str) {
         .expect("resolve assignment metadata");
     let prepared = PreparedAssignment::new(resolved);
     let active_runs =
-        ActiveRunStore::open(config.credentials_file.with_file_name("active-runs.json"))
-            .expect("load active-run state");
+        ActiveRunStore::open(config.active_runs_file()).expect("load active-run state");
     let shutdown = ShutdownSignal::inactive();
     let context = tines_runner_rs::execution::ExecutionContext::new(&shutdown, &active_runs);
 

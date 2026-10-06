@@ -134,14 +134,17 @@ allow_remote_concurrency = false
 poll_interval_seconds = 15
 
 [storage]
+state_dir = "/var/lib/tines-runner-rs/state"
 keep_workspaces = "never"
 keep_workspaces_for_hours = 72
 keep_workspaces_max = 20
 ```
 
 `[server].url`, `[runners.codex].name`, `[runners.codex].credentials_file`,
-and `[runners.codex].executor_cwd` are required. The server URL must use HTTP
-or HTTPS. The supported `runner_type` values are `codex` and `custom`.
+and `[runners.codex].executor_cwd` are required. `[storage].state_dir` is
+optional and defaults to a writable platform state directory. The server URL
+must use HTTP or HTTPS. The supported `runner_type` values are `codex` and
+`custom`.
 `executor_cwd` has no default. The runner expands `~` and resolves a relative
 path under the daemon account's home directory. The runner registers with
 Tines using the configured name and concurrency. Tines and this local
@@ -209,6 +212,28 @@ the executor account's home. If `workspace_parent` is omitted, the executor
 uses its platform default. The daemon expands `~` in its own paths, including
 `executor_cwd` and `credentials_file`. Unknown configuration keys cause
 startup to fail.
+
+### Active-run state directory
+
+The daemon stores active executor transport identities in a subdirectory under
+`[storage].state_dir`. Each runner uses a path such as
+`<state_dir>/runner-codex/active-runs.json`, based on its stable local ID. This mutable
+recovery state is separate from credentials. The default state
+directory is `${XDG_STATE_HOME:-~/.local/state}/tines-runner-rs` on Linux,
+`${XDG_STATE_HOME:-~/Library/Application Support}/tines-runner-rs` on macOS,
+and `${XDG_STATE_HOME:-%LOCALAPPDATA%}/tines-runner-rs` on Windows. An explicit
+relative `[storage].state_dir` resolves under the daemon account's home
+directory. The runner uses `XDG_STATE_HOME` only when it is an absolute path.
+
+At startup, the daemon creates the directory if needed and checks that it can
+write, sync, and rename files there. A missing or read-only location stops
+startup with the configured state path in the diagnostic. For systemd
+`LoadCredential=` deployments, keep credentials under `/run/credentials/...`
+and set `[storage].state_dir` to writable persistent storage such as
+`/var/lib/tines-runner-rs/state`. Add `StateDirectory=tines-runner-rs` to the
+service unit so the service account owns its parent directory. On the
+first startup after upgrading, any old recovery file is imported by reading
+it from the credentials-adjacent location; the old file is left untouched.
 
 ### Configure execution overrides
 
@@ -366,33 +391,36 @@ sudo chmod 0600 /etc/credstore.encrypted/tines-runner-rs.cred
 rm /home/tines-runner/provisioned-credentials.toml
 ```
 
-Set the runner's credential path to a private runtime copy. Add these settings
-to the config and system service unit:
+For the `tines-runner-rs@codex.service` instance, point the runner directly at
+systemd's private, read-only credential copy. Add these settings to the config
+and service unit:
 
 ```toml
 [runners.codex]
-credentials_file = "/run/tines-runner-rs-codex/credentials.toml"
+credentials_file = "/run/credentials/tines-runner-rs@codex.service/runner-credentials"
+
+[storage]
+state_dir = "/var/lib/tines-runner-rs/state"
 ```
 
 ```ini
 [Service]
-RuntimeDirectory=tines-runner-rs-codex
-RuntimeDirectoryMode=0700
+StateDirectory=tines-runner-rs
 LoadCredentialEncrypted=runner-credentials:/etc/credstore.encrypted/tines-runner-rs.cred
-ExecStartPre=/usr/bin/install -m 0400 %d/runner-credentials /run/tines-runner-rs-codex/credentials.toml
 ```
 
-systemd decrypts the credential for the unit. `ExecStartPre` copies it into
-the service's runtime directory, where the daemon can read it. The runtime
-directory is private to the service account and is removed when the service
-stops. The daemon loads the file without changing its permissions.
+systemd makes the credential readable to the unit without allowing the daemon
+to change it. `StateDirectory=` gives the service account writable persistent
+storage for `[storage].state_dir`; active-run records are never written under
+`/run/credentials`.
 
 If the host does not support `LoadCredentialEncrypted=`, use
 `LoadCredential=runner-credentials:/etc/tines-runner-rs/credentials.toml`
 with a root-owned, mode `0600` plaintext source file. Keep that source file
-private. The same runtime copy and `[runners.codex].credentials_file` setting
-apply. Give each additional runner its own runtime directory and system
-credential.
+private. Use the corresponding path under `/run/credentials/` for the
+service's `credentials_file`. Give each runner its own system credential. All
+runners can share the writable `[storage].state_dir`; the daemon separates
+their recovery files by local ID.
 
 ## Optional service examples
 
@@ -415,6 +443,7 @@ After=network-online.target
 [Service]
 Type=simple
 User=tines-runner
+StateDirectory=tines-runner-rs
 Environment=HOME=/home/tines-runner
 Environment=PATH=/home/tines-runner/.cargo/bin:/home/tines-runner/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner %i

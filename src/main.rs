@@ -204,6 +204,13 @@ fn start_runner(
         std::io::Error::other("daemon shutdown handler was not installed before polling")
     })?;
     let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(config.active_runs_file())?;
+    let imported_runs = active_runs.import_legacy_state(config.legacy_active_runs_file())?;
+    if imported_runs > 0 {
+        tracing::info!(
+            imported_runs,
+            "imported active-run recovery state from the legacy location"
+        );
+    }
     let recovered_runs = tines_runner_rs::recovery::recover_active_runs(
         &active_runs,
         &config.workspace_retention,

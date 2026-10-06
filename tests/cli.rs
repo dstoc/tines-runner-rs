@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Child;
 use std::process::{Command, Stdio};
@@ -19,12 +19,27 @@ use tines_runner_rs::execution_protocol::{
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+fn runner_active_runs_file(state_dir: &Path) -> PathBuf {
+    fs::read_dir(state_dir)
+        .expect("read runner state directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("runner-"))
+        })
+        .expect("find runner state namespace")
+        .join("active-runs.json")
+}
+
 struct TestDirectory(PathBuf);
 
 #[cfg(unix)]
 struct RunnerGuard {
     child: Child,
-    credentials_path: PathBuf,
+    state_dir: PathBuf,
 }
 
 #[cfg(unix)]
@@ -43,12 +58,16 @@ impl Drop for RunnerGuard {
                 let _ = self.child.wait();
             }
         }
-        if let Ok(store) = tines_runner_rs::recovery::ActiveRunStore::open(
-            self.credentials_path.with_file_name("active-runs.json"),
-        ) {
-            for record in store.records() {
-                if let Some(process) = record.transport {
-                    let _ = process.terminate_if_matches(Duration::from_millis(100));
+        if let Ok(entries) = fs::read_dir(&self.state_dir) {
+            for entry in entries.flatten() {
+                if let Ok(store) = tines_runner_rs::recovery::ActiveRunStore::open(
+                    entry.path().join("active-runs.json"),
+                ) {
+                    for record in store.records() {
+                        if let Some(process) = record.transport {
+                            let _ = process.terminate_if_matches(Duration::from_millis(100));
+                        }
+                    }
                 }
             }
         }
@@ -1475,6 +1494,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
     let harness_pid_path = directory.0.join("harness.pid");
     let descendant_path = directory.0.join("descendant.pid");
     let workspace_parent = directory.0.join("workspaces");
+    let state_dir = directory.0.join("runner-state");
     let current_path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
         std::iter::once(bin_directory).chain(std::env::split_paths(&current_path)),
@@ -1483,11 +1503,12 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nexecutor_cwd = \"~\"\nexecutor = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"shutdown-test\"\nexecutor_cwd = \"~\"\nexecutor = [{}]\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\nstate_dir = {:?}\n",
             serde_json::to_string(&executor_path.to_string_lossy().as_ref())
                 .expect("encode executor path"),
             workspace_parent,
-            credentials_path
+            credentials_path,
+            state_dir
         ),
     )
     .expect("write runner config");
@@ -1504,7 +1525,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
             .env_remove("TINES_API_KEY")
             .spawn()
             .expect("start runner daemon"),
-        credentials_path: credentials_path.clone(),
+        state_dir,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     while (!harness_pid_path.exists() || !descendant_path.exists()) && Instant::now() < deadline {
@@ -1517,7 +1538,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
     assert!(descendant_path.exists(), "harness descendant did not start");
     let harness = wait_for_pid_file(&mut runner.child, &harness_pid_path, deadline);
     let descendant = wait_for_pid_file(&mut runner.child, &descendant_path, deadline);
-    let active_runs_path = credentials_path.with_file_name("active-runs.json");
+    let active_runs_path = runner_active_runs_file(&runner.state_dir);
     let transport_identity = loop {
         if let Some(status) = runner.child.try_wait().expect("check runner") {
             panic!("runner exited before executor cancellation: {status}");

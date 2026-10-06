@@ -70,6 +70,9 @@ pub struct Config {
     pub server_url: Url,
     pub runner_name: String,
     pub runner_type: RunnerType,
+    /// Shared writable daemon state root. Each runner gets a separate,
+    /// collision-safe namespace beneath it.
+    pub state_dir: PathBuf,
     /// Executor workspace parent configured for new runs. `None` uses the
     /// executor environment's platform/XDG default.
     pub workspace_parent: Option<PathBuf>,
@@ -91,6 +94,7 @@ pub struct Config {
     pub poll_interval: Duration,
     pub credentials_file: PathBuf,
     active_runs_file: PathBuf,
+    legacy_active_runs_file: PathBuf,
     pub workspace_retention: WorkspaceRetention,
     overrides: Vec<ConfigOverride>,
 }
@@ -174,6 +178,12 @@ impl Config {
     /// Return the persisted active-run state file for this selected runner.
     pub fn active_runs_file(&self) -> &Path {
         &self.active_runs_file
+    }
+
+    /// Return the pre-state-directory location, used only to import recovery
+    /// records written by an earlier runner version.
+    pub fn legacy_active_runs_file(&self) -> &Path {
+        &self.legacy_active_runs_file
     }
 
     /// Load configuration from a file.
@@ -353,8 +363,17 @@ impl Config {
             &defaults.home,
         )?;
         let credentials_file = expand_path(&credentials_path, &defaults.home)?;
-        let active_runs_file = if local_id.is_some() {
-            named_active_runs_file(&credentials_file)
+        let state_dir = resolve_state_dir(
+            raw_storage
+                .state_dir
+                .as_deref()
+                .unwrap_or(&defaults.state_dir),
+            &defaults.home,
+        )?;
+        let active_runs_file =
+            active_runs_file(&state_dir, local_id.as_deref().unwrap_or("default"));
+        let legacy_active_runs_file = if local_id.is_some() {
+            legacy_named_active_runs_file(&credentials_file)
         } else {
             credentials_file.with_file_name("active-runs.json")
         };
@@ -423,6 +442,7 @@ impl Config {
             server_url,
             runner_name,
             runner_type: runner.runner_type.unwrap_or(RunnerType::Codex),
+            state_dir,
             workspace_parent,
             legacy_workspace_roots,
             executor: runner
@@ -441,6 +461,7 @@ impl Config {
             poll_interval: Duration::from_secs(poll_interval_seconds),
             credentials_file,
             active_runs_file,
+            legacy_active_runs_file,
             workspace_retention: WorkspaceRetention {
                 mode: raw_storage.keep_workspaces.unwrap_or_default(),
                 max_age: Duration::from_secs(keep_workspaces_max_age_seconds),
@@ -581,7 +602,24 @@ fn normalize_path_for_comparison(path: &Path) -> PathBuf {
     normalized
 }
 
-fn named_active_runs_file(credentials_file: &Path) -> PathBuf {
+fn active_runs_file(state_dir: &Path, runner_id: &str) -> PathBuf {
+    state_dir
+        .join(format!("runner-{}", runner_state_namespace(runner_id)))
+        .join("active-runs.json")
+}
+
+fn runner_state_namespace(runner_id: &str) -> String {
+    let digest = Sha256::digest(runner_id.as_bytes());
+    let mut namespace = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespace.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    namespace
+}
+
+fn legacy_named_active_runs_file(credentials_file: &Path) -> PathBuf {
     let normalized_credentials = normalize_path_for_comparison(credentials_file);
     let digest = Sha256::digest(normalized_credentials.to_string_lossy().as_bytes());
     let suffix = digest
@@ -682,6 +720,7 @@ struct RawRunner {
 #[serde(deny_unknown_fields)]
 struct RawStorage {
     credentials_file: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     keep_workspaces: Option<RetentionMode>,
     keep_workspaces_for_hours: Option<u64>,
     keep_workspaces_max: Option<usize>,
@@ -708,6 +747,7 @@ struct DefaultPaths {
     home: PathBuf,
     workspace_parent: PathBuf,
     credentials_file: PathBuf,
+    state_dir: PathBuf,
 }
 
 fn default_paths() -> Result<DefaultPaths, ConfigError> {
@@ -724,6 +764,7 @@ fn default_paths() -> Result<DefaultPaths, ConfigError> {
         home,
         env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        env::var_os("XDG_STATE_HOME").map(PathBuf::from),
         env::var_os("APPDATA").map(PathBuf::from),
         env::var_os("LOCALAPPDATA").map(PathBuf::from),
     ))
@@ -760,6 +801,7 @@ fn default_paths_for(
     home: PathBuf,
     xdg_config_home: Option<PathBuf>,
     xdg_data_home: Option<PathBuf>,
+    xdg_state_home: Option<PathBuf>,
     _appdata: Option<PathBuf>,
     _local_appdata: Option<PathBuf>,
 ) -> DefaultPaths {
@@ -788,10 +830,25 @@ fn default_paths_for(
     let data_dir =
         absolute_path(xdg_data_home).unwrap_or_else(|| home.join(".local").join("share"));
 
+    #[cfg(windows)]
+    let state_dir = absolute_path(xdg_state_home)
+        .or_else(|| absolute_path(_local_appdata))
+        .unwrap_or_else(|| home.join("AppData").join("Local"))
+        .join("tines-runner-rs");
+    #[cfg(target_os = "macos")]
+    let state_dir = absolute_path(xdg_state_home)
+        .unwrap_or_else(|| home.join("Library").join("Application Support"))
+        .join("tines-runner-rs");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let state_dir = absolute_path(xdg_state_home)
+        .unwrap_or_else(|| home.join(".local").join("state"))
+        .join("tines-runner-rs");
+
     DefaultPaths {
         home: home.clone(),
         credentials_file: config_dir.join("credentials.toml"),
         workspace_parent: data_dir.join("tines-runner-rs").join("workspaces"),
+        state_dir,
     }
 }
 
@@ -799,6 +856,20 @@ fn resolve_executor_cwd(path: &Path, home: &Path) -> Result<PathBuf, ConfigError
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid(
             "executor_cwd must not be empty".to_owned(),
+        ));
+    }
+    let expanded = expand_path(path, home)?;
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(home.join(expanded))
+    }
+}
+
+fn resolve_state_dir(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid(
+            "state_dir must not be empty".to_owned(),
         ));
     }
     let expanded = expand_path(path, home)?;
@@ -849,6 +920,7 @@ mod tests {
             home: home.clone(),
             workspace_parent: home.join(".local/share/tines-runner-rs/workspaces"),
             credentials_file: config_dir.join("credentials.toml"),
+            state_dir: home.join(".local/state/tines-runner-rs"),
         }
     }
 
@@ -901,6 +973,9 @@ max_concurrent = 4
 [[runners.antigravity.override]]
 state = "Review"
 executor = ["antigravity-review-executor"]
+
+[storage]
+state_dir = "/var/lib/tines/state"
 "#;
 
         let codex =
@@ -912,6 +987,11 @@ executor = ["antigravity-review-executor"]
         assert_eq!(
             codex.credentials_file,
             PathBuf::from("/var/lib/tines/codex-credentials.toml")
+        );
+        assert_eq!(codex.state_dir, PathBuf::from("/var/lib/tines/state"));
+        assert_eq!(
+            codex.active_runs_file(),
+            active_runs_file(Path::new("/var/lib/tines/state"), "codex")
         );
         assert_eq!(codex.executor, ["codex-executor".to_owned()]);
         assert_eq!(
@@ -940,6 +1020,11 @@ executor = ["antigravity-review-executor"]
             antigravity.credentials_file,
             PathBuf::from("/var/lib/tines/antigravity-credentials.toml")
         );
+        assert_eq!(antigravity.state_dir, PathBuf::from("/var/lib/tines/state"));
+        assert_eq!(
+            antigravity.active_runs_file(),
+            active_runs_file(Path::new("/var/lib/tines/state"), "antigravity")
+        );
         assert_eq!(antigravity.executor, ["antigravity-executor".to_owned()]);
         assert_eq!(
             antigravity.capabilities_executor,
@@ -961,8 +1046,8 @@ executor = ["antigravity-review-executor"]
         );
         assert_ne!(codex.active_runs_file(), antigravity.active_runs_file());
         assert_ne!(
-            codex.active_runs_file().file_name(),
-            antigravity.active_runs_file().file_name()
+            codex.active_runs_file().parent(),
+            antigravity.active_runs_file().parent()
         );
     }
 
@@ -991,6 +1076,138 @@ executor_cwd = "/srv/antigravity"
                 .to_string();
         assert!(unknown.contains("unknown runner id \"other\""), "{unknown}");
         assert!(unknown.contains("antigravity, codex"), "{unknown}");
+    }
+
+    #[test]
+    fn external_credentials_use_the_configured_state_directory() {
+        let config = Config::from_toml_str_with_defaults(
+            r#"
+                [server]
+                url = "https://tines.example.test"
+                [runner]
+                name = "test-runner"
+                credentials_file = "/run/credentials/service/runner-credentials"
+                executor_cwd = "~/daemon"
+                [storage]
+                state_dir = "/var/lib/tines-runner-rs/state"
+            "#,
+            defaults(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials_file,
+            PathBuf::from("/run/credentials/service/runner-credentials")
+        );
+        assert_eq!(
+            config.state_dir,
+            PathBuf::from("/var/lib/tines-runner-rs/state")
+        );
+        assert_eq!(
+            config.active_runs_file(),
+            active_runs_file(Path::new("/var/lib/tines-runner-rs/state"), "default")
+        );
+    }
+
+    #[test]
+    fn empty_state_directory_is_rejected() {
+        let error = Config::from_toml_str_with_defaults(
+            r#"
+                [server]
+                url = "https://tines.example.test"
+                [runner]
+                name = "test-runner"
+                executor_cwd = "~/daemon"
+                [storage]
+                state_dir = ""
+            "#,
+            defaults(),
+        )
+        .expect_err("empty state directory must not select a hidden fallback");
+        assert!(error.to_string().contains("state_dir must not be empty"));
+    }
+
+    #[test]
+    fn state_directory_defaults_and_relative_paths_are_resolved_independently() {
+        let default = Config::from_toml_str_with_defaults(
+            r#"
+                [server]
+                url = "https://tines.example.test"
+                [runner]
+                name = "test-runner"
+                credentials_file = "/run/credentials/service/runner-credentials"
+                executor_cwd = "~/daemon"
+            "#,
+            defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            default.state_dir,
+            PathBuf::from("/home/tester/.local/state/tines-runner-rs")
+        );
+        assert_eq!(
+            default.active_runs_file().parent(),
+            Some(
+                active_runs_file(&default.state_dir, "default")
+                    .parent()
+                    .unwrap()
+            )
+        );
+
+        let relative = Config::from_toml_str_with_defaults(
+            r#"
+                [server]
+                url = "https://tines.example.test"
+                [runner]
+                name = "test-runner"
+                executor_cwd = "~/daemon"
+                [storage]
+                state_dir = "runner-state"
+            "#,
+            defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            relative.state_dir,
+            PathBuf::from("/home/tester/runner-state")
+        );
+    }
+
+    #[test]
+    fn runner_state_namespaces_are_collision_safe_path_components() {
+        let state_dir = Path::new("/var/lib/tines-runner");
+        let codex = active_runs_file(state_dir, "codex");
+        let codex_uppercase = active_runs_file(state_dir, "Codex");
+        let checks = active_runs_file(state_dir, "checks");
+        let separator_id = active_runs_file(state_dir, "../codex");
+        let encoded_id = active_runs_file(state_dir, "..%2Fcodex");
+
+        assert!(codex.starts_with(state_dir));
+        assert!(checks.starts_with(state_dir));
+        assert!(separator_id.starts_with(state_dir));
+        assert_eq!(
+            codex.file_name().and_then(|name| name.to_str()),
+            Some("active-runs.json")
+        );
+        let namespace = codex.parent().and_then(Path::file_name).unwrap();
+        let namespace = namespace.to_str().unwrap();
+        assert!(namespace.starts_with("runner-"));
+        assert_eq!(namespace.len(), "runner-".len() + 64);
+        assert!(
+            namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        assert_ne!(codex, codex_uppercase);
+        let folded_namespace = |path: &Path| {
+            path.parent()
+                .and_then(Path::file_name)
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        };
+        assert_ne!(folded_namespace(&codex), folded_namespace(&codex_uppercase));
+        assert_ne!(separator_id, encoded_id);
     }
 
     #[test]
@@ -1080,6 +1297,7 @@ workspace_parent = "~/work/payments"
             PathBuf::from("/executor/home"),
             None,
             Some(PathBuf::from("/executor/xdg-data")),
+            None,
             None,
             None,
         );
@@ -1729,6 +1947,7 @@ executor_cwd = "/srv/tines-runner"
             home,
             Some(PathBuf::from("/custom/config")),
             Some(PathBuf::from("/custom/data")),
+            Some(PathBuf::from("/custom/state")),
             None,
             None,
         );
@@ -1743,6 +1962,10 @@ executor_cwd = "/srv/tines-runner"
             defaults.workspace_parent,
             PathBuf::from("/custom/data/tines-runner-rs/workspaces")
         );
+        assert_eq!(
+            defaults.state_dir,
+            PathBuf::from("/custom/state/tines-runner-rs")
+        );
 
         let config = Config::from_toml_str_with_defaults(
             r#"
@@ -1751,12 +1974,17 @@ executor_cwd = "/srv/tines-runner"
                 [runner]
                 name = "test-runner"
                 executor_cwd = "~/daemon"
+                credentials_file = "/run/credentials/service/runner-credentials"
             "#,
             defaults.clone(),
         )
         .unwrap();
         assert_eq!(config.legacy_workspace_roots(), [defaults.workspace_parent]);
-        assert_eq!(config.credentials_file, defaults.credentials_file);
+        assert_eq!(
+            config.credentials_file,
+            PathBuf::from("/run/credentials/service/runner-credentials")
+        );
+        assert_eq!(config.state_dir, defaults.state_dir);
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1767,6 +1995,7 @@ executor_cwd = "/srv/tines-runner"
             home.clone(),
             Some(PathBuf::from("relative/config")),
             Some(PathBuf::from("relative/data")),
+            None,
             None,
             None,
         );
