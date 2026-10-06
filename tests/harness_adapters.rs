@@ -8,6 +8,7 @@ use tines_runner_rs::execution_protocol::{
 };
 use tines_runner_rs::executor::harness::{HarnessExit, adapter_for};
 use tines_runner_rs::executor::workspace::MaterializedWorkspace;
+use tines_runner_rs::executor_events::ExecutorEventStream;
 use url::Url;
 use uuid::Uuid;
 
@@ -313,6 +314,131 @@ fn provider_errors_rate_limits_and_terminal_result_are_normalized() {
     zero_exit_result
         .validate()
         .expect("rate limit is terminal even when a harness exits zero");
+}
+
+#[test]
+fn codex_usage_and_pricing_evidence_survive_the_split_executor_finish_path() {
+    let mut request = request();
+    request.assignment.run.model = Some("gpt-5.1-codex".to_owned());
+    let adapter = adapter_for(&request.execution.harness).expect("select Codex adapter");
+
+    for (tail, exit, expected_status, expected_finish) in [
+        (
+            "",
+            HarnessExit {
+                exit_code: Some(0),
+                error: None,
+                interrupted: false,
+            },
+            "complete",
+            tines_runner_rs::protocol::FinishStatus::Completed,
+        ),
+        (
+            "{\"type\":\"turn.started\"}\n",
+            HarnessExit {
+                exit_code: Some(7),
+                error: Some("harness failed after usage".to_owned()),
+                interrupted: false,
+            },
+            "incomplete_attempt",
+            tines_runner_rs::protocol::FinishStatus::Failed,
+        ),
+    ] {
+        let codex = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"01a09e68-24d8-78d3-8bc7-67037a0cd7de\"}}\n{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":30,\"cached_input_tokens\":5,\"cache_write_input_tokens\":2,\"output_tokens\":7}}}}\n{tail}"
+        );
+        let mut codex_parser = adapter.event_parser_for_request(&request);
+        let mut events = Vec::new();
+        for chunk in codex.as_bytes().chunks(19) {
+            events.extend(codex_parser.push(std::str::from_utf8(chunk).expect("ASCII fixture")));
+        }
+        events.extend(codex_parser.finish());
+        let terminal = codex_parser.terminal_result(exit);
+        events.push(terminal.clone());
+
+        let terminal_value = serde_json::to_value(&terminal).expect("serialize terminal event");
+        assert_eq!(terminal_value["type"], "result");
+        assert_eq!(terminal_value["usage"]["input_tokens"], 23);
+        assert_eq!(terminal_value["pricing_evidence"]["provider"], "codex");
+        assert_eq!(terminal_value["pricing_evidence"]["version"], 1);
+        let payload = &terminal_value["pricing_evidence"]["payload"];
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["harness"], "codex");
+        assert_eq!(payload["model"], "gpt-5.1-codex");
+        assert_eq!(payload["identity_source"], "launch_argument");
+        assert_eq!(payload["usage_scope"], "thread_total");
+        assert_eq!(payload["session_mode"], "cold");
+        assert_eq!(payload["normalization"], "codex-jsonl-v1");
+        assert_eq!(payload["raw_usage"]["input_tokens"], 30);
+        assert_eq!(payload["raw_usage"]["cached_input_tokens"], 5);
+        assert_eq!(payload["raw_usage"]["cache_write_input_tokens"], 2);
+        assert_eq!(payload["raw_usage"]["output_tokens"], 7);
+        assert_eq!(payload["measurement_status"], expected_status);
+        assert_eq!(payload["terminal_snapshots"], 1);
+
+        let mut daemon_stream = ExecutorEventStream::new(&request);
+        for event in events {
+            let jsonl = render_event_jsonl(&event, &request).expect("render executor event");
+            daemon_stream
+                .push(jsonl.as_bytes())
+                .expect("daemon accepts executor event");
+        }
+        daemon_stream.finish().expect("daemon sees terminal result");
+        let finish = daemon_stream.finish_request(None, "", false);
+        assert_eq!(finish.status, expected_finish);
+        assert_eq!(finish.usage.as_ref().unwrap().input_tokens, Some(23));
+        assert_eq!(finish.usage.as_ref().unwrap().cache_read_tokens, Some(5));
+        let evidence = finish
+            .pricing_evidence
+            .expect("pricing evidence reaches Tines");
+        assert_eq!(evidence.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(evidence.raw_usage.as_ref().unwrap().input_tokens, Some(30));
+        assert_eq!(
+            serde_json::to_value(evidence).unwrap()["measurement_status"],
+            expected_status
+        );
+    }
+}
+
+#[test]
+fn codex_evidence_marks_missing_and_invalid_terminal_usage_without_fabricating_counts() {
+    let mut request = request();
+    request.assignment.run.model = Some("gpt-5.1-codex".to_owned());
+    let adapter = adapter_for(&request.execution.harness).expect("select Codex adapter");
+
+    for (input, expected_status, expected_snapshots) in [
+        ("", "missing", 0),
+        ("{\"type\":\"turn.completed\"}\n", "missing", 1),
+        (
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":3,\"cached_input_tokens\":4,\"cache_write_input_tokens\":0,\"output_tokens\":2}}\n",
+            "invalid",
+            1,
+        ),
+    ] {
+        let mut parser = adapter.event_parser_for_request(&request);
+        parser.push(input);
+        parser.finish();
+        let terminal = parser.terminal_result(HarnessExit {
+            exit_code: Some(0),
+            error: None,
+            interrupted: false,
+        });
+        let value = serde_json::to_value(terminal).expect("serialize terminal result");
+        let evidence = &value["pricing_evidence"]["payload"];
+        assert_eq!(evidence["measurement_status"], expected_status);
+        assert_eq!(evidence["terminal_snapshots"], expected_snapshots);
+        if expected_status == "invalid" {
+            assert_eq!(evidence["raw_usage"]["input_tokens"], 3);
+            assert_eq!(evidence["raw_usage"]["cached_input_tokens"], 4);
+            assert!(value["usage"].get("input_tokens").is_none());
+        } else if expected_snapshots == 1 {
+            assert_eq!(evidence["raw_usage"], serde_json::json!({}));
+            assert!(value.get("usage").is_none());
+        } else {
+            assert!(evidence.get("raw_usage").is_none());
+            assert!(value.get("usage").is_none());
+        }
+    }
 }
 
 #[test]

@@ -503,7 +503,13 @@ mod tests {
                         "normalization":"codex-jsonl-v1",
                         "model_rerouted":false,
                         "measurement_status":"complete",
-                        "terminal_snapshots":1
+                        "terminal_snapshots":1,
+                        "request_context":{
+                            "version":1,
+                            "normalization":"codex-rollout-delta-v1",
+                            "status":"unavailable",
+                            "reason":"not_applicable"
+                        }
                     }
                 }
             }),
@@ -522,9 +528,11 @@ mod tests {
         assert_eq!(finish.resume_at, Some(2_000_000_000_000));
         assert_eq!(finish.provider_session_id.as_deref(), Some("thread-2"));
         assert_eq!(finish.usage.unwrap().input_tokens, Some(20));
+        let pricing = finish.pricing_evidence.unwrap();
+        assert_eq!(pricing.model.as_deref(), Some("gpt-5.1-codex"));
         assert_eq!(
-            finish.pricing_evidence.unwrap().model.as_deref(),
-            Some("gpt-5.1-codex")
+            pricing.request_context.as_ref().unwrap()["reason"],
+            "not_applicable"
         );
     }
 

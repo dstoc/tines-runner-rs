@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 
 use crate::effort::EffortCapabilities;
 use crate::execution_protocol::{
-    ExecutionEvent, ExecutionEventKind, ExecutionRateLimit, ExecutionRequest, ExecutionUsage,
-    TerminalResult, TerminalStatus,
+    ExecutionEvent, ExecutionEventKind, ExecutionPricingEvidence, ExecutionRateLimit,
+    ExecutionRequest, ExecutionUsage, TerminalResult, TerminalStatus,
 };
 use crate::executor::codex::CodexLaunch;
 use crate::executor::codex_stream::{CodexEvent, CodexRateLimit, CodexStreamParser};
@@ -14,6 +14,9 @@ use crate::executor::harness::{
     HarnessAdapter, HarnessAdapterError, HarnessEventParser, HarnessExit, HarnessLaunch,
 };
 use crate::executor::workspace::MaterializedWorkspace;
+use crate::protocol::{CodexMeasurementStatus, CodexPricingEvidenceV1, CodexRawUsageV1};
+
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Initial executor-side adapter for the Codex CLI.
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,7 +49,7 @@ impl HarnessAdapter for CodexAdapter {
     }
 
     fn event_parser_for_request(&self, request: &ExecutionRequest) -> Box<dyn HarnessEventParser> {
-        Box::new(CodexEventParser::with_secrets(request.secret_patterns()))
+        Box::new(CodexEventParser::for_request(request))
     }
 }
 
@@ -55,6 +58,12 @@ struct CodexEventParser {
     parser: CodexStreamParser,
     thread_ids: BTreeSet<String>,
     usage: Option<ExecutionUsage>,
+    model: Option<String>,
+    raw_usage: Option<CodexRawUsageV1>,
+    measurement_status: CodexMeasurementStatus,
+    sticky_status: Option<CodexMeasurementStatus>,
+    terminal_snapshots: u64,
+    model_rerouted: bool,
     rate_limit: Option<CodexRateLimit>,
     stderr_pending: String,
     stderr_secrets: Vec<String>,
@@ -62,6 +71,12 @@ struct CodexEventParser {
 }
 
 impl CodexEventParser {
+    fn for_request(request: &ExecutionRequest) -> Self {
+        let mut parser = Self::with_secrets(request.secret_patterns());
+        parser.model = request.assignment.run.model.clone();
+        parser
+    }
+
     fn with_secrets(stderr_secrets: Vec<String>) -> Self {
         let stderr_redaction_window = stderr_secrets
             .iter()
@@ -122,6 +137,39 @@ impl CodexEventParser {
         }
         self.stderr_pending = characters[index..].iter().collect();
         output
+    }
+
+    fn pricing_evidence(&self) -> CodexPricingEvidenceV1 {
+        CodexPricingEvidenceV1 {
+            version: 1,
+            harness: "codex".to_owned(),
+            model: self.model.clone(),
+            identity_source: "launch_argument".to_owned(),
+            usage_scope: "thread_total".to_owned(),
+            session_mode: "cold".to_owned(),
+            normalization: "codex-jsonl-v1".to_owned(),
+            raw_usage: self.raw_usage.clone(),
+            model_rerouted: self.model_rerouted,
+            measurement_status: self.measurement_status,
+            terminal_snapshots: self.terminal_snapshots,
+            daemon_version: Some(crate::VERSION.to_owned()),
+            request_context: None,
+        }
+    }
+
+    fn record_usage(&mut self, raw: Option<&Value>) -> Option<ExecutionUsage> {
+        let empty_usage = serde_json::Map::new();
+        let object = raw.and_then(Value::as_object).unwrap_or(&empty_usage);
+        let (raw_usage, status) = codex_pricing_usage(object);
+        if status == CodexMeasurementStatus::Complete
+            && is_nonmonotonic(&raw_usage, self.raw_usage.as_ref())
+        {
+            self.sticky_status = Some(CodexMeasurementStatus::Nonmonotonic);
+        }
+        self.raw_usage = Some(raw_usage);
+        self.terminal_snapshots = self.terminal_snapshots.saturating_add(1);
+        self.measurement_status = self.sticky_status.unwrap_or(status);
+        raw.and_then(normalize_usage)
     }
 }
 
@@ -197,7 +245,12 @@ impl HarnessEventParser for CodexEventParser {
                     .then(|| self.thread_ids.iter().next().cloned())
                     .flatten(),
                 usage: self.usage.clone(),
-                pricing_evidence: None,
+                pricing_evidence: Some(ExecutionPricingEvidence {
+                    provider: "codex".to_owned(),
+                    version: 1,
+                    payload: serde_json::to_value(self.pricing_evidence())
+                        .expect("Codex pricing evidence is serializable"),
+                }),
                 interrupted,
                 rate_limit: rate_limit_event,
             },
@@ -219,12 +272,33 @@ impl CodexEventParser {
     fn translate(&mut self, event: CodexEvent) -> Vec<ExecutionEvent> {
         let mut events = Vec::new();
 
+        match event.event_type() {
+            Some("turn.started") => {
+                self.measurement_status = self
+                    .sticky_status
+                    .unwrap_or(CodexMeasurementStatus::IncompleteAttempt);
+            }
+            Some("item.completed")
+                if event
+                    .raw()
+                    .and_then(|raw| raw.get("item"))
+                    .is_some_and(is_model_reroute) =>
+            {
+                self.model_rerouted = true
+            }
+            _ => {}
+        }
+
         if let Some(limit) = event.rate_limit() {
             self.rate_limit = Some(limit.clone());
         }
 
         if let Some(id) = event.thread_id().filter(|id| !id.trim().is_empty()) {
             self.thread_ids.insert(id.to_owned());
+            if self.thread_ids.len() > 1 {
+                self.sticky_status = Some(CodexMeasurementStatus::MultipleThreads);
+                self.measurement_status = CodexMeasurementStatus::MultipleThreads;
+            }
             events.push(ExecutionEvent::new(ExecutionEventKind::Session {
                 provider: "codex".to_owned(),
                 id: id.to_owned(),
@@ -248,9 +322,12 @@ impl CodexEventParser {
             }));
         }
 
-        if let Some(usage) = event.raw_usage().and_then(normalize_usage) {
-            self.usage = Some(usage.clone());
-            events.push(ExecutionEvent::new(ExecutionEventKind::Usage { usage }));
+        if event.event_type() == Some("turn.completed") {
+            let raw = event.raw().and_then(|event| event.get("usage"));
+            if let Some(usage) = self.record_usage(raw) {
+                self.usage = Some(usage.clone());
+                events.push(ExecutionEvent::new(ExecutionEventKind::Usage { usage }));
+            }
         }
 
         events.extend(event.render_lines().into_iter().map(|message| {
@@ -261,6 +338,88 @@ impl CodexEventParser {
         }));
         events
     }
+}
+
+fn is_model_reroute(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("error")
+        && item
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with("model rerouted:"))
+}
+
+fn codex_pricing_usage(
+    usage: &serde_json::Map<String, Value>,
+) -> (CodexRawUsageV1, CodexMeasurementStatus) {
+    let metric = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= MAX_SAFE_JSON_INTEGER)
+    };
+    let raw = CodexRawUsageV1 {
+        input_tokens: metric("input_tokens"),
+        cached_input_tokens: metric("cached_input_tokens"),
+        cache_write_input_tokens: metric("cache_write_input_tokens"),
+        output_tokens: metric("output_tokens"),
+    };
+    let supplied = [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+    ]
+    .iter()
+    .filter(|key| usage.contains_key(**key))
+    .count();
+    let complete = raw.input_tokens.is_some()
+        && raw.cached_input_tokens.is_some()
+        && raw.cache_write_input_tokens.is_some()
+        && raw.output_tokens.is_some();
+    let dimensions_reconcile = raw
+        .cached_input_tokens
+        .zip(raw.cache_write_input_tokens)
+        .and_then(|(read, write)| read.checked_add(write))
+        .zip(raw.input_tokens)
+        .is_some_and(|(cached, total)| cached <= total);
+    let status = if complete && dimensions_reconcile {
+        CodexMeasurementStatus::Complete
+    } else if supplied < 4 {
+        CodexMeasurementStatus::Missing
+    } else {
+        CodexMeasurementStatus::Invalid
+    };
+    (raw, status)
+}
+
+fn is_nonmonotonic(current: &CodexRawUsageV1, previous: Option<&CodexRawUsageV1>) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let pairs = [
+        (current.input_tokens, previous.input_tokens),
+        (current.cached_input_tokens, previous.cached_input_tokens),
+        (
+            current.cache_write_input_tokens,
+            previous.cache_write_input_tokens,
+        ),
+        (current.output_tokens, previous.output_tokens),
+    ];
+    if pairs
+        .iter()
+        .any(|(current, previous)| current.zip(*previous).is_some_and(|(a, b)| a < b))
+    {
+        return true;
+    }
+    let normalized_input = |usage: &CodexRawUsageV1| {
+        usage
+            .input_tokens?
+            .checked_sub(usage.cached_input_tokens?)?
+            .checked_sub(usage.cache_write_input_tokens?)
+    };
+    normalized_input(current)
+        .zip(normalized_input(previous))
+        .is_some_and(|(current, previous)| current < previous)
 }
 
 struct ProviderError {
