@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/dstoc/tines-runner-rs/compare/v0.5.0...v0.6.0) (2026-10-06)
+
+
+### Features
+
+* **config:** add runner default inheritance ([#66](https://github.com/dstoc/tines-runner-rs/issues/66)) ([7921fdc](https://github.com/dstoc/tines-runner-rs/commit/7921fdc7ce23d3341a76e25a04d86dd074831bf6))
+* **recovery:** separate runner state from credentials ([#65](https://github.com/dstoc/tines-runner-rs/issues/65)) ([08ed574](https://github.com/dstoc/tines-runner-rs/commit/08ed5741eb5d8e975417ef9aa723591cbc937a21))
+
+
+### Bug Fixes
+
+* **runner:** include custom command in registration ([#63](https://github.com/dstoc/tines-runner-rs/issues/63)) ([0fe73da](https://github.com/dstoc/tines-runner-rs/commit/0fe73dad5f0ca1af27ea7f37875b6ac74bf9c33b))
+
 ## [0.5.0](https://github.com/dstoc/tines-runner-rs/compare/v0.4.1...v0.5.0) (2026-10-06)
 
 
