@@ -289,14 +289,16 @@ work.
 
 ### Credentials file
 
-The default credentials path is `credentials.toml` in the platform
-configuration directory: `${XDG_CONFIG_HOME:-~/.config}` on Linux and other
-Unix systems, `${XDG_CONFIG_HOME:-~/Library/Application Support}` on macOS,
-and `${XDG_CONFIG_HOME:-%APPDATA%}` on Windows. If Windows `APPDATA` is unset,
-the runner uses `%USERPROFILE%\AppData\Roaming`. `XDG_CONFIG_HOME` affects
-this credentials path only when it is absolute; it does not select the runner
-configuration file. Set `[storage].credentials_file` to use another path. The
-runner creates this file after registration. Its contents have this form:
+The default credentials file is in the platform configuration directory:
+
+- Linux and other Unix: `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs/credentials.toml`.
+- macOS: `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs/credentials.toml`.
+- Windows: `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs/credentials.toml` (or `%USERPROFILE%\AppData\Roaming\tines-runner-rs\credentials.toml` if `APPDATA` is unset).
+
+The runner uses `XDG_CONFIG_HOME` only when it is absolute. It affects the
+default credentials location; it does not select the runner configuration
+file. Set `[storage].credentials_file` to use another path. The runner creates
+this file after registration. Its contents have this form:
 
 ```toml
 runner_id = "rnr_example"
