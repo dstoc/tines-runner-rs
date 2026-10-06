@@ -92,22 +92,24 @@ installing or deploying a new binary and restarting the service.
 
 ## Configure the runner
 
-Create `config.toml` in the runner configuration directory. The default
-directories are:
+Save the runner configuration at a path you choose, such as
+`/etc/tines-runner-rs/config.toml`. The runner does not search for a
+configuration file. Pass its path with `--config` when you run the daemon or
+`--check`.
 
-| Platform | Configuration directory | Workspace directory |
-| --- | --- | --- |
-| Linux and other Unix systems | `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs` | `${XDG_DATA_HOME:-~/.local/share}/tines-runner-rs/workspaces` |
-| macOS | `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs` | `${XDG_DATA_HOME:-~/Library/Application Support}/tines-runner-rs/workspaces` |
-| Windows | `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs` | `${XDG_DATA_HOME:-%LOCALAPPDATA%}/tines-runner-rs/workspaces` |
+The default workspace directories are:
+
+| Platform | Workspace directory |
+| --- | --- |
+| Linux and other Unix systems | `${XDG_DATA_HOME:-~/.local/share}/tines-runner-rs/workspaces` |
+| macOS | `${XDG_DATA_HOME:-~/Library/Application Support}/tines-runner-rs/workspaces` |
+| Windows | `${XDG_DATA_HOME:-%LOCALAPPDATA%}/tines-runner-rs/workspaces` |
 
 The workspace directory defaults shown in the table apply in the executor
 environment. On Windows, if `APPDATA` or `LOCALAPPDATA` is not set, the
 executor uses the equivalent directories under `%USERPROFILE%\AppData\Roaming`
 and `%USERPROFILE%\AppData\Local`. XDG directory variables are used only when
-they contain absolute paths. Set `XDG_CONFIG_HOME` before starting the daemon
-if you need a different default configuration directory. Use `--config` to
-select another file.
+they contain absolute paths.
 
 The following example shows the supported settings and their defaults:
 
@@ -262,7 +264,7 @@ printf 'Tines API key: '
 IFS= read -r -s TINES_API_KEY
 printf '\n'
 export TINES_API_KEY
-tines-runner-rs --check
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --check
 unset TINES_API_KEY
 ```
 
@@ -272,7 +274,7 @@ later starts, `--check` validates the existing token and does not need
 `TINES_API_KEY`. If the check succeeds, start the daemon:
 
 ```sh
-tines-runner-rs
+tines-runner-rs --config /etc/tines-runner-rs/config.toml
 ```
 
 The daemon reads its configuration and credentials at startup. Restart it
@@ -287,8 +289,13 @@ work.
 
 ### Credentials file
 
-The default credentials path is `credentials.toml` in the configuration
-directory. Set `[storage].credentials_file` to use a different path. The
+The default credentials path is `credentials.toml` in the platform
+configuration directory: `${XDG_CONFIG_HOME:-~/.config}` on Linux and other
+Unix systems, `${XDG_CONFIG_HOME:-~/Library/Application Support}` on macOS,
+and `${XDG_CONFIG_HOME:-%APPDATA%}` on Windows. If Windows `APPDATA` is unset,
+the runner uses `%USERPROFILE%\AppData\Roaming`. `XDG_CONFIG_HOME` affects
+this credentials path only when it is absolute; it does not select the runner
+configuration file. Set `[storage].credentials_file` to use another path. The
 runner creates this file after registration. Its contents have this form:
 
 ```toml
@@ -326,7 +333,7 @@ Type=simple
 User=tines-runner
 Environment=HOME=/home/tines-runner
 Environment=PATH=/home/tines-runner/.cargo/bin:/home/tines-runner/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs
+ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs --config /etc/tines-runner-rs/config.toml
 Restart=on-abnormal
 RestartSec=5
 
@@ -365,6 +372,8 @@ before loading it. Replace `/Users/tines-runner` and the executable paths:
   <key>ProgramArguments</key>
   <array>
     <string>/Users/tines-runner/.cargo/bin/tines-runner-rs</string>
+    <string>--config</string>
+    <string>/Users/tines-runner/.config/tines-runner-rs/config.toml</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/tines-runner</string>
@@ -428,10 +437,12 @@ those log requests.
 
 ### Configuration or credential file errors
 
-- Confirm that the daemon's `HOME`, `XDG_CONFIG_HOME`, and
-  `XDG_DATA_HOME` match the account and paths used during setup.
-- Confirm that `config.toml` is in the configuration directory and contains
-  both required values: `[server].url` and `[runner].name`.
+- Confirm that the daemon's `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`
+  match the credential and workspace locations used during setup.
+- Confirm that the file passed to `--config` exists and contains both required
+  values: `[server].url` and `[runner].name`.
+- Daemon and `--check` commands require `--config <path>`. The runner does not
+  search a default configuration location.
 - Check TOML syntax and field names. Unknown fields are errors.
 - If the error names `credentials.toml`, verify `[storage].credentials_file`
   and confirm that the daemon account can read and write that path.
@@ -446,7 +457,8 @@ does not repair or replace a rejected saved token.
 If the saved token is invalid, follow the Tines runner lifecycle used by your
 organization before registering again. Back up or remove the invalid
 credentials file only when you intend to register a runner again. Then set a
-valid user key in `TINES_API_KEY` and run `tines-runner-rs --check` as the
+valid user key in `TINES_API_KEY` and run
+`tines-runner-rs --config /etc/tines-runner-rs/config.toml --check` as the
 service account. A missing credentials file triggers registration and writes
 the new runner credentials. Do not leave both old and new daemon instances
 using the same runner identity.

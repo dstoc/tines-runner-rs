@@ -128,6 +128,9 @@ impl TestDirectory {
         let search_path = std::env::join_paths(search_path).expect("build isolated PATH");
         let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
         command
+            .arg("--config")
+            .arg(self.path.join("config/tines-runner-rs/config.toml"));
+        command
             .env("HOME", &self.path)
             .env("USERPROFILE", &self.path)
             .env("XDG_CONFIG_HOME", config_home)

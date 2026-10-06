@@ -166,6 +166,8 @@ impl RunnerProcess {
         let runner_binary = Path::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
         let log = File::create(&paths.log).expect("create daemon stderr log");
         let child = Command::new(runner_binary)
+            .arg("--config")
+            .arg(directory.0.join("config/tines-runner-rs/config.toml"))
             .env("HOME", &directory.0)
             .env("USERPROFILE", &directory.0)
             .env("XDG_CONFIG_HOME", directory.0.join("config"))

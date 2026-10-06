@@ -166,16 +166,6 @@ impl Config {
         self.legacy_workspace_roots.clone()
     }
 
-    /// Return the platform/XDG default location for `config.toml`.
-    pub fn default_path() -> Result<PathBuf, ConfigError> {
-        Ok(default_paths()?.config_dir.join("config.toml"))
-    }
-
-    /// Load configuration from the platform/XDG default location.
-    pub fn load_default() -> Result<Self, ConfigError> {
-        Self::load(Self::default_path()?)
-    }
-
     /// Load configuration from a file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -526,7 +516,6 @@ struct RawOverride {
 #[derive(Clone, Debug)]
 struct DefaultPaths {
     home: PathBuf,
-    config_dir: PathBuf,
     workspace_parent: PathBuf,
     credentials_file: PathBuf,
 }
@@ -548,6 +537,10 @@ fn default_paths() -> Result<DefaultPaths, ConfigError> {
         env::var_os("APPDATA").map(PathBuf::from),
         env::var_os("LOCALAPPDATA").map(PathBuf::from),
     ))
+}
+
+pub(crate) fn default_credentials_path() -> Result<PathBuf, ConfigError> {
+    Ok(default_paths()?.credentials_file)
 }
 
 /// Resolve a workspace path in the current executor environment.
@@ -608,7 +601,6 @@ fn default_paths_for(
     DefaultPaths {
         home: home.clone(),
         credentials_file: config_dir.join("credentials.toml"),
-        config_dir,
         workspace_parent: data_dir.join("tines-runner-rs").join("workspaces"),
     }
 }
@@ -665,7 +657,6 @@ mod tests {
         let config_dir = home.join(".config/tines-runner-rs");
         DefaultPaths {
             home: home.clone(),
-            config_dir: config_dir.clone(),
             workspace_parent: home.join(".local/share/tines-runner-rs/workspaces"),
             credentials_file: config_dir.join("credentials.toml"),
         }
@@ -1404,12 +1395,10 @@ executor_cwd = "/srv/tines-runner"
         );
 
         assert_eq!(
-            defaults.config_dir,
-            PathBuf::from("/custom/config/tines-runner-rs")
-        );
-        assert_eq!(
-            defaults.credentials_file,
+            defaults.credentials_file.parent().unwrap(),
             PathBuf::from("/custom/config/tines-runner-rs/credentials.toml")
+                .parent()
+                .unwrap()
         );
         assert_eq!(
             defaults.workspace_parent,
@@ -1443,7 +1432,10 @@ executor_cwd = "/srv/tines-runner"
             None,
         );
 
-        assert_eq!(defaults.config_dir, home.join(".config/tines-runner-rs"));
+        assert_eq!(
+            defaults.credentials_file.parent().unwrap(),
+            home.join(".config/tines-runner-rs")
+        );
         assert_eq!(
             defaults.workspace_parent,
             home.join(".local/share/tines-runner-rs/workspaces")

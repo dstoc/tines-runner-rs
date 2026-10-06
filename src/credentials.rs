@@ -400,13 +400,8 @@ impl Error for CredentialError {
 }
 
 fn default_credentials_path() -> Result<PathBuf, CredentialError> {
-    let config_path = crate::config::Config::default_path()
-        .map_err(|_| CredentialError::ConfigurationDirectoryUnavailable)?;
-    let config_dir = config_path
-        .parent()
-        .ok_or(CredentialError::ConfigurationDirectoryUnavailable)?;
-
-    Ok(config_dir.join("credentials.toml"))
+    crate::config::default_credentials_path()
+        .map_err(|_| CredentialError::ConfigurationDirectoryUnavailable)
 }
 
 #[cfg(unix)]
@@ -504,13 +499,11 @@ mod tests {
 
     #[test]
     fn default_path_is_under_the_runner_configuration_directory() {
-        let config_path = crate::config::Config::default_path().unwrap();
-        let config_dir = config_path.parent().unwrap();
+        let credentials_path = CredentialStore::default_path().unwrap();
+        let config_dir = credentials_path.parent().unwrap();
 
-        assert_eq!(
-            CredentialStore::default_path().unwrap(),
-            config_dir.join("credentials.toml")
-        );
+        assert_eq!(credentials_path.file_name().unwrap(), "credentials.toml");
+        assert_eq!(config_dir.file_name().unwrap(), "tines-runner-rs");
     }
 
     #[cfg(unix)]
