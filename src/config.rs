@@ -457,7 +457,7 @@ impl Config {
             run_key_delivery: runner.run_key_delivery.unwrap_or_default(),
             executor_cwd,
             max_concurrent,
-            allow_remote_concurrency: runner.allow_remote_concurrency,
+            allow_remote_concurrency: runner.allow_remote_concurrency.unwrap_or(false),
             poll_interval: Duration::from_secs(poll_interval_seconds),
             credentials_file,
             active_runs_file,
@@ -480,7 +480,14 @@ fn select_runner(
     requested_id: Option<&str>,
     defaults: &DefaultPaths,
 ) -> Result<(Option<String>, RawRunner, Vec<RawOverride>, PathBuf), ConfigError> {
-    if !runners.is_empty() {
+    if requested_id == Some("default") && runners.contains_key("default") {
+        return Err(ConfigError::Invalid(
+            "runner ID \"default\" is reserved for [runners.default], which is a template and cannot be selected".to_owned(),
+        ));
+    }
+
+    let runner_template = runners.remove("default");
+    if !runners.is_empty() || runner_template.is_some() {
         if legacy_runner.is_some() {
             return Err(ConfigError::Invalid(
                 "use either [runner] or [runners.<id>] definitions, not both".to_owned(),
@@ -495,6 +502,33 @@ fn select_runner(
         if legacy_credentials_file.is_some() {
             return Err(ConfigError::Invalid(
                 "set credentials_file inside each [runners.<id>] definition".to_owned(),
+            ));
+        }
+
+        if let Some(template) = &runner_template {
+            validate_runner_template(template)?;
+            for (id, runner) in &mut runners {
+                if runner
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "missing required [runners.{id}].name; name must be set on each named runner and cannot be inherited from [runners.default]"
+                    )));
+                }
+                if runner.runner_type.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "missing required [runners.{id}].runner_type; runner_type must be set on each named runner and cannot be inherited from [runners.default]"
+                    )));
+                }
+                runner.inherit_settings_from(template);
+            }
+        }
+
+        if runners.is_empty() {
+            return Err(ConfigError::Invalid(
+                "missing named [runners.<id>] definition; [runners.default] is a template and cannot be selected".to_owned(),
             ));
         }
 
@@ -579,6 +613,23 @@ fn select_runner(
         .or(legacy_credentials_file)
         .unwrap_or_else(|| defaults.credentials_file.clone());
     Ok((None, runner, legacy_overrides, credentials_file))
+}
+
+fn validate_runner_template(template: &RawRunner) -> Result<(), ConfigError> {
+    if template.name.is_some()
+        || template.runner_type.is_some()
+        || template.credentials_file.is_some()
+    {
+        return Err(ConfigError::Invalid(
+            "[runners.default] is a template and cannot define name, runner_type, or credentials_file; set these fields on each named runner".to_owned(),
+        ));
+    }
+    if !template.overrides.is_empty() {
+        return Err(ConfigError::Invalid(
+            "[runners.default] cannot define assignment overrides; keep [[runners.<id>.override]] entries on each named runner".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_path_for_comparison(path: &Path) -> PathBuf {
@@ -709,11 +760,51 @@ struct RawRunner {
     run_key_delivery: Option<RunKeyDelivery>,
     executor_cwd: Option<PathBuf>,
     max_concurrent: Option<usize>,
-    #[serde(default)]
-    allow_remote_concurrency: bool,
+    allow_remote_concurrency: Option<bool>,
     poll_interval_seconds: Option<u64>,
     #[serde(default, rename = "override")]
     overrides: Vec<RawOverride>,
+}
+
+impl RawRunner {
+    /// Copy settings from the shared template when this runner does not set
+    /// them. Lists are replaced as values and assignment overrides stay local.
+    fn inherit_settings_from(&mut self, template: &Self) {
+        if self.workspace_parent.is_none() {
+            self.workspace_parent.clone_from(&template.workspace_parent);
+        }
+        if self.executor.is_none() {
+            self.executor.clone_from(&template.executor);
+        }
+        if self.capabilities_executor.is_none() {
+            self.capabilities_executor
+                .clone_from(&template.capabilities_executor);
+        }
+        if self.custom_command.is_none() {
+            self.custom_command.clone_from(&template.custom_command);
+        }
+        if self.repository_checkout.is_none() {
+            self.repository_checkout
+                .clone_from(&template.repository_checkout);
+        }
+        if self.run_key_delivery.is_none() {
+            self.run_key_delivery.clone_from(&template.run_key_delivery);
+        }
+        if self.executor_cwd.is_none() {
+            self.executor_cwd.clone_from(&template.executor_cwd);
+        }
+        if self.max_concurrent.is_none() {
+            self.max_concurrent.clone_from(&template.max_concurrent);
+        }
+        if self.allow_remote_concurrency.is_none() {
+            self.allow_remote_concurrency
+                .clone_from(&template.allow_remote_concurrency);
+        }
+        if self.poll_interval_seconds.is_none() {
+            self.poll_interval_seconds
+                .clone_from(&template.poll_interval_seconds);
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1048,6 +1139,267 @@ state_dir = "/var/lib/tines/state"
         assert_ne!(
             codex.active_runs_file().parent(),
             antigravity.active_runs_file().parent()
+        );
+    }
+
+    #[test]
+    fn named_runners_inherit_shared_settings_and_replace_lists() {
+        let contents = r#"
+[server]
+url = "https://tines.example.test"
+
+[runners.default]
+executor = ["shared-transport", "--mounted"]
+capabilities_executor = ["shared-probe", "--mounted"]
+executor_cwd = "~/daemon"
+workspace_parent = "~/workspaces"
+max_concurrent = 5
+repository_checkout = "metadata_only"
+run_key_delivery = "environment"
+poll_interval_seconds = 9
+allow_remote_concurrency = true
+
+[runners.codex]
+name = "shared-codex"
+credentials_file = "/var/lib/tines/codex.toml"
+runner_type = "codex"
+capabilities_executor = ["codex-probe"]
+max_concurrent = 2
+
+[runners.checks]
+name = "shared-checks"
+credentials_file = "/var/lib/tines/checks.toml"
+runner_type = "custom"
+custom_command = ["run-checks", "{prompt_file}"]
+run_key_delivery = "request"
+
+[runners.customized]
+name = "customized"
+credentials_file = "/var/lib/tines/customized.toml"
+runner_type = "codex"
+executor = ["custom-transport", "--runner-only"]
+
+[[runners.checks.override]]
+project = "Payments"
+repository_checkout = "enabled"
+"#;
+
+        let codex =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("codex"))
+                .unwrap();
+        assert_eq!(codex.executor, ["shared-transport", "--mounted"]);
+        assert_eq!(
+            codex.capabilities_executor,
+            Some(vec!["codex-probe".to_owned()])
+        );
+        assert_eq!(codex.executor_cwd, PathBuf::from("/home/tester/daemon"));
+        assert_eq!(codex.workspace_parent, Some(PathBuf::from("~/workspaces")));
+        assert_eq!(codex.max_concurrent, 2);
+        assert_eq!(
+            codex.repository_checkout,
+            RepositoryCheckoutPolicy::MetadataOnly
+        );
+        assert_eq!(codex.run_key_delivery, RunKeyDelivery::Environment);
+        assert_eq!(codex.poll_interval, Duration::from_secs(9));
+        assert!(codex.allow_remote_concurrency);
+
+        let checks =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("checks"))
+                .unwrap();
+        assert_eq!(checks.executor, codex.executor);
+        assert_eq!(
+            checks.capabilities_executor,
+            Some(vec!["shared-probe".to_owned(), "--mounted".to_owned()])
+        );
+        assert_eq!(checks.executor_cwd, codex.executor_cwd);
+        assert_eq!(checks.workspace_parent, codex.workspace_parent);
+        assert_eq!(checks.max_concurrent, 5);
+        assert_eq!(
+            checks.repository_checkout,
+            RepositoryCheckoutPolicy::MetadataOnly
+        );
+        assert_eq!(checks.run_key_delivery, RunKeyDelivery::Request);
+        assert_eq!(checks.poll_interval, Duration::from_secs(9));
+        assert!(checks.allow_remote_concurrency);
+        assert_eq!(
+            checks.custom_command,
+            Some(vec!["run-checks".to_owned(), "{prompt_file}".to_owned()])
+        );
+        assert_eq!(
+            checks
+                .resolve(context("Payments", "Build", "Ready"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::Enabled
+        );
+        assert_eq!(
+            checks
+                .resolve(context("Other", "Build", "Ready"))
+                .repository_checkout,
+            RepositoryCheckoutPolicy::MetadataOnly
+        );
+
+        let customized = Config::from_toml_str_with_defaults_and_runner(
+            contents,
+            defaults(),
+            Some("customized"),
+        )
+        .unwrap();
+        assert_eq!(customized.executor, ["custom-transport", "--runner-only"]);
+        assert_ne!(customized.executor, codex.executor);
+    }
+
+    #[test]
+    fn runner_template_does_not_supply_identity_fields() {
+        let template_identity = r#"
+[server]
+url = "https://tines.example.test"
+[runners.default]
+name = "must-not-register"
+executor_cwd = "/daemon"
+[runners.worker]
+name = "worker"
+credentials_file = "/var/lib/tines/worker.toml"
+runner_type = "codex"
+"#;
+        let error = Config::from_toml_str_with_defaults_and_runner(
+            template_identity,
+            defaults(),
+            Some("worker"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("[runners.default] is a template"), "{error}");
+        assert!(error.contains("cannot define name, runner_type, or credentials_file"));
+
+        for (runner_fields, required_field) in [
+            (
+                "credentials_file = \"/var/lib/tines/worker.toml\"\nrunner_type = \"codex\"\n",
+                ".name",
+            ),
+            (
+                "name = \"worker\"\ncredentials_file = \"/var/lib/tines/worker.toml\"\n",
+                ".runner_type",
+            ),
+            (
+                "name = \"worker\"\nrunner_type = \"codex\"\n",
+                ".credentials_file",
+            ),
+        ] {
+            let contents = format!(
+                "[server]\nurl = \"https://tines.example.test\"\n[runners.default]\nexecutor_cwd = \"/daemon\"\n[runners.worker]\n{runner_fields}"
+            );
+            let error = Config::from_toml_str_with_defaults_and_runner(
+                &contents,
+                defaults(),
+                Some("worker"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("[runners.worker]{required_field}")),
+                "expected required field {required_field}, got: {error}"
+            );
+        }
+
+        let missing_effective = r#"
+[server]
+url = "https://tines.example.test"
+[runners.default]
+max_concurrent = 3
+[runners.worker]
+name = "worker"
+credentials_file = "/var/lib/tines/worker.toml"
+runner_type = "codex"
+"#;
+        let error = Config::from_toml_str_with_defaults_and_runner(
+            missing_effective,
+            defaults(),
+            Some("worker"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("missing required [runners.worker].executor_cwd"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn custom_harness_command_inherits_and_named_command_replaces_it() {
+        let contents = r#"
+[server]
+url = "https://tines.example.test"
+[runners.default]
+executor_cwd = "/daemon"
+custom_command = ["shared-checks", "--prompt", "{prompt_file}"]
+[runners.inherited]
+name = "inherited"
+credentials_file = "/var/lib/tines/inherited.toml"
+runner_type = "custom"
+[runners.replaced]
+name = "replaced"
+credentials_file = "/var/lib/tines/replaced.toml"
+runner_type = "custom"
+custom_command = ["runner-checks", "{workspace}"]
+"#;
+
+        let inherited =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("inherited"))
+                .unwrap();
+        assert_eq!(
+            inherited.custom_command,
+            Some(vec![
+                "shared-checks".to_owned(),
+                "--prompt".to_owned(),
+                "{prompt_file}".to_owned()
+            ])
+        );
+
+        let replaced =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("replaced"))
+                .unwrap();
+        assert_eq!(
+            replaced.custom_command,
+            Some(vec!["runner-checks".to_owned(), "{workspace}".to_owned()])
+        );
+    }
+
+    #[test]
+    fn runner_template_cannot_be_selected_or_supply_assignment_overrides() {
+        let template_only = r#"
+[server]
+url = "https://tines.example.test"
+[runners.default]
+executor_cwd = "/daemon"
+[runners.worker]
+name = "worker"
+credentials_file = "/var/lib/tines/worker.toml"
+runner_type = "codex"
+"#;
+        let error = Config::from_toml_str_with_defaults_and_runner(
+            template_only,
+            defaults(),
+            Some("default"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("[runners.default]"), "{error}");
+        assert!(error.contains("cannot be selected"), "{error}");
+
+        let template_override = template_only.replace(
+            "executor_cwd = \"/daemon\"",
+            "executor_cwd = \"/daemon\"\n\n[[runners.default.override]]\nproject = \"Payments\"\nexecutor = [\"alternate\"]",
+        );
+        let error = Config::from_toml_str_with_defaults_and_runner(
+            &template_override,
+            defaults(),
+            Some("worker"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cannot define assignment overrides"),
+            "{error}"
         );
     }
 

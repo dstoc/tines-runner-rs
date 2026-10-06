@@ -162,20 +162,29 @@ tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --runner co
 ### Run multiple runners
 
 Define each runner once in the same file. Each definition has a stable local
-ID, a Tines registration name, and its own credentials and executor settings.
+ID, a Tines registration name, and its own credentials. Use
+`[runners.default]` for settings that named runners share. This table is a
+template. It does not register a Tines runner and cannot be selected with
+`--runner default`.
+
 For example, save this as `/etc/tines-runner-rs/config.toml`:
 
 ```toml
 [server]
 url = "https://tines.example.com"
 
+[runners.default]
+executor = ["tines-runner-rs"]
+executor_cwd = "/var/lib/tines-runner-rs"
+workspace_parent = "/var/lib/tines-runner-rs/workspaces"
+run_key_delivery = "environment"
+repository_checkout = "enabled"
+max_concurrent = 1
+
 [runners.codex]
 name = "build-codex"
 credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 runner_type = "codex"
-executor = ["tines-runner-rs"]
-workspace_parent = "/var/lib/tines-runner-rs/build/workspaces"
-executor_cwd = "/var/lib/tines-runner-rs/build"
 max_concurrent = 2
 
 [runners.antigravity]
@@ -183,10 +192,6 @@ name = "review-antigravity"
 credentials_file = "/var/lib/tines-runner-rs/antigravity/credentials.toml"
 runner_type = "custom"
 custom_command = ["antigravity", "{prompt_file}"]
-workspace_parent = "/var/lib/tines-runner-rs/antigravity/workspaces"
-executor = ["tines-runner-rs"]
-executor_cwd = "/var/lib/tines-runner-rs/antigravity"
-max_concurrent = 1
 
 [storage]
 state_dir = "/var/lib/tines-runner-rs/state"
@@ -194,6 +199,18 @@ state_dir = "/var/lib/tines-runner-rs/state"
 
 The IDs `codex` and `antigravity` are local selectors. The example uses the
 custom harness for `antigravity` until a dedicated harness type is available.
+Both runners inherit the executor transport, working directory, workspace
+parent, run-key delivery, and repository policy. The Codex runner replaces
+the inherited concurrency limit with `2`. The custom runner keeps the
+inherited limit and sets its harness command.
+
+Each named runner must set its own `name`, `runner_type`, and
+`credentials_file`. Omitted transport and execution settings inherit from
+`[runners.default]`. An explicitly set list such as `executor` or
+`capabilities_executor` replaces the complete inherited list. Assignment
+overrides remain local to each named runner. Keep shared recovery storage in
+the top-level `[storage].state_dir` table.
+
 Register, check, and start each runner with the same config and its ID:
 
 ```sh
@@ -224,19 +241,26 @@ manager's normal stop command. Restart it after changing `config.toml` or
 
 The main settings are:
 
+When `[runners.default]` is present, named runners inherit omitted runner
+settings from it. A named runner's explicit value replaces the inherited
+value, including for argv arrays. `name`, `runner_type`, and
+`credentials_file` remain required on each named runner. Assignment override
+lists remain local to each named runner.
+
 | Setting | Purpose |
 | --- | --- |
 | `[server].url` | Tines instance URL. Required; must use HTTP or HTTPS. |
 | `[runners.<id>].name` | Tines registration name. Required for each runner. |
 | `[runners.<id>].credentials_file` | Required credentials path. Every runner in the file must use a distinct path. |
+| `[runners.default]` | Optional, non-selectable template for shared runner settings. Named runners must still set their own `name`, `runner_type`, and `credentials_file`. |
 | `[storage].state_dir` | Shared writable root for active-run crash-recovery state. Defaults to the platform state directory. The daemon separates runners into local-ID subdirectories. |
-| `[runners.<id>].runner_type` | Harness type: `codex` or `custom`. Defaults to `codex`. |
+| `[runners.<id>].runner_type` | Harness type: `codex` or `custom`. Required with `[runners.default]`; otherwise defaults to `codex`. |
 | `[runners.<id>].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
 | `[runners.<id>].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |
 | `[runners.<id>].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
 | `[runners.<id>].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
 | `[runners.<id>].capabilities_executor` | Optional argument array used only for capability discovery. The runner appends `capabilities`; when unset, it uses the resolved `executor` command. |
-| `[runners.<id>].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
+| `[runners.<id>].executor_cwd` | Required after inheritance. Set it on this runner or `[runners.default]`. A relative path resolves under the daemon account's home directory. |
 | `[runners.<id>].run_key_delivery` | How the daemon sends each assignment's run key to the executor transport: `request` (default) or `environment`. |
 | `[runners.<id>].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
 | `[runners.<id>].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |
