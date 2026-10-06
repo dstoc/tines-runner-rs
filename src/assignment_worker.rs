@@ -3,6 +3,7 @@
 use crate::assignment::resolve_assignment;
 use crate::cancellation::CancellationToken;
 use crate::config::Config;
+use crate::config::RunnerType;
 use crate::effort::assignment_effort_rejection;
 use crate::execution::{self, ExecutionOutcome};
 use crate::executor_capabilities::ExecutorCapabilities;
@@ -136,17 +137,27 @@ fn run_assignment_inner(
             context,
         );
     }
-    let harness = match resolved.resolution().config.runner_type {
-        crate::config::RunnerType::Codex => "codex",
-        crate::config::RunnerType::Custom => "custom",
+    let runner_type = resolved.resolution().config.runner_type;
+    let harness = match runner_type {
+        RunnerType::Codex => "codex",
+        RunnerType::Custom => "custom",
     };
     if !capabilities.supports(harness) {
         return Ok(AssignmentTaskOutcome::Declined(format!(
             "configured executor does not verify support for the {harness} harness"
         )));
     }
-    let effort_capabilities = capabilities.effort_report(harness, crate::VERSION);
-    if let Some(reason) = assignment_effort_rejection(&assignment, &effort_capabilities) {
+    let effort_rejection = match runner_type {
+        RunnerType::Codex => {
+            let effort_capabilities = capabilities.effort_report("codex", crate::VERSION);
+            assignment_effort_rejection(&assignment, &effort_capabilities)
+        }
+        // Custom commands do not consume Codex effort metadata. Keep this
+        // branch harness-specific so future harnesses can define their own
+        // effort semantics without using Codex validation.
+        RunnerType::Custom => None,
+    };
+    if let Some(reason) = effort_rejection {
         if context.shutdown.is_requested() {
             return report_interrupted_before_execution(
                 connection,
