@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
+    /// Select one named runner definition from the config file.
+    #[arg(long, value_name = "ID", global = true)]
+    runner: Option<String>,
+
     /// Validate configuration and stored credentials, then exit without polling.
     #[arg(long)]
     check: bool,
@@ -66,11 +70,20 @@ fn main() -> ExitCode {
             .error(clap::error::ErrorKind::MissingRequiredArgument, message)
             .exit();
     }
+    if cli.runner.is_some() && cli.config.is_none() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--config <PATH> is required when selecting --runner <ID>",
+            )
+            .exit();
+    }
 
     match cli.command {
         Some(CliCommand::Register { output }) => {
             return match register_runner(
                 cli.config.as_deref().expect("register requires --config"),
+                cli.runner.as_deref(),
                 &output,
             ) {
                 Ok(credentials) => {
@@ -107,6 +120,7 @@ fn main() -> ExitCode {
         cli.config
             .as_deref()
             .expect("runner mode requires --config"),
+        cli.runner.as_deref(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -118,9 +132,10 @@ fn main() -> ExitCode {
 
 fn register_runner(
     config_path: &Path,
+    runner_id: Option<&str>,
     output_path: &Path,
 ) -> Result<tines_runner_rs::credentials::RunnerCredentials, Box<dyn Error>> {
-    let config = tines_runner_rs::config::Config::load(config_path)?;
+    let config = tines_runner_rs::config::Config::load_for_runner(config_path, runner_id)?;
     Ok(tines_runner_rs::runner::RunnerConnection::register(
         &config,
         output_path,
@@ -149,8 +164,12 @@ fn execute_stdin() -> ExitCode {
     }
 }
 
-fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
-    let config = tines_runner_rs::config::Config::load(config_path)?;
+fn start_runner(
+    check: bool,
+    config_path: &Path,
+    runner_id: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let config = tines_runner_rs::config::Config::load_for_runner(config_path, runner_id)?;
     let shutdown = if check {
         None
     } else {
@@ -163,6 +182,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
 
     tracing::info!(
         version = tines_runner_rs::VERSION,
+        local_id = %config.local_id,
         runner_id = connection.credentials().runner_id(),
         registered = connection.registered(),
         "runner credentials ready"
@@ -175,9 +195,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
     let shutdown = shutdown.ok_or_else(|| {
         std::io::Error::other("daemon shutdown handler was not installed before polling")
     })?;
-    let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(
-        config.credentials_file.with_file_name("active-runs.json"),
-    )?;
+    let active_runs = tines_runner_rs::recovery::ActiveRunStore::open(config.active_runs_file())?;
     let recovered_runs = tines_runner_rs::recovery::recover_active_runs(
         &active_runs,
         &config.workspace_retention,

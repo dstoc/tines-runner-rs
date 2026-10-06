@@ -64,7 +64,8 @@ Start with this configuration and replace the URL and runner name:
 [server]
 url = "https://tines.example.com"
 
-[runner]
+[runners.codex]
+credentials_file = "~/.config/tines-runner-rs/codex-credentials.toml"
 name = "workstation-codex"
 runner_type = "codex"
 executor = ["tines-runner-rs"]
@@ -76,9 +77,12 @@ poll_interval_seconds = 15
 keep_workspaces = "never"
 ```
 
-`[server].url` and `[runner].name` are required. The runner type defaults to
-`codex`. Set it to `custom` to run a configured command. The daemon expands
-`~` in its paths, including `executor_cwd` and `credentials_file`. It sends the configured
+`[server].url`, `[runners.codex].name`, `[runners.codex].credentials_file`,
+and `[runners.codex].executor_cwd` are required. The table name `codex` is the
+local runner ID. Pass it with `--runner codex` when the file defines more than
+one runner. The runner type defaults to `codex`. Set it to `custom` to run a
+configured command. The daemon expands `~` in its paths, including
+`executor_cwd` and `credentials_file`. It sends the configured
 `workspace_parent` to the executor, which resolves it in its own environment.
 If it is omitted, the executor uses its platform default. Unknown settings
 cause startup to fail.
@@ -106,77 +110,90 @@ instead:
 ```sh
 tines-runner-rs register \
   --config "$HOME/.config/tines-runner-rs/config.toml" \
+  --runner codex \
   --output "$HOME/runner-credentials.toml"
 ```
 
-The `register` command reads `TINES_API_KEY`, registers the configured runner,
+The `register` command reads `TINES_API_KEY`, registers the selected runner,
 and writes only the returned runner ID and token to `--output`. It does not
-read or write `[storage].credentials_file`. On Unix, it writes the output
-atomically with mode `0600`. Install or encrypt this file in the service's
-secret-delivery mechanism, then set `[storage].credentials_file` to the path
-where the service can read it. See the [systemd credential workflow](docs/operation.md#provision-credentials-for-systemd)
+read or write `[runners.codex].credentials_file`. On Unix, it writes the
+output atomically with mode `0600`. Install or encrypt this file in the
+service's secret-delivery mechanism, then set
+`[runners.codex].credentials_file` to the path where the service can read it.
+See the [systemd credential workflow](docs/operation.md#provision-credentials-for-systemd)
 for an example.
 
-The default credentials file remains in the platform configuration directory:
+For a single legacy `[runner]` config, the default credentials file remains
+in the platform configuration directory:
 
 - Linux and other Unix: `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs/credentials.toml`.
 - macOS: `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs/credentials.toml`.
 - Windows: `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs/credentials.toml` (or `%USERPROFILE%\AppData\Roaming` if `APPDATA` is unset).
 
-The runner uses `XDG_CONFIG_HOME` only when it is absolute. It affects the
-default credentials location; it does not select the runner configuration
-file. Set `[storage].credentials_file` to choose a different credentials path.
-On Unix, the runner creates or repairs the file with mode `0600`. Keep it
-private and use the same file when restarting the daemon. Later `--check` runs
-use the saved runner token and do not need `TINES_API_KEY`:
+Named runner definitions require an explicit, distinct
+`[runners.<id>].credentials_file`. The runner uses `XDG_CONFIG_HOME` only when
+it is absolute. It affects the legacy default credentials location; it does
+not select the runner configuration file. On Unix, the runner creates or
+repairs the credential file with mode `0600`. Keep it private and use the same
+file when restarting that runner. Later `--check` runs use the saved runner
+token and do not need `TINES_API_KEY`:
 
 ```sh
-tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --check
+tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --runner codex --check
 ```
 
 ### Run multiple runners
 
-Give each runner its own config file, registration name, credentials file,
-and workspace directory. For example, save this as
-`/etc/tines-runner-rs/build.toml`:
+Define each runner once in the same file. Each definition has a stable local
+ID, a Tines registration name, and its own credentials and executor settings.
+For example, save this as `/etc/tines-runner-rs/config.toml`:
 
 ```toml
 [server]
 url = "https://tines.example.com"
 
-[runner]
+[runners.codex]
 name = "build-codex"
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
+runner_type = "codex"
+executor = ["tines-runner-rs"]
 workspace_parent = "/var/lib/tines-runner-rs/build/workspaces"
 executor_cwd = "/var/lib/tines-runner-rs/build"
+max_concurrent = 2
 
-[storage]
-credentials_file = "/var/lib/tines-runner-rs/build/credentials.toml"
+[runners.antigravity]
+name = "review-antigravity"
+credentials_file = "/var/lib/tines-runner-rs/antigravity/credentials.toml"
+runner_type = "custom"
+custom_command = ["antigravity", "{prompt_file}"]
+workspace_parent = "/var/lib/tines-runner-rs/antigravity/workspaces"
+executor = ["tines-runner-rs"]
+executor_cwd = "/var/lib/tines-runner-rs/antigravity"
+max_concurrent = 1
 ```
 
-Save a second config as `/etc/tines-runner-rs/review.toml` with its own
-`[runner].name`, `[runner].workspace_parent`, required
-`[runner].executor_cwd`, and `[storage].credentials_file`, such as
-`review-codex`, `/var/lib/tines-runner-rs/review/workspaces`,
-`/var/lib/tines-runner-rs/review`, and
-`/var/lib/tines-runner-rs/review/credentials.toml`. Register and start each
-runner with its selected file:
+The IDs `codex` and `antigravity` are local selectors. The example uses the
+custom harness for `antigravity` until a dedicated harness type is available.
+Register, check, and start each runner with the same config and its ID:
 
 ```sh
-tines-runner-rs --config /etc/tines-runner-rs/build.toml --check
-tines-runner-rs --config /etc/tines-runner-rs/review.toml --check
-tines-runner-rs --config /etc/tines-runner-rs/build.toml
-tines-runner-rs --config /etc/tines-runner-rs/review.toml
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex --check
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity --check
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity
 ```
 
-Each config keeps the runner's registration and local state separate. Run
-`--check` for both files with `TINES_API_KEY` set on first registration.
+Each command starts one daemon for the selected definition. The credentials
+paths must be distinct, so the definitions register as separate Tines runners
+and keep persisted state separate. Each process also keeps its own capability
+cache. Set `TINES_API_KEY` for the first `--check` of each runner.
 
 ### 3. Start the daemon
 
 After `--check` succeeds, start the runner:
 
 ```sh
-tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml"
+tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --runner codex
 ```
 
 The process polls until stopped. Use Ctrl-C in a terminal or the service
@@ -190,20 +207,21 @@ The main settings are:
 | Setting | Purpose |
 | --- | --- |
 | `[server].url` | Tines instance URL. Required; must use HTTP or HTTPS. |
-| `[runner].name` | Name used to register this runner. Required. |
-| `[runner].runner_type` | Harness type: `codex` or `custom`. Defaults to `codex`. |
-| `[runner].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
-| `[runner].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |
-| `[runner].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
-| `[runner].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
-| `[runner].capabilities_executor` | Optional argument array used only for capability discovery. The runner appends `capabilities`; when unset, it uses the resolved `executor` command. |
-| `[runner].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
-| `[runner].run_key_delivery` | How the daemon sends each assignment's run key to the executor transport: `request` (default) or `environment`. |
-| `[runner].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
-| `[runner].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |
-| `[runner].allow_remote_concurrency` | Allow Tines to change the runner's concurrency. Defaults to `false`. |
-| `[storage].credentials_file` | Runner credential file path. Defaults to `credentials.toml` in the configuration directory. |
-| `[storage].keep_workspaces` | Workspace retention mode: `never`, `failed`, or `always`. Defaults to `never`. |
+| `[runners.<id>].name` | Tines registration name. Required for each runner. |
+| `[runners.<id>].credentials_file` | Required credentials path. Every runner in the file must use a distinct path. |
+| `[runners.<id>].runner_type` | Harness type: `codex` or `custom`. Defaults to `codex`. |
+| `[runners.<id>].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
+| `[runners.<id>].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |
+| `[runners.<id>].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
+| `[runners.<id>].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
+| `[runners.<id>].capabilities_executor` | Optional argument array used only for capability discovery. The runner appends `capabilities`; when unset, it uses the resolved `executor` command. |
+| `[runners.<id>].executor_cwd` | Required daemon-side working directory for the executor transport process. There is no default. A relative path resolves under the daemon account's home directory. |
+| `[runners.<id>].run_key_delivery` | How the daemon sends each assignment's run key to the executor transport: `request` (default) or `environment`. |
+| `[runners.<id>].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
+| `[runners.<id>].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |
+| `[runners.<id>].allow_remote_concurrency` | Allow Tines to change this runner's concurrency. Defaults to `false`. |
+| `[[runners.<id>.override]]` | Assignment-specific settings for this runner. Each override uses optional `project`, `workflow`, and `state` selectors. |
+| `[storage].keep_workspaces` | Shared workspace retention mode: `never`, `failed`, or `always`. Defaults to `never`. |
 | `[storage].keep_workspaces_for_hours` | Maximum age for retained workspaces. Defaults to `72` hours. |
 | `[storage].keep_workspaces_max` | Maximum number of retained workspaces. Defaults to `20`. |
 
@@ -220,7 +238,8 @@ For native execution, keep the default executor and install
 credentials must also be available to that account:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 runner_type = "codex"
 executor = ["tines-runner-rs"]
 executor_cwd = "~"
@@ -233,7 +252,8 @@ inside the image or executor environment. The image must also contain
 at the configured workspace parent. This Linux example does that:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 runner_type = "codex"
 executor = [
   "docker", "run", "--rm", "-i",
@@ -290,7 +310,8 @@ that a capability probe does not need. For example, with
 same image without forwarding that key:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 run_key_delivery = "environment"
 executor = [
   "docker", "run", "--rm", "-i", "--env", "TINES_API_KEY",
@@ -311,11 +332,11 @@ will use. If an override changes `executor` to a different harness environment,
 set `capabilities_executor` in a matching override to probe that environment.
 Capability discovery does not receive the assignment run key, and the daemon
 removes inherited Tines credentials from the probe environment.
-`capabilities_executor` is also resolved per assignment through `[[override]]`
-entries. Like `executor`, it is an argv array and the daemon launches it
-without a shell.
+`capabilities_executor` is also resolved per assignment through
+`[[runners.<id>.override]]` entries. Like `executor`, it is an argv array and
+the daemon launches it without a shell.
 
-Use `[[override]]` entries to change a workspace parent, repository checkout
+Use `[[runners.<id>.override]]` entries to change a workspace parent, repository checkout
 mode, run key delivery, runner type, custom harness command, executor command,
 capability discovery command, or executor working directory for matching
 assignments.
@@ -325,7 +346,7 @@ replace only the fields they set.
 
 ```toml
 # Use a container executor for matching assignments.
-[[override]]
+[[runners.codex.override]]
 project = "Payments"
 workflow = "Implementation"
 state = "Ready"
@@ -365,17 +386,18 @@ harness. Values marked secret use the same output redaction as Codex.
 
 ### Choose run key delivery
 
-`[runner].run_key_delivery` controls only how the daemon sends the per-run
+`[runners.<id>].run_key_delivery` controls only how the daemon sends the per-run
 Tines key to the configured executor transport. The default, `request`, keeps
 the key in the JSON request written to executor stdin. Set it to `environment`
 to omit the key from that request and set `TINES_API_KEY` on the executor
 transport process instead:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 run_key_delivery = "environment"
 
-[[override]]
+[[runners.codex.override]]
 project = "Payments"
 run_key_delivery = "request"
 ```
@@ -398,16 +420,17 @@ or state. The command must be available on the executor's `PATH` or use an
 absolute path:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 runner_type = "custom"
 custom_command = ["default-checks", "{prompt_file}"]
 
-[[override]]
+[[runners.codex.override]]
 project = "Payments"
 custom_command = ["github-checks", "--prompt-file", "{prompt_file}", "--workspace", "{workspace}"]
 repository_checkout = "metadata_only"
 
-[[override]]
+[[runners.codex.override]]
 state = "Review"
 custom_command = ["review-checks", "{workspace}"]
 ```
