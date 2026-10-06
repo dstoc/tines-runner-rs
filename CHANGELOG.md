@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.1](https://github.com/dstoc/tines-runner-rs/compare/v0.4.0...v0.4.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* **executor:** restore Codex pricing evidence ([#55](https://github.com/dstoc/tines-runner-rs/issues/55)) ([7267232](https://github.com/dstoc/tines-runner-rs/commit/7267232945cdd1ea6da244ebc8c656f2330cbc71))
+* reduce runner log noise ([#53](https://github.com/dstoc/tines-runner-rs/issues/53)) ([90d8910](https://github.com/dstoc/tines-runner-rs/commit/90d8910b0e6dba4e76d8ffa05eff7bf9ea01f69a))
+* scope effort validation to resolved harness ([#56](https://github.com/dstoc/tines-runner-rs/issues/56)) ([6abc42a](https://github.com/dstoc/tines-runner-rs/commit/6abc42aebbe737958e3bb575214b082cc9306e11))
+
 ## [0.4.0](https://github.com/dstoc/tines-runner-rs/compare/v0.3.0...v0.4.0) (2026-10-05)
 
 
