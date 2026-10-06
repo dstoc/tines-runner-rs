@@ -151,8 +151,13 @@ impl ExecutorCapabilities {
 
     /// Decode and validate one capability document from executor stdout.
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let capabilities: Self = serde_json::from_slice(bytes)
-            .map_err(|_| "executor returned malformed capability JSON".to_owned())?;
+        let capabilities: Self = serde_json::from_slice(bytes).map_err(|error| {
+            format!(
+                "executor returned malformed capability JSON at line {} column {}",
+                error.line(),
+                error.column()
+            )
+        })?;
         capabilities.validate()?;
         Ok(capabilities)
     }

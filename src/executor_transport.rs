@@ -32,6 +32,31 @@ const CAPABILITIES_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 const STDERR_TRUNCATION_MARKER: &str = "\n[executor stderr truncated]";
 
+fn process_exit_reason(exit: ChildExit) -> String {
+    match exit {
+        ChildExit::Code(code) => format!("command exited with code {code}"),
+        ChildExit::Signal(signal) => format!("command terminated by signal {signal}"),
+        ChildExit::Unknown => "command exited without a reported status".to_owned(),
+    }
+}
+
+fn capability_failure_signature(
+    transport_name: &str,
+    reason: &str,
+    stderr: Option<&str>,
+) -> String {
+    let stderr = stderr
+        .map(|stderr| {
+            crate::diagnostic::format_bounded_diagnostic(
+                stderr,
+                crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+                crate::diagnostic::KeepPart::Suffix,
+            )
+        })
+        .unwrap_or_default();
+    format!("{transport_name}: {reason}: {stderr}")
+}
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn access(pathname: *const c_char, mode: c_int) -> c_int;
@@ -151,13 +176,20 @@ impl ExecutorTransport {
 
     /// Run `<argv...> capabilities` and validate the bounded JSON document it returns.
     pub fn discover_capabilities(&self) -> Result<ExecutorCapabilities, ExecutorTransportError> {
+        self.discover_capabilities_with_stderr()
+            .map(|(capabilities, _)| capabilities)
+    }
+
+    fn discover_capabilities_with_stderr(
+        &self,
+    ) -> Result<(ExecutorCapabilities, Option<String>), ExecutorTransportError> {
         let program = self
             .argv
             .first()
             .filter(|program| !program.trim().is_empty())
-            .ok_or_else(|| self.capabilities_error("command is empty"))?;
+            .ok_or_else(|| self.capabilities_error("command is empty", None))?;
         let working_directory = validate_capabilities_cwd(&self.executor_cwd)
-            .map_err(|_| self.capabilities_error("executor_cwd is invalid or inaccessible"))?;
+            .map_err(|error| self.capabilities_error(error.to_string(), None))?;
         let mut command = Command::new(program);
         command
             .args(self.argv.iter().skip(1))
@@ -167,8 +199,9 @@ impl ExecutorTransport {
         command.env_clear();
         command.envs(safe_capabilities_environment(env::vars_os()));
 
-        let process = SupervisedProcess::spawn_with_output(&mut command)
-            .map_err(|_| self.capabilities_error("could not start command"))?;
+        let process = SupervisedProcess::spawn_with_output(&mut command).map_err(|error| {
+            self.capabilities_error(format!("could not start command: {error}"), None)
+        })?;
         let mut stdout = Vec::new();
         let mut stdout_too_large = false;
         let mut stderr = BoundedStderr::new(capability_redaction_forms(&self.argv));
@@ -188,25 +221,25 @@ impl ExecutorTransport {
             || {},
         );
         let stderr = non_empty(stderr.finish());
-        let output = output_result.map_err(|_| {
-            self.capabilities_error_with_stderr("could not wait for command", stderr.clone())
+        let output = output_result.map_err(|error| {
+            self.capabilities_error(
+                format!("could not wait for command: {error}"),
+                stderr.clone(),
+            )
         })?;
 
         if output.timed_out {
-            return Err(
-                self.capabilities_error_with_stderr("capability discovery timed out", stderr)
-            );
+            return Err(self.capabilities_error("capability discovery timed out", stderr));
         }
         if output.exit != ChildExit::Code(0) {
-            return Err(self.capabilities_error_with_stderr("command failed", stderr));
+            return Err(self.capabilities_error(process_exit_reason(output.exit), stderr));
         }
         if stdout_too_large {
-            return Err(
-                self.capabilities_error_with_stderr("capability document exceeded 64 KiB", stderr)
-            );
+            return Err(self.capabilities_error("capability document exceeded 64 KiB", stderr));
         }
-        ExecutorCapabilities::parse(&stdout)
-            .map_err(|_| self.capabilities_error_with_stderr("invalid capability document", stderr))
+        let capabilities = ExecutorCapabilities::parse(&stdout)
+            .map_err(|error| self.capabilities_error(error, stderr.clone()))?;
+        Ok((capabilities, stderr))
     }
 
     /// Discover capabilities and report probe failures with bounded, redacted
@@ -216,8 +249,8 @@ impl ExecutorTransport {
         failures: &FailureReporter,
     ) -> ExecutorCapabilities {
         let path = self.diagnostic_identity();
-        match self.discover_capabilities() {
-            Ok(capabilities) => {
+        match self.discover_capabilities_with_stderr() {
+            Ok((capabilities, stderr)) => {
                 if let Some(reason) = capabilities.discovery_error.as_deref() {
                     let secret_forms = capability_redaction_forms(&self.argv);
                     let reason = redact_with_forms(reason, &secret_forms);
@@ -226,8 +259,18 @@ impl ExecutorTransport {
                         crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
                         crate::diagnostic::KeepPart::Suffix,
                     );
-                    let signature = format!("{}: {reason}", self.config_source());
-                    self.log_capability_failure(failures, &path, &signature, &reason, None);
+                    let signature = capability_failure_signature(
+                        self.config_source(),
+                        &reason,
+                        stderr.as_deref(),
+                    );
+                    self.log_capability_failure(
+                        failures,
+                        &path,
+                        &signature,
+                        &reason,
+                        stderr.as_deref(),
+                    );
                 } else {
                     self.log_capability_recovery(failures, &path);
                     tracing::debug!(
@@ -298,15 +341,17 @@ impl ExecutorTransport {
         }
     }
 
-    fn capabilities_error(&self, reason: &'static str) -> ExecutorTransportError {
-        self.capabilities_error_with_stderr(reason, None)
-    }
-
-    fn capabilities_error_with_stderr(
+    fn capabilities_error(
         &self,
-        reason: &'static str,
+        reason: impl AsRef<str>,
         stderr: Option<String>,
     ) -> ExecutorTransportError {
+        let reason = redact_with_forms(reason.as_ref(), &capability_redaction_forms(&self.argv));
+        let reason = crate::diagnostic::format_bounded_diagnostic(
+            &reason,
+            crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+            crate::diagnostic::KeepPart::Suffix,
+        );
         ExecutorTransportError::Capabilities {
             transport_name: self.capabilities_transport_name,
             reason,
@@ -815,7 +860,7 @@ pub enum ExecutorTransportError {
     },
     Capabilities {
         transport_name: &'static str,
-        reason: &'static str,
+        reason: String,
         stderr: Option<String>,
     },
 }
@@ -837,20 +882,20 @@ impl ExecutorTransportError {
             Self::Capabilities {
                 transport_name,
                 reason,
-                ..
-            } => format!("{transport_name}: {reason}"),
+                stderr,
+            } => capability_failure_signature(transport_name, reason, stderr.as_deref()),
             _ => self.to_string(),
         }
     }
 
     /// Configuration source and sanitized failure reason for capability logs.
-    pub fn capability_failure(&self) -> Option<(&'static str, &'static str)> {
+    pub fn capability_failure(&self) -> Option<(&'static str, &str)> {
         match self {
             Self::Capabilities {
                 transport_name,
                 reason,
                 ..
-            } => Some((*transport_name, *reason)),
+            } => Some((*transport_name, reason)),
             _ => None,
         }
     }
@@ -887,8 +932,17 @@ impl Error for ExecutorTransportError {}
 mod tests {
     use super::{ExecutionRequest, ExecutorTransport, safe_executor_environment};
     use crate::logging::FailureReporter;
-    use crate::logging::test_support::capture_events;
+    use crate::logging::test_support::{CapturedEvent, capture_events};
     use std::ffi::OsString;
+
+    fn reported_probe_events(
+        transport: &ExecutorTransport,
+        failures: &FailureReporter,
+    ) -> Vec<CapturedEvent> {
+        capture_events(|| {
+            transport.discover_capabilities_reported(failures);
+        })
+    }
 
     #[cfg(unix)]
     #[test]
@@ -905,13 +959,19 @@ mod tests {
             &command,
             r##"#!/bin/sh
 printf '%s\n' '{"version":1,"harnesses":{},"discovery_error":"Codex version probe failed"}'
+printf '%s\n' 'capability probe explanation: capability-secret' >&2
 "##,
         )
         .expect("write capability command");
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
             .expect("make capability command executable");
-        let transport =
-            ExecutorTransport::new(vec![command.to_string_lossy().into_owned()], &directory);
+        let transport = ExecutorTransport::new(
+            vec![
+                command.to_string_lossy().into_owned(),
+                "capability-secret".to_owned(),
+            ],
+            &directory,
+        );
         let reporter = FailureReporter::default();
 
         let (capabilities, events) = {
@@ -931,6 +991,124 @@ printf '%s\n' '{"version":1,"harnesses":{},"discovery_error":"Codex version prob
                 .fields
                 .contains("executor capability discovery failed")
         );
+        assert!(events[0].fields.contains("capability probe explanation"));
+        assert!(events[0].fields.contains("[REDACTED]"));
+        assert!(!events[0].fields.contains("capability-secret"));
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_probe_failures_preserve_causes_and_recover_after_a_changed_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-capability-causes-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary directory");
+        let command = directory.join("capability-command");
+        let transport =
+            ExecutorTransport::new(vec![command.to_string_lossy().into_owned()], &directory);
+        let failures = FailureReporter::default();
+
+        let missing = reported_probe_events(&transport, &failures);
+        assert_eq!(missing[0].level, tracing::Level::WARN);
+        assert!(missing[0].fields.contains("could not start command"));
+        assert!(missing[0].fields.contains("os error 2"));
+
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").expect("write non-executable probe");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o644))
+            .expect("remove probe execute permission");
+        let denied = reported_probe_events(&transport, &failures);
+        assert_eq!(denied[0].level, tracing::Level::WARN);
+        assert!(denied[0].fields.contains("could not start command"));
+        assert!(denied[0].fields.contains("os error 13"));
+
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf '%s\\n' '{\"version\":9,\"harnesses\":{}}'\n",
+        )
+        .expect("write invalid capability document");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
+            .expect("make probe executable");
+        let invalid = reported_probe_events(&transport, &failures);
+        assert_eq!(invalid[0].level, tracing::Level::WARN);
+        assert!(
+            invalid[0]
+                .fields
+                .contains("unsupported executor capability document version")
+        );
+
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf '%s\\n' 'first probe root cause' >&2\nexit 17\n",
+        )
+        .expect("write first failing probe");
+        let first_cause = reported_probe_events(&transport, &failures);
+        assert_eq!(first_cause[0].level, tracing::Level::WARN);
+        assert!(first_cause[0].fields.contains("exited with code 17"));
+        assert!(first_cause[0].fields.contains("first probe root cause"));
+        let repeated_cause = reported_probe_events(&transport, &failures);
+        assert_eq!(repeated_cause[0].level, tracing::Level::DEBUG);
+
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf '%s\\n' 'changed probe root cause' >&2\nexit 17\n",
+        )
+        .expect("change failing probe cause");
+        let changed_cause = reported_probe_events(&transport, &failures);
+        assert_eq!(changed_cause[0].level, tracing::Level::WARN);
+        assert!(changed_cause[0].fields.contains("changed probe root cause"));
+
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"harnesses\":{}}'\n",
+        )
+        .expect("restore healthy capability probe");
+        let recovered = reported_probe_events(&transport, &failures);
+        assert_eq!(recovered[0].level, tracing::Level::INFO);
+        assert!(
+            recovered[0]
+                .fields
+                .contains("executor capability discovery recovered")
+        );
+        assert!(recovered[0].fields.contains("failure_count=1"));
+
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_capability_probe_keeps_stderr_quiet() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-capability-healthy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary directory");
+        let command = directory.join("capability-command");
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf '%s\\n' 'healthy probe note' >&2\nprintf '%s\\n' '{\"version\":1,\"harnesses\":{}}'\n",
+        )
+        .expect("write healthy probe");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
+            .expect("make probe executable");
+        let transport =
+            ExecutorTransport::new(vec![command.to_string_lossy().into_owned()], &directory);
+
+        let events = reported_probe_events(&transport, &FailureReporter::default());
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, tracing::Level::DEBUG);
+        assert!(
+            events[0]
+                .fields
+                .contains("executor capabilities discovered")
+        );
+        assert!(!events[0].fields.contains("healthy probe note"));
         std::fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 
