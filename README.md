@@ -78,8 +78,9 @@ keep_workspaces = "never"
 ```
 
 `[server].url`, `[runners.codex].name`, `[runners.codex].credentials_file`,
-and `[runners.codex].executor_cwd` are required. The table name `codex` is the
-local runner ID. Pass it with `--runner codex` when the file defines more than
+and `[runners.codex].executor_cwd` are required. `[storage].state_dir` is
+optional and defaults to a writable per-user state directory. The table name
+`codex` is the local runner ID. Pass it with `--runner codex` when the file defines more than
 one runner. The runner type defaults to `codex`. Set it to `custom` to run a
 configured command. The daemon expands `~` in its paths, including
 `executor_cwd` and `credentials_file`. It sends the configured
@@ -133,10 +134,24 @@ in the platform configuration directory:
 Named runner definitions require an explicit, distinct
 `[runners.<id>].credentials_file`. The runner uses `XDG_CONFIG_HOME` only when
 it is absolute. It affects the legacy default credentials location; it does
-not select the runner configuration file. On Unix, the runner creates or
-repairs the credential file with mode `0600`. Keep it private and use the same
-file when restarting that runner. Later `--check` runs use the saved runner
-token and do not need `TINES_API_KEY`:
+not select the runner configuration file. Mutable active-run recovery state
+is stored separately from the credentials file.
+Without an explicit setting, the state directory is:
+
+- Linux and other Unix: `${XDG_STATE_HOME:-~/.local/state}/tines-runner-rs`.
+- macOS: `${XDG_STATE_HOME:-~/Library/Application Support}/tines-runner-rs`.
+- Windows: `${XDG_STATE_HOME:-%LOCALAPPDATA%}/tines-runner-rs` (or
+  `%USERPROFILE%\AppData\Local` if `LOCALAPPDATA` is unset).
+
+Set `[storage].state_dir` once for all runners in the config. The daemon stores
+each runner's active-run file in a separate `runner-<local-ID>` subdirectory.
+The daemon creates the selected directory and tests file creation,
+sync, and rename before it polls. If the path is invalid or unwritable, startup
+fails and reports the state path.
+
+On Unix, the runner creates or repairs the credentials file with mode `0600`.
+Keep it private and use the same file when restarting that runner. Later
+`--check` runs use the saved runner token and do not need `TINES_API_KEY`:
 
 ```sh
 tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --runner codex --check
@@ -170,6 +185,9 @@ workspace_parent = "/var/lib/tines-runner-rs/antigravity/workspaces"
 executor = ["tines-runner-rs"]
 executor_cwd = "/var/lib/tines-runner-rs/antigravity"
 max_concurrent = 1
+
+[storage]
+state_dir = "/var/lib/tines-runner-rs/state"
 ```
 
 The IDs `codex` and `antigravity` are local selectors. The example uses the
@@ -209,6 +227,7 @@ The main settings are:
 | `[server].url` | Tines instance URL. Required; must use HTTP or HTTPS. |
 | `[runners.<id>].name` | Tines registration name. Required for each runner. |
 | `[runners.<id>].credentials_file` | Required credentials path. Every runner in the file must use a distinct path. |
+| `[storage].state_dir` | Shared writable root for active-run crash-recovery state. Defaults to the platform state directory. The daemon separates runners into local-ID subdirectories. |
 | `[runners.<id>].runner_type` | Harness type: `codex` or `custom`. Defaults to `codex`. |
 | `[runners.<id>].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
 | `[runners.<id>].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |

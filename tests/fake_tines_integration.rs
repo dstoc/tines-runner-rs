@@ -72,6 +72,7 @@ impl TestDirectory {
         let config_dir = self.path.join("config/tines-runner-rs");
         fs::create_dir_all(&config_dir).expect("create runner config directory");
         let credentials = self.path.join("credentials.toml");
+        let state_dir = self.path.join("state");
         let workspaces = self.path.join("workspaces");
         let events = self.path.join("events");
         let captures = self.path.join("captures");
@@ -89,8 +90,8 @@ impl TestDirectory {
             String::new()
         };
         let config = format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nexecutor = {default_executor}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n{override_section}",
-            workspaces, credentials
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nexecutor = {default_executor}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\nstate_dir = {:?}\n{override_section}",
+            workspaces, credentials, state_dir
         );
         fs::write(config_dir.join("config.toml"), config).expect("write runner config");
     }
@@ -99,17 +100,22 @@ impl TestDirectory {
         let config_dir = self.path.join("config/tines-runner-rs");
         fs::create_dir_all(&config_dir).expect("create runner config directory");
         let credentials = self.path.join("credentials.toml");
+        let state_dir = self.path.join("state");
         let workspaces = self.path.join("workspaces");
         fs::create_dir_all(&workspaces).expect("create native workspace parent");
         let config = format!(
-            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
-            workspaces, credentials
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\nstate_dir = {:?}\n",
+            workspaces, credentials, state_dir
         );
         fs::write(config_dir.join("config.toml"), config).expect("write native runner config");
     }
 
     fn credentials_path(&self) -> std::path::PathBuf {
         self.path.join("credentials.toml")
+    }
+
+    fn active_runs_path(&self) -> std::path::PathBuf {
+        self.path.join("state/runner-default/active-runs.json")
     }
 
     fn workspace_parent(&self) -> std::path::PathBuf {
@@ -475,6 +481,57 @@ fn default_native_executor_preserves_cold_workspace_environment_logs_and_finish(
         0
     );
     stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
+fn read_only_external_credentials_run_with_state_in_the_configured_directory() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    directory.configure(fake.url().as_str(), &stub, 1, false);
+
+    let mut bootstrap = directory.runner(Some("fake-bootstrap-key"));
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        !poll_requests(requests).is_empty()
+    });
+    stop_gracefully(&fake, &mut bootstrap);
+
+    let credentials_dir = directory.path.join("external-credentials");
+    fs::create_dir_all(&credentials_dir).expect("create external credentials directory");
+    let external_credentials = credentials_dir.join("runner-credentials");
+    fs::copy(directory.credentials_path(), &external_credentials)
+        .expect("install externally managed credentials");
+    fs::set_permissions(&external_credentials, fs::Permissions::from_mode(0o400))
+        .expect("make external credentials read-only");
+    fs::set_permissions(&credentials_dir, fs::Permissions::from_mode(0o500))
+        .expect("make external credentials directory read-only");
+
+    let config_path = directory.path.join("config/tines-runner-rs/config.toml");
+    let old_config = fs::read_to_string(&config_path).expect("read runner config");
+    let old_credentials = format!("{:?}", directory.credentials_path());
+    let new_credentials = format!("{external_credentials:?}");
+    let config = old_config.replace(&old_credentials, &new_credentials);
+    assert_ne!(config, old_config, "replace configured credentials path");
+    fs::write(&config_path, config).expect("write config for external credentials");
+
+    fake.enqueue_poll(json!({
+        "assignments": [assignment("arun_read_only_credentials", 5, Vec::new())],
+        "cancels": []
+    }));
+    let mut runner = directory.runner(None);
+    let finishes = fake.wait_for_finishes(1, Duration::from_secs(20));
+    assert_eq!(finishes[0]["status"], "completed");
+    assert!(directory.active_runs_path().is_file());
+    assert!(
+        !credentials_dir.join("active-runs.json").exists(),
+        "the read-only credential directory receives no daemon state"
+    );
+    assert!(fs::read(&external_credentials).is_ok());
+    stop_gracefully(&fake, &mut runner);
+    fs::set_permissions(&credentials_dir, fs::Permissions::from_mode(0o700))
+        .expect("restore external credentials directory permissions");
+    fs::set_permissions(&external_credentials, fs::Permissions::from_mode(0o600))
+        .expect("restore external credentials permissions");
 }
 
 #[test]
@@ -1113,11 +1170,16 @@ fn sigterm_stops_the_executor_transport_and_reports_one_interrupted_finish() {
         .trim()
         .parse::<u32>()
         .expect("parse descendant PID");
-    let active_runs_path = directory
-        .credentials_path()
-        .with_file_name("active-runs.json");
+    let active_runs_path = directory.active_runs_path();
     let transport_identity =
         wait_for_process_identity(&active_runs_path, run_id, Duration::from_secs(10));
+    assert!(
+        !directory
+            .credentials_path()
+            .with_file_name("active-runs.json")
+            .exists(),
+        "active-run records stay under state_dir"
+    );
     let transport_pid = transport_identity["process_id"]
         .as_u64()
         .expect("persisted transport process ID") as u32;
@@ -1181,9 +1243,7 @@ fn restart_recovers_a_crashed_run_before_polling_with_empty_ownership() {
         .trim()
         .parse::<u32>()
         .expect("parse crashed stub descendant PID");
-    let active_runs_path = directory
-        .credentials_path()
-        .with_file_name("active-runs.json");
+    let active_runs_path = directory.active_runs_path();
     let transport_identity =
         wait_for_process_identity(&active_runs_path, "arun_crash", Duration::from_secs(10));
     let process_group_id = transport_identity["process_group_id"]
@@ -1210,12 +1270,7 @@ fn restart_recovers_a_crashed_run_before_polling_with_empty_ownership() {
         !crashed_status.success(),
         "first daemon was killed to simulate a crash"
     );
-    assert!(
-        directory
-            .credentials_path()
-            .with_file_name("active-runs.json")
-            .exists()
-    );
+    assert!(directory.active_runs_path().exists());
 
     let mut restarted = directory.runner(None);
     fake.wait_for(Duration::from_secs(10), |requests| {
@@ -1263,9 +1318,7 @@ fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_
         .trim()
         .parse::<u32>()
         .expect("parse executor descendant PID");
-    let active_runs_path = directory
-        .credentials_path()
-        .with_file_name("active-runs.json");
+    let active_runs_path = directory.active_runs_path();
     let transport_identity =
         wait_for_process_identity(&active_runs_path, run_id, Duration::from_secs(10));
     let transport_pid = transport_identity["process_id"]
@@ -1343,7 +1396,7 @@ fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_
         .expect("copy runner credentials to an alias path");
     let alias_config_path = directory.path.join("credential-alias/config.toml");
     let alias_config = format!(
-        "[server]\nurl = {:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+        "[server]\nurl = {:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\nstate_dir = {:?}\n",
         trailing_slash_url,
         executor(
             &stub,
@@ -1353,7 +1406,8 @@ fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_
             &directory.path.join("control")
         ),
         directory.workspace_parent(),
-        alias_credentials
+        alias_credentials,
+        directory.path.join("state")
     );
     fs::write(&alias_config_path, alias_config).expect("write alias config");
     let mut alias_command = directory.runner_command(&alias_config_path, None, None);
@@ -1418,14 +1472,15 @@ fn distinct_named_runner_registrations_can_poll_concurrently() {
     let codex_executor = executor(&stub, "codex", &events, &captures, &control);
     let antigravity_executor = executor(&stub, "antigravity", &events, &captures, &control);
     let config = format!(
-        "[server]\nurl = {:?}\n\n[runners.codex]\nname = \"shared-codex\"\ncredentials_file = {:?}\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 2\npoll_interval_seconds = 1\n\n[runners.antigravity]\nname = \"shared-antigravity\"\ncredentials_file = {:?}\nrunner_type = \"custom\"\ncustom_command = [\"antigravity\"]\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 4\npoll_interval_seconds = 1\n",
+        "[server]\nurl = {:?}\n\n[runners.codex]\nname = \"shared-codex\"\ncredentials_file = {:?}\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 2\npoll_interval_seconds = 1\n\n[runners.antigravity]\nname = \"shared-antigravity\"\ncredentials_file = {:?}\nrunner_type = \"custom\"\ncustom_command = [\"antigravity\"]\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 4\npoll_interval_seconds = 1\n\n[storage]\nstate_dir = {:?}\n",
         fake.url(),
         credentials_codex,
         codex_executor,
         directory.workspace_parent(),
         credentials_antigravity,
         antigravity_executor,
-        directory.workspace_parent()
+        directory.workspace_parent(),
+        directory.path.join("state")
     );
     fs::write(&config_path, config).expect("write shared named-runner config");
 
@@ -1451,6 +1506,8 @@ fn distinct_named_runner_registrations_can_poll_concurrently() {
             .collect::<std::collections::BTreeSet<_>>();
         registrations.len() >= 2 && poll_targets.len() >= 2
     });
+    assert!(directory.path.join("state/runner-codex").is_dir());
+    assert!(directory.path.join("state/runner-antigravity").is_dir());
     codex.assert_running();
     antigravity.assert_running();
 

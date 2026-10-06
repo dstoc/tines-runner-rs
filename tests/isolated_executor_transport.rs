@@ -38,6 +38,7 @@ impl TestDirectory {
         let first_cwd = self.0.join("transport-cwds/first");
         let second_cwd = self.0.join("transport-cwds/second");
         let daemon_workspaces = self.0.join("daemon-workspaces");
+        let state_dir = self.0.join("daemon-state/runner-state");
         let first_workspaces = self.0.join("executor-environment/workspaces/first");
         let second_workspaces = self.0.join("executor-environment/workspaces/second");
         for path in [
@@ -99,12 +100,13 @@ impl TestDirectory {
         let credentials = self.0.join("daemon-state/credentials.toml");
         fs::create_dir_all(credentials.parent().unwrap()).expect("create daemon state directory");
         let config = format!(
-            "[server]\nurl = {}\n[runner]\nname = \"isolated-transport-acceptance\"\nexecutor = {}\nexecutor_cwd = {}\nworkspace_parent = {}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {}\nkeep_workspaces = \"never\"\n\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\n\n[[override]]\nproject = \"Alternate\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\nrun_key_delivery = \"environment\"\n",
+            "[server]\nurl = {}\n[runner]\nname = \"isolated-transport-acceptance\"\nexecutor = {}\nexecutor_cwd = {}\nworkspace_parent = {}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {}\nstate_dir = {}\nkeep_workspaces = \"never\"\n\n[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\n\n[[override]]\nproject = \"Alternate\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nexecutor_cwd = {}\nworkspace_parent = {}\nrun_key_delivery = \"environment\"\n",
             path_value(Path::new(server_url)),
             executor_argv,
             path_value(&capability_cwd),
             path_value(&daemon_workspaces),
             path_value(&credentials),
+            path_value(&state_dir),
             path_value(&first_cwd),
             path_value(&first_workspaces),
             path_value(&second_cwd),
@@ -130,7 +132,7 @@ impl TestDirectory {
             second_cwd,
             first_workspaces,
             second_workspaces,
-            credentials,
+            state_dir,
             repository: create_local_repository(&self.0.join("source-repository")),
             log: self.0.join("daemon-stderr.log"),
         }
@@ -152,7 +154,7 @@ struct FixturePaths {
     second_cwd: PathBuf,
     first_workspaces: PathBuf,
     second_workspaces: PathBuf,
-    credentials: PathBuf,
+    state_dir: PathBuf,
     repository: PathBuf,
     log: PathBuf,
 }
@@ -674,7 +676,7 @@ fn isolated_transport_covers_capabilities_overrides_protocol_cancellation_and_ti
     wait_for_file(&cancel_harness_pid_file, Duration::from_secs(10));
     wait_for_file(&cancel_descendant_pid_file, Duration::from_secs(10));
     let transport_state = wait_for_process_identity(
-        &paths.credentials.with_file_name("active-runs.json"),
+        &paths.state_dir.join("runner-default/active-runs.json"),
         "arun_transport_cancel",
         Duration::from_secs(10),
     );
