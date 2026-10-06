@@ -191,9 +191,21 @@ fn run_case(exit_code: i32, expected_status: &str) {
                     "usage_scope":"thread_total",
                     "session_mode":"cold",
                     "normalization":"codex-jsonl-v1",
+                    "raw_usage":{
+                        "input_tokens":110801,
+                        "cached_input_tokens":101888,
+                        "cache_write_input_tokens":0,
+                        "output_tokens":1980
+                    },
                     "model_rerouted":false,
                     "measurement_status":evidence_status,
-                    "terminal_snapshots":1
+                    "terminal_snapshots":1,
+                    "request_context":{
+                        "version":1,
+                        "normalization":"codex-rollout-delta-v1",
+                        "status":"unavailable",
+                        "reason":"not_applicable"
+                    }
                 }
             },
             "interrupted":false
@@ -319,6 +331,14 @@ fn run_case(exit_code: i32, expected_status: &str) {
         })
     );
     assert_eq!(finish["pricing_evidence"]["model"], "gpt-5.1-codex");
+    assert_eq!(
+        finish["pricing_evidence"]["raw_usage"]["input_tokens"],
+        110801
+    );
+    assert_eq!(
+        finish["pricing_evidence"]["request_context"]["reason"],
+        "not_applicable"
+    );
     assert_eq!(
         finish["pricing_evidence"]["measurement_status"],
         if expected_status == "failed" {

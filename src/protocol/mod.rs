@@ -224,10 +224,11 @@ pub struct CodexRawUsageV1 {
     pub output_tokens: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexMeasurementStatus {
     Complete,
+    #[default]
     Missing,
     Invalid,
     Nonmonotonic,
@@ -252,6 +253,10 @@ pub struct CodexPricingEvidenceV1 {
     pub terminal_snapshots: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    /// Optional rollout-derived request context. Keep the provider payload
+    /// opaque here so the daemon can carry the existing schema without loss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

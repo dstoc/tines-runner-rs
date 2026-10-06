@@ -151,6 +151,24 @@ fn successful_execution_emits_one_result_and_applies_always_retention() {
     assert_eq!(terminal["usage"]["cache_read_tokens"], 10);
     assert_eq!(terminal["usage"]["cache_write_tokens"], 2);
     assert_eq!(terminal["usage"]["output_tokens"], 7);
+    assert_eq!(terminal["pricing_evidence"]["provider"], "codex");
+    assert_eq!(terminal["pricing_evidence"]["version"], 1);
+    assert_eq!(
+        terminal["pricing_evidence"]["payload"]["measurement_status"],
+        "complete"
+    );
+    assert_eq!(
+        terminal["pricing_evidence"]["payload"]["raw_usage"]["input_tokens"],
+        42
+    );
+    assert_eq!(
+        terminal["pricing_evidence"]["payload"]["raw_usage"]["cached_input_tokens"],
+        10
+    );
+    assert_eq!(
+        terminal["pricing_evidence"]["payload"]["raw_usage"]["cache_write_input_tokens"],
+        2
+    );
 
     let workspaces = fs::read_dir(workspace_parent)
         .expect("workspace parent remains")
@@ -420,6 +438,11 @@ fn nonzero_harness_exit_keeps_usage_and_session_in_failed_result() {
     assert_eq!(terminal["exit_code"], 9);
     assert_eq!(terminal["provider_session_id"], "thread-success");
     assert_eq!(terminal["usage"]["input_tokens"], 30);
+    assert_eq!(terminal["pricing_evidence"]["provider"], "codex");
+    assert_eq!(
+        terminal["pricing_evidence"]["payload"]["raw_usage"]["input_tokens"],
+        42
+    );
 
     let workspace = fs::read_dir(workspace_parent)
         .expect("workspace parent remains")
@@ -457,6 +480,10 @@ exit 1
     assert_eq!(terminal["usage"]["input_tokens"], 95);
     assert_eq!(terminal["usage"]["cache_read_tokens"], 20);
     assert!(terminal["rate_limit"]["resume_at"].as_u64().is_some());
+    assert_eq!(
+        terminal["pricing_evidence"]["payload"]["raw_usage"]["input_tokens"],
+        120
+    );
 }
 
 #[test]
