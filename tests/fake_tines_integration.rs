@@ -1240,7 +1240,8 @@ fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
     let stub = directory.create_stub();
-    directory.configure(fake.url().as_str(), &stub, 1, false);
+    let server_url = format!("{}/tines", fake.url());
+    directory.configure(&server_url, &stub, 1, false);
     let run_id = "arun_duplicate_daemon";
     let control = directory.path.join("control");
     fs::write(
@@ -1278,7 +1279,20 @@ fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_
         .expect("first daemon poll instance ID");
 
     let config_path = directory.path.join("config/tines-runner-rs/config.toml");
-    let mut duplicate_command = directory.runner_command(&config_path, None, None);
+    let duplicate_config_path = directory.path.join("duplicate-config.toml");
+    let original_config = fs::read_to_string(&config_path).expect("read original runner config");
+    let trailing_slash_url = format!("{server_url}/");
+    let alternate_config = original_config.replace(
+        &format!("url = {server_url:?}"),
+        &format!("url = {trailing_slash_url:?}"),
+    );
+    assert_ne!(
+        alternate_config, original_config,
+        "replace the configured API URL"
+    );
+    fs::write(&duplicate_config_path, alternate_config)
+        .expect("write equivalent trailing-slash runner config");
+    let mut duplicate_command = directory.runner_command(&duplicate_config_path, None, None);
     duplicate_command.stdout(Stdio::piped());
     duplicate_command.stderr(Stdio::piped());
     let duplicate = RunnerProcess {
@@ -1330,7 +1344,7 @@ fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_
     let alias_config_path = directory.path.join("credential-alias/config.toml");
     let alias_config = format!(
         "[server]\nurl = {:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
-        fake.url(),
+        trailing_slash_url,
         executor(
             &stub,
             "alias",

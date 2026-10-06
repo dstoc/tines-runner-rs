@@ -155,6 +155,7 @@ impl Client {
         }
         base_url.set_query(None);
         base_url.set_fragment(None);
+        let base_url = normalize_api_base_url(base_url);
 
         let request_timeout = timeout.min(MAX_REQUEST_TIMEOUT);
         let http = HttpClient::builder()
@@ -337,13 +338,25 @@ impl Client {
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| ClientError::local_protocol_error())?;
-        segments.pop_if_empty().push("api").push("v1");
+        segments.push("api").push("v1");
         for segment in path {
             segments.push(segment);
         }
         drop(segments);
         Ok(url)
     }
+}
+
+/// Remove the final empty path segment before appending the API route.
+///
+/// Keep this normalization shared with daemon ownership so equivalent base
+/// URLs cannot acquire separate locks for the same API endpoint.
+pub(crate) fn normalize_api_base_url(mut base_url: Url) -> Url {
+    base_url
+        .path_segments_mut()
+        .expect("HTTP(S) API base URLs support path segments")
+        .pop_if_empty();
+    base_url
 }
 
 const MAX_LOG_BATCH_BYTES: usize = 32 * 1024;
@@ -877,6 +890,23 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn equivalent_trailing_slash_base_urls_build_the_same_api_endpoint() {
+        let without_trailing_slash =
+            Client::new("https://tines.example.test/tines").expect("create client");
+        let with_trailing_slash =
+            Client::new("https://tines.example.test/tines/").expect("create client");
+
+        assert_eq!(
+            without_trailing_slash
+                .endpoint(&["runners", "rnr_123", "poll"])
+                .expect("build endpoint"),
+            with_trailing_slash
+                .endpoint(&["runners", "rnr_123", "poll"])
+                .expect("build endpoint")
+        );
+    }
 
     fn read_log_request(stream: &mut TcpStream) -> serde_json::Value {
         let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));

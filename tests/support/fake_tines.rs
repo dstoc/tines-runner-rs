@@ -223,7 +223,8 @@ struct Response {
 }
 
 fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
-    if request.method == "POST" && request.target == "/api/v1/runners/register" {
+    let target = api_target(&request.target);
+    if request.method == "POST" && target == "/api/v1/runners/register" {
         state.next_runner_id += 1;
         let runner_id = format!("rnr_fake_tines_{}", state.next_runner_id);
         if let Some(name) = request.json()["name"].as_str() {
@@ -241,8 +242,7 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
     }
 
     if request.method == "POST"
-        && let Some(runner_id) = request
-            .target
+        && let Some(runner_id) = target
             .strip_prefix("/api/v1/runners/")
             .and_then(|target| target.strip_suffix("/poll"))
         && let Some(registered_runner_name) = state.runner_names.get(runner_id)
@@ -294,8 +294,8 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         return response(status, body);
     }
 
-    if request.method == "GET" && request.target.starts_with("/api/v1/issues/") {
-        let issue_id = request.target.trim_start_matches("/api/v1/issues/");
+    if request.method == "GET" && target.starts_with("/api/v1/issues/") {
+        let issue_id = target.trim_start_matches("/api/v1/issues/");
         let expected_token = issue_id
             .strip_prefix("iss_")
             .map(|run_id| format!("Bearer issue-run-key-{run_id}"));
@@ -311,8 +311,8 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         );
     }
 
-    if request.method == "POST" && request.target.starts_with("/api/v1/runs/") {
-        let rest = request.target.trim_start_matches("/api/v1/runs/");
+    if request.method == "POST" && target.starts_with("/api/v1/runs/") {
+        let rest = target.trim_start_matches("/api/v1/runs/");
         if let Some(run_id) = rest.strip_suffix("/logs") {
             if state.failures.logs > 0 {
                 state.failures.logs -= 1;
@@ -404,6 +404,17 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<RecordedRequest> {
         headers,
         body: bytes[body_start..body_start + content_length].to_vec(),
     })
+}
+
+fn api_target(target: &str) -> &str {
+    let Some(path) = target.strip_prefix("/tines") else {
+        return target;
+    };
+    if path.is_empty() || path.starts_with('/') {
+        path
+    } else {
+        target
+    }
 }
 
 fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {

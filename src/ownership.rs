@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::credentials::{CredentialStore, RunnerCredentials};
+use crate::protocol::client::normalize_api_base_url;
 
 /// An exclusive local lock held for the lifetime of one daemon registration.
 #[derive(Debug)]
@@ -30,7 +31,7 @@ impl DaemonOwnershipGuard {
         })?;
         fs::create_dir_all(lock_directory)?;
 
-        let identity = format!("{}\0{}", server_url.as_str(), credentials.runner_id());
+        let identity = registration_identity(server_url, credentials.runner_id());
         let digest = Sha256::digest(identity.as_bytes());
         let suffix = digest
             .iter()
@@ -39,6 +40,11 @@ impl DaemonOwnershipGuard {
         let path = lock_directory.join(format!("daemon-{suffix}.lock"));
         acquire_at(path)
     }
+}
+
+fn registration_identity(server_url: &Url, runner_id: &str) -> String {
+    let api_base_url = normalize_api_base_url(server_url.clone());
+    format!("{}\0{runner_id}", api_base_url.as_str())
 }
 
 fn acquire_at(path: PathBuf) -> io::Result<DaemonOwnershipGuard> {
@@ -65,10 +71,11 @@ fn acquire_at(path: PathBuf) -> io::Result<DaemonOwnershipGuard> {
 
 #[cfg(test)]
 mod tests {
-    use super::acquire_at;
+    use super::{acquire_at, registration_identity};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use url::Url;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -107,5 +114,18 @@ mod tests {
         fs::remove_file(&second).expect("remove second test lock file");
         fs::remove_dir(first.parent().expect("lock file has a parent"))
             .expect("remove ownership lock test directory");
+    }
+
+    #[test]
+    fn equivalent_api_base_urls_share_registration_identity() {
+        let without_trailing_slash =
+            Url::parse("https://tines.example.test/tines").expect("parse API base URL");
+        let with_trailing_slash = Url::parse("https://tines.example.test/tines/")
+            .expect("parse API base URL with trailing slash");
+
+        assert_eq!(
+            registration_identity(&without_trailing_slash, "rnr_123"),
+            registration_identity(&with_trailing_slash, "rnr_123")
+        );
     }
 }
