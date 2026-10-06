@@ -21,6 +21,7 @@ use crate::execution_protocol::{
     TinesExecutionContext, WorkspacePolicy,
 };
 use crate::executor_capabilities::ExecutorCapabilities;
+use crate::logging::{FailureDisposition, FailureReporter};
 use crate::process::{ProcessExit as ChildExit, ProcessIdentity, ProcessStream, SupervisedProcess};
 
 const EXECUTOR_MODE: &str = "execute";
@@ -114,6 +115,24 @@ impl ExecutorTransport {
         }
     }
 
+    /// Name of the configuration field that selected this transport.
+    pub fn config_source(&self) -> &'static str {
+        self.capabilities_transport_name
+    }
+
+    /// Return a stable, sanitized identifier for grouping probe failures.
+    pub fn diagnostic_identity(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.argv.hash(&mut hasher);
+        self.executor_cwd.hash(&mut hasher);
+        format!(
+            "{}:{:016x}",
+            self.capabilities_transport_name,
+            hasher.finish()
+        )
+    }
+
     pub fn new(argv: Vec<String>, executor_cwd: impl Into<PathBuf>) -> Self {
         Self::new_named(argv, executor_cwd, "[runner].executor")
     }
@@ -152,40 +171,146 @@ impl ExecutorTransport {
             .map_err(|_| self.capabilities_error("could not start command"))?;
         let mut stdout = Vec::new();
         let mut stdout_too_large = false;
-        let output = process
-            .wait_timeout_with_output(
-                CAPABILITIES_DEADLINE,
-                CAPABILITIES_TERMINATION_GRACE,
-                || false,
-                |chunk| {
-                    if chunk.stream == ProcessStream::Stdout {
-                        let remaining = MAX_CAPABILITIES_OUTPUT_BYTES.saturating_sub(stdout.len());
-                        let accepted = chunk.bytes.len().min(remaining);
-                        stdout.extend_from_slice(&chunk.bytes[..accepted]);
-                        stdout_too_large |= accepted < chunk.bytes.len();
-                    }
-                },
-                || {},
-            )
-            .map_err(|_| self.capabilities_error("could not wait for command"))?;
+        let mut stderr = BoundedStderr::new(capability_redaction_forms(&self.argv));
+        let output_result = process.wait_timeout_with_output(
+            CAPABILITIES_DEADLINE,
+            CAPABILITIES_TERMINATION_GRACE,
+            || false,
+            |chunk| match chunk.stream {
+                ProcessStream::Stdout => {
+                    let remaining = MAX_CAPABILITIES_OUTPUT_BYTES.saturating_sub(stdout.len());
+                    let accepted = chunk.bytes.len().min(remaining);
+                    stdout.extend_from_slice(&chunk.bytes[..accepted]);
+                    stdout_too_large |= accepted < chunk.bytes.len();
+                }
+                ProcessStream::Stderr => stderr.push(&chunk.bytes),
+            },
+            || {},
+        );
+        let stderr = non_empty(stderr.finish());
+        let output = output_result.map_err(|_| {
+            self.capabilities_error_with_stderr("could not wait for command", stderr.clone())
+        })?;
 
         if output.timed_out {
-            return Err(self.capabilities_error("capability discovery timed out"));
+            return Err(
+                self.capabilities_error_with_stderr("capability discovery timed out", stderr)
+            );
         }
         if output.exit != ChildExit::Code(0) {
-            return Err(self.capabilities_error("command failed"));
+            return Err(self.capabilities_error_with_stderr("command failed", stderr));
         }
         if stdout_too_large {
-            return Err(self.capabilities_error("capability document exceeded 64 KiB"));
+            return Err(
+                self.capabilities_error_with_stderr("capability document exceeded 64 KiB", stderr)
+            );
         }
         ExecutorCapabilities::parse(&stdout)
-            .map_err(|_| self.capabilities_error("invalid capability document"))
+            .map_err(|_| self.capabilities_error_with_stderr("invalid capability document", stderr))
+    }
+
+    /// Discover capabilities and report probe failures with bounded, redacted
+    /// local diagnostics. Repeated failures are summarized until recovery.
+    pub fn discover_capabilities_reported(
+        &self,
+        failures: &FailureReporter,
+    ) -> ExecutorCapabilities {
+        let path = self.diagnostic_identity();
+        match self.discover_capabilities() {
+            Ok(capabilities) => {
+                if let Some(reason) = capabilities.discovery_error.as_deref() {
+                    let secret_forms = capability_redaction_forms(&self.argv);
+                    let reason = redact_with_forms(reason, &secret_forms);
+                    let reason = crate::diagnostic::format_bounded_diagnostic(
+                        &reason,
+                        crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+                        crate::diagnostic::KeepPart::Suffix,
+                    );
+                    let signature = format!("{}: {reason}", self.config_source());
+                    self.log_capability_failure(failures, &path, &signature, &reason, None);
+                } else {
+                    self.log_capability_recovery(failures, &path);
+                    tracing::debug!(
+                        transport = self.config_source(),
+                        harnesses = ?capabilities.harnesses.keys().collect::<Vec<_>>(),
+                        "executor capabilities discovered"
+                    );
+                }
+                capabilities
+            }
+            Err(error) => {
+                let (_, reason) = error
+                    .capability_failure()
+                    .expect("capability discovery returns a capability error");
+                let diagnostic = error.diagnostic_stderr();
+                self.log_capability_failure(
+                    failures,
+                    &path,
+                    &error.failure_signature(),
+                    reason,
+                    diagnostic,
+                );
+                ExecutorCapabilities::unavailable(error.to_string())
+            }
+        }
+    }
+
+    fn log_capability_failure(
+        &self,
+        failures: &FailureReporter,
+        path: &str,
+        signature: &str,
+        reason: &str,
+        stderr: Option<&str>,
+    ) {
+        let diagnostic = stderr.map(|stderr| {
+            crate::diagnostic::format_bounded_diagnostic(
+                stderr,
+                crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+                crate::diagnostic::KeepPart::Suffix,
+            )
+        });
+        match failures.record_failure(path, signature) {
+            FailureDisposition::First => tracing::warn!(
+                transport = self.config_source(),
+                reason,
+                diagnostic = diagnostic.as_deref(),
+                "executor capability discovery failed"
+            ),
+            FailureDisposition::Repeated { failures } => tracing::debug!(
+                transport = self.config_source(),
+                reason,
+                failure_count = failures,
+                diagnostic = diagnostic.as_deref(),
+                "executor capability discovery still failing"
+            ),
+        }
+    }
+
+    fn log_capability_recovery(&self, failures: &FailureReporter, path: &str) {
+        if let Some(recovery) = failures.recovered(path) {
+            tracing::info!(
+                transport = self.config_source(),
+                failure_count = recovery.failures,
+                outage_seconds = recovery.outage.as_secs(),
+                "executor capability discovery recovered"
+            );
+        }
     }
 
     fn capabilities_error(&self, reason: &'static str) -> ExecutorTransportError {
+        self.capabilities_error_with_stderr(reason, None)
+    }
+
+    fn capabilities_error_with_stderr(
+        &self,
+        reason: &'static str,
+        stderr: Option<String>,
+    ) -> ExecutorTransportError {
         ExecutorTransportError::Capabilities {
             transport_name: self.capabilities_transport_name,
             reason,
+            stderr,
         }
     }
 
@@ -305,29 +430,32 @@ impl ExecutorTransport {
             let _ = process.terminate(termination_grace);
             return Err(ExecutorTransportError::Start(error));
         }
-        let mut stderr = BoundedStderr::new(&redaction_request);
-        let output = process
-            .wait_timeout_with_output_or_shutdown(
-                execution_deadline.saturating_duration_since(Instant::now()),
-                termination_grace,
-                is_cancelled,
-                is_interrupted,
-                |chunk| match chunk.stream {
-                    ProcessStream::Stdout => on_stdout(&chunk.bytes),
-                    ProcessStream::Stderr => stderr.push(&chunk.bytes),
-                },
-                on_tick,
-            )
-            .map_err(|error| {
-                ExecutorTransportError::Wait(redact_text(&error.to_string(), &redaction_request))
-            })?;
+        let mut stderr = BoundedStderr::for_request(&redaction_request);
+        let output_result = process.wait_timeout_with_output_or_shutdown(
+            execution_deadline.saturating_duration_since(Instant::now()),
+            termination_grace,
+            is_cancelled,
+            is_interrupted,
+            |chunk| match chunk.stream {
+                ProcessStream::Stdout => on_stdout(&chunk.bytes),
+                ProcessStream::Stderr => stderr.push(&chunk.bytes),
+            },
+            on_tick,
+        );
+        let stderr = stderr.finish();
+        let output = output_result.map_err(|error| ExecutorTransportError::Wait {
+            error: redact_text(&error.to_string(), &redaction_request),
+            stderr: non_empty(stderr.clone()),
+        })?;
 
         if output.stdin_error.is_some()
             && !output.timed_out
             && !output.cancelled
             && !output.interrupted
         {
-            return Err(ExecutorTransportError::RequestDelivery);
+            return Err(ExecutorTransportError::RequestDelivery {
+                stderr: non_empty(stderr),
+            });
         }
 
         Ok(ExecutorOutput {
@@ -335,7 +463,7 @@ impl ExecutorTransport {
             timed_out: output.timed_out,
             cancelled: output.cancelled,
             interrupted: output.interrupted,
-            stderr: stderr.finish(),
+            stderr,
         })
     }
 }
@@ -553,8 +681,22 @@ fn secret_values(request: &ExecutionRequest) -> Vec<String> {
 }
 
 fn secret_forms(request: &ExecutionRequest) -> Vec<String> {
-    let mut forms = secret_values(request)
+    redaction_forms(secret_values(request))
+}
+
+fn capability_redaction_forms(argv: &[String]) -> Vec<String> {
+    let mut values = argv.iter().skip(1).cloned().collect::<Vec<_>>();
+    values.extend(env::vars_os().filter_map(|(name, value)| {
+        let name = name.to_string_lossy();
+        is_sensitive_environment_name(&name).then(|| value.to_string_lossy().into_owned())
+    }));
+    redaction_forms(values)
+}
+
+fn redaction_forms(values: Vec<String>) -> Vec<String> {
+    let mut forms = values
         .into_iter()
+        .filter(|value| !value.is_empty())
         .flat_map(|secret| {
             let escaped =
                 serde_json::to_string(&secret).expect("Rust strings always serialize to JSON");
@@ -572,23 +714,37 @@ fn secret_forms(request: &ExecutionRequest) -> Vec<String> {
 }
 
 fn redact_text(value: &str, request: &ExecutionRequest) -> String {
+    redact_with_forms(value, &secret_forms(request))
+}
+
+fn redact_with_forms(value: &str, forms: &[String]) -> String {
     let mut redacted = value.to_owned();
-    for secret in secret_forms(request) {
-        redacted = redacted.replace(&secret, "[REDACTED]");
+    for secret in forms {
+        if !secret.is_empty() {
+            redacted = redacted.replace(secret, "[REDACTED]");
+        }
     }
     redacted
 }
 
-struct BoundedStderr<'a> {
-    request: &'a ExecutionRequest,
+struct BoundedStderr {
+    secret_forms: Vec<String>,
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-impl<'a> BoundedStderr<'a> {
-    fn new(request: &'a ExecutionRequest) -> Self {
+impl BoundedStderr {
+    fn for_request(request: &ExecutionRequest) -> Self {
         Self {
-            request,
+            secret_forms: secret_forms(request),
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn new(secret_forms: Vec<String>) -> Self {
+        Self {
+            secret_forms,
             bytes: Vec::new(),
             truncated: false,
         }
@@ -603,14 +759,10 @@ impl<'a> BoundedStderr<'a> {
 
     fn finish(self) -> String {
         let mut diagnostic = String::from_utf8_lossy(&self.bytes).into_owned();
-        diagnostic = redact_text(&diagnostic, self.request);
+        diagnostic = redact_with_forms(&diagnostic, &self.secret_forms);
         let truncated = self.truncated || diagnostic.len() > MAX_STDERR_DIAGNOSTIC_BYTES;
         if truncated {
-            let longest_secret = secret_forms(self.request)
-                .iter()
-                .map(String::len)
-                .max()
-                .unwrap_or(0);
+            let longest_secret = self.secret_forms.iter().map(String::len).max().unwrap_or(0);
             let end = if self.truncated {
                 diagnostic.len().saturating_sub(longest_secret)
             } else {
@@ -624,6 +776,17 @@ impl<'a> BoundedStderr<'a> {
         }
         diagnostic
     }
+}
+
+fn non_empty(diagnostic: String) -> Option<String> {
+    (!diagnostic.trim().is_empty()).then_some(diagnostic)
+}
+
+fn is_sensitive_environment_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
+        .iter()
+        .any(|marker| name.contains(marker))
 }
 
 fn previous_char_boundary(value: &str, mut index: usize) -> usize {
@@ -643,12 +806,54 @@ pub enum ExecutorTransportError {
     RequestSerialization,
     Spawn(String),
     Start(String),
-    RequestDelivery,
-    Wait(String),
+    RequestDelivery {
+        stderr: Option<String>,
+    },
+    Wait {
+        error: String,
+        stderr: Option<String>,
+    },
     Capabilities {
         transport_name: &'static str,
         reason: &'static str,
+        stderr: Option<String>,
     },
+}
+
+impl ExecutorTransportError {
+    /// Bounded, redacted stderr captured before a transport failure, when any.
+    pub fn diagnostic_stderr(&self) -> Option<&str> {
+        match self {
+            Self::RequestDelivery { stderr }
+            | Self::Wait { stderr, .. }
+            | Self::Capabilities { stderr, .. } => stderr.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Stable source and reason for suppressing repeated capability failures.
+    pub fn failure_signature(&self) -> String {
+        match self {
+            Self::Capabilities {
+                transport_name,
+                reason,
+                ..
+            } => format!("{transport_name}: {reason}"),
+            _ => self.to_string(),
+        }
+    }
+
+    /// Configuration source and sanitized failure reason for capability logs.
+    pub fn capability_failure(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Capabilities {
+                transport_name,
+                reason,
+                ..
+            } => Some((*transport_name, *reason)),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ExecutorTransportError {
@@ -660,13 +865,14 @@ impl fmt::Display for ExecutorTransportError {
             Self::RequestSerialization => f.write_str("could not serialize executor request"),
             Self::Spawn(error) => write!(f, "could not start executor transport: {error}"),
             Self::Start(error) => write!(f, "could not initialize executor transport: {error}"),
-            Self::RequestDelivery => {
+            Self::RequestDelivery { .. } => {
                 f.write_str("executor closed stdin before receiving the complete request")
             }
-            Self::Wait(error) => write!(f, "could not wait for executor transport: {error}"),
+            Self::Wait { error, .. } => write!(f, "could not wait for executor transport: {error}"),
             Self::Capabilities {
                 transport_name,
                 reason,
+                ..
             } => write!(
                 f,
                 "executor capabilities unavailable using {transport_name}: {reason}"
@@ -679,15 +885,61 @@ impl Error for ExecutorTransportError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionRequest, safe_executor_environment};
+    use super::{ExecutionRequest, ExecutorTransport, safe_executor_environment};
+    use crate::logging::FailureReporter;
+    use crate::logging::test_support::capture_events;
     use std::ffi::OsString;
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_document_discovery_errors_are_warned_locally() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-capability-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary directory");
+        let command = directory.join("capability-command");
+        std::fs::write(
+            &command,
+            r##"#!/bin/sh
+printf '%s\n' '{"version":1,"harnesses":{},"discovery_error":"Codex version probe failed"}'
+"##,
+        )
+        .expect("write capability command");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
+            .expect("make capability command executable");
+        let transport =
+            ExecutorTransport::new(vec![command.to_string_lossy().into_owned()], &directory);
+        let reporter = FailureReporter::default();
+
+        let (capabilities, events) = {
+            let mut capabilities = None;
+            let events = capture_events(|| {
+                capabilities = Some(transport.discover_capabilities_reported(&reporter));
+            });
+            (capabilities.expect("discover capability document"), events)
+        };
+
+        assert!(capabilities.discovery_error.is_some());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert!(events[0].fields.contains("Codex version probe failed"));
+        assert!(
+            events[0]
+                .fields
+                .contains("executor capability discovery failed")
+        );
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
 
     #[test]
     fn review_debug_escaped_stderr_secret_is_redacted() {
         let mut request = request();
         request.assignment.env[0].value = "prefix\u{8}suffix".to_owned();
         let diagnostic = format!("{:?}", request.assignment.env[0].value);
-        let mut stderr = super::BoundedStderr::new(&request);
+        let mut stderr = super::BoundedStderr::for_request(&request);
         stderr.push(diagnostic.as_bytes());
         let diagnostic = stderr.finish();
         assert!(
@@ -704,7 +956,7 @@ mod tests {
         let mut output = vec![b'x'; super::MAX_STDERR_DIAGNOSTIC_BYTES - 200];
         output.extend_from_slice(debug_secret.as_bytes());
 
-        let mut stderr = super::BoundedStderr::new(&request);
+        let mut stderr = super::BoundedStderr::for_request(&request);
         stderr.push(&output);
         let diagnostic = stderr.finish();
         assert!(diagnostic.contains(super::STDERR_TRUNCATION_MARKER));

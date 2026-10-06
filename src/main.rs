@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -192,6 +192,8 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
         tines_runner_rs::executor_transport::ExecutorTransport::for_capabilities(&config);
     let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
     let boot_id = poller.state().instance_id().to_owned();
+    let failure_reporter = poller.state().failure_reporter();
+    let last_logged_concurrency = Cell::new(config.max_concurrent as u32);
     tracing::info!(instance_id = %boot_id, "runner poll loop started");
     let workers = RefCell::new(BTreeMap::<String, AssignmentWorker>::new());
     let fatal_error = Arc::new(Mutex::new(None::<String>));
@@ -212,14 +214,14 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                 } else {
                     state.acknowledge_cancellation(request.run_id.clone(), request.token.clone());
                 }
-                tracing::warn!(run_id = %request.run_id, "supervisor requested run cancellation");
+                tracing::info!(run_id = %request.run_id, "supervisor requested run cancellation");
             }
             for run_id in &response.cancels {
                 canceled_ids.insert(run_id.clone());
                 if let Some(worker) = workers.borrow().get(run_id) {
                     worker.cancellation.cancel();
                 }
-                tracing::warn!(run_id, "supervisor settled run; stopping local work without finish reporting");
+                tracing::info!(run_id, "supervisor settled run; stopping local work without finish reporting");
             }
 
             let force_capability_refresh = response
@@ -239,7 +241,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                     continue;
                 }
                 if state.owns_run(&run_id) {
-                    tracing::info!(run_id, "duplicate assignment delivery ignored because the run is already owned");
+                    tracing::debug!(run_id, "duplicate assignment delivery ignored because the run is already owned");
                     continue;
                 }
                 if shutdown.is_requested() {
@@ -250,7 +252,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                 match state.admit_assignment(run_id.clone()) {
                     tines_runner_rs::poll::AssignmentAdmission::Accepted => {}
                     tines_runner_rs::poll::AssignmentAdmission::AlreadyOwned => {
-                        tracing::info!(run_id, "duplicate assignment delivery ignored because the run is already owned");
+                        tracing::debug!(run_id, "duplicate assignment delivery ignored because the run is already owned");
                         continue;
                     }
                     tines_runner_rs::poll::AssignmentAdmission::AtCapacity => {
@@ -271,6 +273,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                 let worker_default_capabilities_transport =
                     default_capabilities_transport.clone();
                 let worker_capabilities = capabilities.clone();
+                let worker_failure_reporter = failure_reporter.clone();
                 let worker_assignment = assignment.clone();
                 let worker_shutdown = shutdown.clone();
                 let worker_active_runs = active_runs.clone();
@@ -281,7 +284,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                             &worker_shutdown,
                             &worker_active_runs,
                         );
-                        tines_runner_rs::assignment_worker::run_assignment(
+                        tines_runner_rs::assignment_worker::run_assignment_with_reporter(
                             &worker_config,
                             &worker_connection,
                             &worker_client,
@@ -289,6 +292,7 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                             run_logs,
                             &worker_default_capabilities_transport,
                             &worker_capabilities,
+                            &worker_failure_reporter,
                             &worker_cancellation,
                             &context,
                         )
@@ -311,13 +315,9 @@ fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            if let Some(control) = &response.concurrency_control {
-                tracing::info!(
-                    concurrency = state.effective_concurrency(),
-                    available = control.available,
-                    "runner concurrency policy updated"
-                );
-            }
+            let concurrency = state.effective_concurrency();
+            let previous = last_logged_concurrency.replace(concurrency);
+            tines_runner_rs::logging::log_effective_concurrency_change(previous, concurrency);
 
             reap_completed_workers(&workers, state, &fatal_error);
         },
