@@ -5,6 +5,7 @@ mod support {
 }
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,6 +117,31 @@ impl TestDirectory {
     }
 
     fn runner(&self, bootstrap_key: Option<&str>) -> RunnerProcess {
+        self.runner_for(
+            &self.path.join("config/tines-runner-rs/config.toml"),
+            None,
+            bootstrap_key,
+        )
+    }
+
+    fn runner_for(
+        &self,
+        config_path: &std::path::Path,
+        runner_id: Option<&str>,
+        bootstrap_key: Option<&str>,
+    ) -> RunnerProcess {
+        let mut command = self.runner_command(config_path, runner_id, bootstrap_key);
+        RunnerProcess {
+            child: command.spawn().expect("start runner daemon"),
+        }
+    }
+
+    fn runner_command(
+        &self,
+        config_path: &std::path::Path,
+        runner_id: Option<&str>,
+        bootstrap_key: Option<&str>,
+    ) -> Command {
         let config_home = self.path.join("config");
         let data_home = self.path.join("data");
         let runner_binary_directory = std::path::Path::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
@@ -127,9 +153,10 @@ impl TestDirectory {
         ));
         let search_path = std::env::join_paths(search_path).expect("build isolated PATH");
         let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
-        command
-            .arg("--config")
-            .arg(self.path.join("config/tines-runner-rs/config.toml"));
+        command.arg("--config").arg(config_path);
+        if let Some(runner_id) = runner_id {
+            command.args(["--runner", runner_id]);
+        }
         command
             .env("HOME", &self.path)
             .env("USERPROFILE", &self.path)
@@ -146,9 +173,7 @@ impl TestDirectory {
         if let Some(key) = bootstrap_key {
             command.env("TINES_API_KEY", key);
         }
-        RunnerProcess {
-            child: command.spawn().expect("start runner daemon"),
-        }
+        command
     }
 }
 
@@ -184,6 +209,33 @@ impl RunnerProcess {
             assert!(Instant::now() < deadline, "runner process did not exit");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_with_output(mut self, timeout: Duration) -> std::process::Output {
+        let status = self.wait(timeout);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = self.child.stdout.take() {
+            pipe.read_to_end(&mut stdout).expect("read runner stdout");
+        }
+        if let Some(mut pipe) = self.child.stderr.take() {
+            pipe.read_to_end(&mut stderr).expect("read runner stderr");
+        }
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn assert_running(&mut self) {
+        assert!(
+            self.child
+                .try_wait()
+                .expect("poll runner process")
+                .is_none(),
+            "runner process exited unexpectedly"
+        );
     }
 
     fn kill_now(&mut self) -> ExitStatus {
@@ -1181,6 +1233,256 @@ fn restart_recovers_a_crashed_run_before_polling_with_empty_ownership() {
         "recovery leaves reconciliation to Tines"
     );
     stop_gracefully(&fake, &mut restarted);
+}
+
+#[test]
+fn duplicate_daemon_cannot_recover_a_live_registration_or_start_from_credential_alias() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    let server_url = format!("{}/tines", fake.url());
+    directory.configure(&server_url, &stub, 1, false);
+    let run_id = "arun_duplicate_daemon";
+    let control = directory.path.join("control");
+    fs::write(
+        control.join(format!("{run_id}.child")),
+        "keep transport open",
+    )
+    .expect("configure executor descendant");
+    directory.write_events(
+        run_id,
+        [json!({"version":1,"type":"log","stream":"system","message":"active executor must remain untouched while duplicate startup is rejected"})],
+    );
+    fake.route_issue("fake-tines-integration", assignment(run_id, 5, Vec::new()));
+
+    let mut first = directory.runner(Some("fake-bootstrap-key"));
+    let child_pid_file = control.join(format!("{run_id}.pid"));
+    wait_for_file(&child_pid_file, Duration::from_secs(10));
+    let child_pid = fs::read_to_string(&child_pid_file)
+        .expect("read executor descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("parse executor descendant PID");
+    let active_runs_path = directory
+        .credentials_path()
+        .with_file_name("active-runs.json");
+    let transport_identity =
+        wait_for_process_identity(&active_runs_path, run_id, Duration::from_secs(10));
+    let transport_pid = transport_identity["process_id"]
+        .as_u64()
+        .expect("persisted executor transport process ID") as u32;
+    wait_for_run_log(&fake, run_id, "active executor must remain untouched");
+    let original_state = fs::read(&active_runs_path).expect("read live active-run state");
+    let first_instance = poll_requests(&fake.requests())
+        .iter()
+        .find_map(|request| request.json()["instance_id"].as_str().map(str::to_owned))
+        .expect("first daemon poll instance ID");
+
+    let config_path = directory.path.join("config/tines-runner-rs/config.toml");
+    let duplicate_config_path = directory.path.join("duplicate-config.toml");
+    let original_config = fs::read_to_string(&config_path).expect("read original runner config");
+    let trailing_slash_url = format!("{server_url}/");
+    let alternate_config = original_config.replace(
+        &format!("url = {server_url:?}"),
+        &format!("url = {trailing_slash_url:?}"),
+    );
+    assert_ne!(
+        alternate_config, original_config,
+        "replace the configured API URL"
+    );
+    fs::write(&duplicate_config_path, alternate_config)
+        .expect("write equivalent trailing-slash runner config");
+    let mut duplicate_command = directory.runner_command(&duplicate_config_path, None, None);
+    duplicate_command.stdout(Stdio::piped());
+    duplicate_command.stderr(Stdio::piped());
+    let duplicate = RunnerProcess {
+        child: duplicate_command.spawn().expect("start duplicate daemon"),
+    };
+    let output = duplicate.wait_with_output(Duration::from_secs(10));
+    assert!(
+        !output.status.success(),
+        "duplicate daemon must fail to start"
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("another local daemon already owns this runner registration"),
+        "duplicate startup should explain the ownership conflict: {diagnostic}"
+    );
+    assert_eq!(
+        fs::read(&active_runs_path).expect("read active-run state after duplicate startup"),
+        original_state,
+        "duplicate startup must not change the active-run state"
+    );
+    assert!(
+        is_process_running(transport_pid),
+        "executor transport remains live"
+    );
+    assert!(
+        is_process_running(child_pid),
+        "executor descendant remains live"
+    );
+    assert!(
+        poll_requests(&fake.requests())
+            .iter()
+            .all(|request| { request.json()["instance_id"] == first_instance }),
+        "a rejected daemon must not start polling"
+    );
+
+    let alias_credentials = directory.path.join("credential-alias/credentials.toml");
+    fs::create_dir_all(
+        alias_credentials
+            .parent()
+            .expect("alias credentials have a parent"),
+    )
+    .expect("create credential alias directory");
+    fs::copy(directory.credentials_path(), &alias_credentials)
+        .expect("copy runner credentials to an alias path");
+    let alias_config_path = directory.path.join("credential-alias/config.toml");
+    let alias_config = format!(
+        "[server]\nurl = {:?}\n[runner]\nname = \"fake-tines-integration\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\n",
+        trailing_slash_url,
+        executor(
+            &stub,
+            "alias",
+            &directory.path.join("events"),
+            &directory.path.join("captures"),
+            &directory.path.join("control")
+        ),
+        directory.workspace_parent(),
+        alias_credentials
+    );
+    fs::write(&alias_config_path, alias_config).expect("write alias config");
+    let mut alias_command = directory.runner_command(&alias_config_path, None, None);
+    alias_command.stdout(Stdio::piped());
+    alias_command.stderr(Stdio::piped());
+    let alias = RunnerProcess {
+        child: alias_command
+            .spawn()
+            .expect("start daemon with credential alias"),
+    };
+    let output = alias.wait_with_output(Duration::from_secs(10));
+    assert!(
+        !output.status.success(),
+        "credential alias must share ownership"
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("another local daemon already owns this runner registration"),
+        "credential alias startup should explain the ownership conflict: {diagnostic}"
+    );
+    assert_eq!(
+        fs::read(&active_runs_path).expect("read active-run state after alias startup"),
+        original_state,
+        "credential alias startup must not change the active-run state"
+    );
+    assert!(
+        is_process_running(transport_pid),
+        "executor transport remains live"
+    );
+    assert!(
+        is_process_running(child_pid),
+        "executor descendant remains live"
+    );
+    assert!(
+        poll_requests(&fake.requests())
+            .iter()
+            .all(|request| { request.json()["instance_id"] == first_instance }),
+        "a credential alias must not start polling"
+    );
+
+    stop_gracefully(&fake, &mut first);
+}
+
+#[test]
+fn distinct_named_runner_registrations_can_poll_concurrently() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    let config_path = directory.path.join("shared-runners.toml");
+    let credentials_codex = directory.path.join("codex/credentials.toml");
+    let credentials_antigravity = directory.path.join("antigravity/credentials.toml");
+    let events = directory.path.join("events");
+    let captures = directory.path.join("captures");
+    let control = directory.path.join("control");
+    for path in [&events, &captures, &control] {
+        fs::create_dir_all(path).expect("create named-runner fixture directory");
+    }
+    let codex_executor = executor(&stub, "codex", &events, &captures, &control);
+    let antigravity_executor = executor(&stub, "antigravity", &events, &captures, &control);
+    let config = format!(
+        "[server]\nurl = {:?}\n\n[runners.codex]\nname = \"shared-codex\"\ncredentials_file = {:?}\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 2\npoll_interval_seconds = 1\n\n[runners.antigravity]\nname = \"shared-antigravity\"\ncredentials_file = {:?}\nrunner_type = \"custom\"\ncustom_command = [\"antigravity\"]\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 4\npoll_interval_seconds = 1\n",
+        fake.url(),
+        credentials_codex,
+        codex_executor,
+        directory.workspace_parent(),
+        credentials_antigravity,
+        antigravity_executor,
+        directory.workspace_parent()
+    );
+    fs::write(&config_path, config).expect("write shared named-runner config");
+
+    let mut codex = directory.runner_for(&config_path, Some("codex"), Some("fake-bootstrap-key"));
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        poll_requests(requests)
+            .iter()
+            .any(|request| request.target.contains("rnr_fake_tines_1"))
+    });
+    let mut antigravity = directory.runner_for(
+        &config_path,
+        Some("antigravity"),
+        Some("fake-bootstrap-key"),
+    );
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        let registrations = requests
+            .iter()
+            .filter(|request| request.target == "/api/v1/runners/register")
+            .collect::<Vec<_>>();
+        let poll_targets = poll_requests(requests)
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        registrations.len() >= 2 && poll_targets.len() >= 2
+    });
+    codex.assert_running();
+    antigravity.assert_running();
+
+    let registrations = fake
+        .requests()
+        .into_iter()
+        .filter(|request| request.target == "/api/v1/runners/register")
+        .map(|request| request.json())
+        .collect::<Vec<_>>();
+    assert!(
+        registrations
+            .iter()
+            .any(|body| { body["name"] == "shared-codex" && body["max_concurrent"] == 2 })
+    );
+    assert!(
+        registrations
+            .iter()
+            .any(|body| { body["name"] == "shared-antigravity" && body["max_concurrent"] == 4 })
+    );
+    let requests = fake.requests();
+    let poll_targets = poll_requests(&requests)
+        .iter()
+        .map(|request| request.target.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        poll_targets.len(),
+        2,
+        "each registration polls independently"
+    );
+
+    stop_gracefully(&fake, &mut codex);
+    stop_gracefully(&fake, &mut antigravity);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! TOML configuration and assignment-specific execution policy.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 /// The harness types supported by the runner.
@@ -63,6 +65,8 @@ pub struct WorkspaceRetention {
 /// Non-secret runner configuration after parsing and daemon-side path expansion.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Stable local identifier used to select this runner from a shared config.
+    pub local_id: String,
     pub server_url: Url,
     pub runner_name: String,
     pub runner_type: RunnerType,
@@ -86,6 +90,7 @@ pub struct Config {
     pub allow_remote_concurrency: bool,
     pub poll_interval: Duration,
     pub credentials_file: PathBuf,
+    active_runs_file: PathBuf,
     pub workspace_retention: WorkspaceRetention,
     overrides: Vec<ConfigOverride>,
 }
@@ -166,14 +171,27 @@ impl Config {
         self.legacy_workspace_roots.clone()
     }
 
+    /// Return the persisted active-run state file for this selected runner.
+    pub fn active_runs_file(&self) -> &Path {
+        &self.active_runs_file
+    }
+
     /// Load configuration from a file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::load_for_runner(path, None)
+    }
+
+    /// Load the selected runner from a shared config file.
+    pub fn load_for_runner(
+        path: impl AsRef<Path>,
+        runner_id: Option<&str>,
+    ) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml_str(&contents).map_err(|error| match error {
+        Self::from_toml_str_for_runner(&contents, runner_id).map_err(|error| match error {
             ConfigError::Parse { source, .. } => ConfigError::Parse {
                 path: Some(path.to_path_buf()),
                 source,
@@ -185,7 +203,15 @@ impl Config {
     /// Parse configuration TOML and expand path settings using the current
     /// home and platform/XDG directories.
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
-        Self::from_toml_str_with_defaults(contents, default_paths()?)
+        Self::from_toml_str_for_runner(contents, None)
+    }
+
+    /// Parse configuration TOML and select one named runner definition.
+    pub fn from_toml_str_for_runner(
+        contents: &str,
+        runner_id: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        Self::from_toml_str_with_defaults_and_runner(contents, default_paths()?, runner_id)
     }
 
     /// Resolve all matching overrides in declaration order.
@@ -252,9 +278,18 @@ impl Config {
         }
     }
 
+    #[cfg(test)]
     fn from_toml_str_with_defaults(
         contents: &str,
         defaults: DefaultPaths,
+    ) -> Result<Self, ConfigError> {
+        Self::from_toml_str_with_defaults_and_runner(contents, defaults, None)
+    }
+
+    fn from_toml_str_with_defaults_and_runner(
+        contents: &str,
+        defaults: DefaultPaths,
+        runner_id: Option<&str>,
     ) -> Result<Self, ConfigError> {
         let raw: RawConfig =
             toml::from_str(contents).map_err(|source| ConfigError::Parse { path: None, source })?;
@@ -271,23 +306,35 @@ impl Config {
             ));
         }
 
-        let runner_name = raw
-            .runner
+        let raw_storage = raw.storage;
+        let (local_id, runner, raw_overrides, credentials_path) = select_runner(
+            raw.runner,
+            raw.runners,
+            raw.overrides,
+            raw_storage.credentials_file.clone(),
+            runner_id,
+            &defaults,
+        )?;
+        let scope = local_id
+            .as_deref()
+            .map(|id| format!("[runners.{id}]"))
+            .unwrap_or_else(|| "[runner]".to_owned());
+
+        let runner_name = runner
             .name
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.trim().is_empty())
-            .ok_or_else(|| ConfigError::Invalid("missing [runner].name".to_owned()))?;
+            .ok_or_else(|| ConfigError::Invalid(format!("missing {scope}.name")))?;
         let legacy_workspace_parent = expand_path(
-            raw.runner
+            runner
                 .workspace_parent
                 .as_deref()
                 .unwrap_or(&defaults.workspace_parent),
             &defaults.home,
         )?;
-        let workspace_parent = raw.runner.workspace_parent.clone();
+        let workspace_parent = runner.workspace_parent.clone();
         let mut legacy_workspace_roots = vec![legacy_workspace_parent];
-        for workspace_parent in raw
-            .overrides
+        for workspace_parent in raw_overrides
             .iter()
             .filter_map(|rule| rule.workspace_parent.as_deref())
         {
@@ -297,44 +344,42 @@ impl Config {
             }
         }
         let executor_cwd = resolve_executor_cwd(
-            raw.runner.executor_cwd.as_deref().ok_or_else(|| {
+            runner.executor_cwd.as_deref().ok_or_else(|| {
                 ConfigError::Invalid(
-                    "missing required [runner].executor_cwd; set the daemon-side working directory for the executor transport"
+                    format!("missing required {scope}.executor_cwd; set the daemon-side working directory for the executor transport")
                         .to_owned(),
                 )
             })?,
             &defaults.home,
         )?;
-        let credentials_file = expand_path(
-            raw.storage
-                .credentials_file
-                .as_deref()
-                .unwrap_or(&defaults.credentials_file),
-            &defaults.home,
-        )?;
+        let credentials_file = expand_path(&credentials_path, &defaults.home)?;
+        let active_runs_file = if local_id.is_some() {
+            named_active_runs_file(&credentials_file)
+        } else {
+            credentials_file.with_file_name("active-runs.json")
+        };
 
-        let max_concurrent = raw.runner.max_concurrent.unwrap_or(1);
+        let max_concurrent = runner.max_concurrent.unwrap_or(1);
         if max_concurrent == 0 {
-            return Err(ConfigError::Invalid(
-                "[runner].max_concurrent must be greater than zero".to_owned(),
-            ));
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.max_concurrent must be greater than zero"
+            )));
         }
-        let poll_interval_seconds = raw.runner.poll_interval_seconds.unwrap_or(15);
+        let poll_interval_seconds = runner.poll_interval_seconds.unwrap_or(15);
         if poll_interval_seconds == 0 {
-            return Err(ConfigError::Invalid(
-                "[runner].poll_interval_seconds must be greater than zero".to_owned(),
-            ));
+            return Err(ConfigError::Invalid(format!(
+                "{scope}.poll_interval_seconds must be greater than zero"
+            )));
         }
 
-        let keep_workspaces_for_hours = raw.storage.keep_workspaces_for_hours.unwrap_or(72);
-        let keep_workspaces_max = raw.storage.keep_workspaces_max.unwrap_or(20);
+        let keep_workspaces_for_hours = raw_storage.keep_workspaces_for_hours.unwrap_or(72);
+        let keep_workspaces_max = raw_storage.keep_workspaces_max.unwrap_or(20);
         let keep_workspaces_max_age_seconds = keep_workspaces_for_hours
             .checked_mul(60 * 60)
             .ok_or_else(|| {
                 ConfigError::Invalid("[storage].keep_workspaces_for_hours is too large".to_owned())
             })?;
-        let overrides = raw
-            .overrides
+        let overrides = raw_overrides
             .into_iter()
             .map(|rule| {
                 if rule.workspace_parent.is_none()
@@ -347,7 +392,7 @@ impl Config {
                     && rule.run_key_delivery.is_none()
                 {
                     return Err(ConfigError::Invalid(
-                        "each [[override]] must set at least one override value".to_owned(),
+                        "each runner override must set at least one override value".to_owned(),
                     ));
                 }
                 if let Some(command) = &rule.custom_command {
@@ -374,36 +419,177 @@ impl Config {
             .collect::<Result<Vec<_>, ConfigError>>()?;
 
         Ok(Self {
+            local_id: local_id.unwrap_or_else(|| "default".to_owned()),
             server_url,
             runner_name,
-            runner_type: raw.runner.runner_type.unwrap_or(RunnerType::Codex),
+            runner_type: runner.runner_type.unwrap_or(RunnerType::Codex),
             workspace_parent,
             legacy_workspace_roots,
-            executor: raw
-                .runner
+            executor: runner
                 .executor
                 .unwrap_or_else(|| vec!["tines-runner-rs".to_owned()]),
-            capabilities_executor: raw.runner.capabilities_executor,
-            custom_command: raw
-                .runner
+            capabilities_executor: runner.capabilities_executor,
+            custom_command: runner
                 .custom_command
                 .map(|command| validate_custom_command(&command).map(|()| command))
                 .transpose()?,
-            repository_checkout: raw.runner.repository_checkout.unwrap_or_default(),
-            run_key_delivery: raw.runner.run_key_delivery.unwrap_or_default(),
+            repository_checkout: runner.repository_checkout.unwrap_or_default(),
+            run_key_delivery: runner.run_key_delivery.unwrap_or_default(),
             executor_cwd,
             max_concurrent,
-            allow_remote_concurrency: raw.runner.allow_remote_concurrency,
+            allow_remote_concurrency: runner.allow_remote_concurrency,
             poll_interval: Duration::from_secs(poll_interval_seconds),
             credentials_file,
+            active_runs_file,
             workspace_retention: WorkspaceRetention {
-                mode: raw.storage.keep_workspaces.unwrap_or_default(),
+                mode: raw_storage.keep_workspaces.unwrap_or_default(),
                 max_age: Duration::from_secs(keep_workspaces_max_age_seconds),
                 max_count: keep_workspaces_max,
             },
             overrides,
         })
     }
+}
+
+fn select_runner(
+    legacy_runner: Option<RawRunner>,
+    mut runners: BTreeMap<String, RawRunner>,
+    legacy_overrides: Vec<RawOverride>,
+    legacy_credentials_file: Option<PathBuf>,
+    requested_id: Option<&str>,
+    defaults: &DefaultPaths,
+) -> Result<(Option<String>, RawRunner, Vec<RawOverride>, PathBuf), ConfigError> {
+    if !runners.is_empty() {
+        if legacy_runner.is_some() {
+            return Err(ConfigError::Invalid(
+                "use either [runner] or [runners.<id>] definitions, not both".to_owned(),
+            ));
+        }
+        if !legacy_overrides.is_empty() {
+            return Err(ConfigError::Invalid(
+                "put each assignment override under its runner as [[runners.<id>.override]]"
+                    .to_owned(),
+            ));
+        }
+        if legacy_credentials_file.is_some() {
+            return Err(ConfigError::Invalid(
+                "set credentials_file inside each [runners.<id>] definition".to_owned(),
+            ));
+        }
+
+        let names = runners.keys().cloned().collect::<Vec<_>>();
+        for id in &names {
+            if id.trim().is_empty() || id.trim() != id || id.chars().any(char::is_control) {
+                return Err(ConfigError::Invalid(format!(
+                    "invalid runner id {id:?}; IDs must be non-empty and contain no surrounding or control characters"
+                )));
+            }
+        }
+        let selected_id = match requested_id {
+            Some(id) if runners.contains_key(id) => id.to_owned(),
+            Some(id) => {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown runner id {id:?}; configured runner IDs: {}",
+                    names.join(", ")
+                )));
+            }
+            None if runners.len() == 1 => names[0].clone(),
+            None => {
+                return Err(ConfigError::Invalid(format!(
+                    "--runner <id> is required because this config defines multiple runners: {}",
+                    names.join(", ")
+                )));
+            }
+        };
+
+        let mut credential_owners = BTreeMap::<PathBuf, String>::new();
+        for (id, runner) in &runners {
+            let credentials_file = runner.credentials_file.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "missing required [runners.{id}].credentials_file; each runner must use its own credentials file"
+                ))
+            })?;
+            if credentials_file.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[runners.{id}].credentials_file must not be empty"
+                )));
+            }
+            let credentials_file = expand_path(credentials_file, &defaults.home)?;
+            let comparison_path = normalize_path_for_comparison(&credentials_file);
+            if let Some(other_id) = credential_owners.insert(comparison_path, id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "[runners.{other_id}].credentials_file and [runners.{id}].credentials_file resolve to the same path; each runner must use a distinct credentials file"
+                )));
+            }
+        }
+
+        let mut runner = runners
+            .remove(&selected_id)
+            .expect("selected runner was verified above");
+        let credentials_file = runner
+            .credentials_file
+            .clone()
+            .expect("all named runners were required to configure credentials_file");
+        let overrides = std::mem::take(&mut runner.overrides);
+        return Ok((Some(selected_id), runner, overrides, credentials_file));
+    }
+
+    if requested_id.is_some() {
+        return Err(ConfigError::Invalid(
+            "--runner can only be used with named [runners.<id>] definitions".to_owned(),
+        ));
+    }
+    let runner = legacy_runner.ok_or_else(|| {
+        ConfigError::Invalid("missing [runner] or [runners.<id>] definition".to_owned())
+    })?;
+    if !runner.overrides.is_empty() {
+        return Err(ConfigError::Invalid(
+            "assignment overrides must use top-level [[override]] with [runner]".to_owned(),
+        ));
+    }
+    if runner.credentials_file.is_some() && legacy_credentials_file.is_some() {
+        return Err(ConfigError::Invalid(
+            "set credentials_file in either [runner] or [storage], not both".to_owned(),
+        ));
+    }
+    let credentials_file = runner
+        .credentials_file
+        .clone()
+        .or(legacy_credentials_file)
+        .unwrap_or_else(|| defaults.credentials_file.clone());
+    Ok((None, runner, legacy_overrides, credentials_file))
+}
+
+fn normalize_path_for_comparison(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn named_active_runs_file(credentials_file: &Path) -> PathBuf {
+    let normalized_credentials = normalize_path_for_comparison(credentials_file);
+    let digest = Sha256::digest(normalized_credentials.to_string_lossy().as_bytes());
+    let suffix = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let parent = credentials_file.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("active-runs-{suffix}.json"))
 }
 
 /// Effective settings and the override entries that matched one assignment.
@@ -456,8 +642,9 @@ impl ConfigOverride {
 struct RawConfig {
     #[serde(default)]
     server: RawServer,
+    runner: Option<RawRunner>,
     #[serde(default)]
-    runner: RawRunner,
+    runners: BTreeMap<String, RawRunner>,
     #[serde(default)]
     storage: RawStorage,
     #[serde(default, rename = "override")]
@@ -474,6 +661,7 @@ struct RawServer {
 #[serde(deny_unknown_fields)]
 struct RawRunner {
     name: Option<String>,
+    credentials_file: Option<PathBuf>,
     runner_type: Option<RunnerType>,
     workspace_parent: Option<PathBuf>,
     executor: Option<Vec<String>>,
@@ -486,6 +674,8 @@ struct RawRunner {
     #[serde(default)]
     allow_remote_concurrency: bool,
     poll_interval_seconds: Option<u64>,
+    #[serde(default, rename = "override")]
+    overrides: Vec<RawOverride>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -608,7 +798,7 @@ fn default_paths_for(
 fn resolve_executor_cwd(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid(
-            "[runner].executor_cwd must not be empty".to_owned(),
+            "executor_cwd must not be empty".to_owned(),
         ));
     }
     let expanded = expand_path(path, home)?;
@@ -677,6 +867,155 @@ mod tests {
             "#
         );
         Config::from_toml_str_with_defaults(&contents, defaults()).unwrap()
+    }
+
+    #[test]
+    fn named_runners_are_selected_independently_from_one_config() {
+        let contents = r#"
+[server]
+url = "https://tines.example.test"
+
+[runners.codex]
+name = "workstation-codex"
+credentials_file = "/var/lib/tines/codex-credentials.toml"
+runner_type = "codex"
+executor = ["codex-executor"]
+capabilities_executor = ["codex-probe"]
+executor_cwd = "/srv/codex"
+max_concurrent = 2
+
+[[runners.codex.override]]
+project = "Payments"
+executor = ["payments-executor"]
+
+[runners.antigravity]
+name = "workstation-antigravity"
+credentials_file = "/var/lib/tines/antigravity-credentials.toml"
+runner_type = "custom"
+custom_command = ["antigravity"]
+executor = ["antigravity-executor"]
+capabilities_executor = ["antigravity-probe"]
+executor_cwd = "/srv/antigravity"
+max_concurrent = 4
+
+[[runners.antigravity.override]]
+state = "Review"
+executor = ["antigravity-review-executor"]
+"#;
+
+        let codex =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("codex"))
+                .unwrap();
+        assert_eq!(codex.local_id, "codex");
+        assert_eq!(codex.runner_name, "workstation-codex");
+        assert_eq!(codex.runner_type, RunnerType::Codex);
+        assert_eq!(
+            codex.credentials_file,
+            PathBuf::from("/var/lib/tines/codex-credentials.toml")
+        );
+        assert_eq!(codex.executor, ["codex-executor".to_owned()]);
+        assert_eq!(
+            codex.capabilities_executor,
+            Some(vec!["codex-probe".to_owned()])
+        );
+        assert_eq!(codex.executor_cwd, PathBuf::from("/srv/codex"));
+        assert_eq!(codex.max_concurrent, 2);
+        assert_eq!(
+            codex
+                .resolve(context("Payments", "Build", "Ready"))
+                .executor,
+            ["payments-executor".to_owned()]
+        );
+
+        let antigravity = Config::from_toml_str_with_defaults_and_runner(
+            contents,
+            defaults(),
+            Some("antigravity"),
+        )
+        .unwrap();
+        assert_eq!(antigravity.local_id, "antigravity");
+        assert_eq!(antigravity.runner_name, "workstation-antigravity");
+        assert_eq!(antigravity.runner_type, RunnerType::Custom);
+        assert_eq!(
+            antigravity.credentials_file,
+            PathBuf::from("/var/lib/tines/antigravity-credentials.toml")
+        );
+        assert_eq!(antigravity.executor, ["antigravity-executor".to_owned()]);
+        assert_eq!(
+            antigravity.capabilities_executor,
+            Some(vec!["antigravity-probe".to_owned()])
+        );
+        assert_eq!(antigravity.executor_cwd, PathBuf::from("/srv/antigravity"));
+        assert_eq!(antigravity.max_concurrent, 4);
+        assert_eq!(
+            antigravity
+                .resolve(context("Payments", "Build", "Ready"))
+                .executor,
+            ["antigravity-executor".to_owned()]
+        );
+        assert_eq!(
+            antigravity
+                .resolve(context("Payments", "Build", "Review"))
+                .executor,
+            ["antigravity-review-executor".to_owned()]
+        );
+        assert_ne!(codex.active_runs_file(), antigravity.active_runs_file());
+        assert_ne!(
+            codex.active_runs_file().file_name(),
+            antigravity.active_runs_file().file_name()
+        );
+    }
+
+    #[test]
+    fn named_runner_selection_requires_a_known_id_for_multiple_definitions() {
+        let contents = r#"
+[server]
+url = "https://tines.example.test"
+[runners.codex]
+name = "codex"
+credentials_file = "/var/lib/tines/codex.toml"
+executor_cwd = "/srv/codex"
+[runners.antigravity]
+name = "antigravity"
+credentials_file = "/var/lib/tines/antigravity.toml"
+executor_cwd = "/srv/antigravity"
+"#;
+
+        let omitted = Config::from_toml_str_with_defaults_and_runner(contents, defaults(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(omitted.contains("--runner <id> is required"), "{omitted}");
+        let unknown =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("other"))
+                .unwrap_err()
+                .to_string();
+        assert!(unknown.contains("unknown runner id \"other\""), "{unknown}");
+        assert!(unknown.contains("antigravity, codex"), "{unknown}");
+    }
+
+    #[test]
+    fn named_runners_cannot_share_credentials_files() {
+        let contents = r#"
+[server]
+url = "https://tines.example.test"
+[runners.codex]
+name = "codex"
+credentials_file = "/var/lib/tines/credentials.toml"
+executor_cwd = "/srv/codex"
+[runners.antigravity]
+name = "antigravity"
+credentials_file = "/var/lib/tines/./credentials.toml"
+executor_cwd = "/srv/antigravity"
+"#;
+
+        let error =
+            Config::from_toml_str_with_defaults_and_runner(contents, defaults(), Some("codex"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("must use a distinct credentials file"),
+            "{error}"
+        );
     }
 
     #[test]

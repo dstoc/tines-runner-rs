@@ -10,8 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const RUNNER_ID: &str = "rnr_fake_tines";
-
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
     pub method: String,
@@ -47,7 +45,8 @@ struct RoutedAssignment {
 #[derive(Default)]
 struct State {
     requests: Vec<RecordedRequest>,
-    registered_runner_name: Option<String>,
+    runner_names: BTreeMap<String, String>,
+    next_runner_id: usize,
     routed_assignments: VecDeque<RoutedAssignment>,
     unexpected_requests: Vec<String>,
     poll_responses: VecDeque<(u16, Value)>,
@@ -224,18 +223,30 @@ struct Response {
 }
 
 fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
-    if request.method == "POST" && request.target == "/api/v1/runners/register" {
-        state.registered_runner_name = request.json()["name"].as_str().map(str::to_owned);
+    let target = api_target(&request.target);
+    if request.method == "POST" && target == "/api/v1/runners/register" {
+        state.next_runner_id += 1;
+        let runner_id = format!("rnr_fake_tines_{}", state.next_runner_id);
+        if let Some(name) = request.json()["name"].as_str() {
+            state
+                .runner_names
+                .insert(runner_id.clone(), name.to_owned());
+        }
         return response(
             201,
             json!({
-                "runner": {"id": RUNNER_ID},
+                "runner": {"id": runner_id},
                 "runner_token": "fake-runner-token"
             }),
         );
     }
 
-    if request.method == "POST" && request.target == format!("/api/v1/runners/{RUNNER_ID}/poll") {
+    if request.method == "POST"
+        && let Some(runner_id) = target
+            .strip_prefix("/api/v1/runners/")
+            .and_then(|target| target.strip_suffix("/poll"))
+        && let Some(registered_runner_name) = state.runner_names.get(runner_id)
+    {
         if request.body == b"{" {
             return response(
                 400,
@@ -246,11 +257,10 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
             state.failures.polls -= 1;
             return response(503, json!({"error": {"code": "unavailable"}}));
         }
-        let registered_runner_name = state.registered_runner_name.as_deref();
         if let Some(index) = state
             .routed_assignments
             .iter()
-            .position(|routed| registered_runner_name == Some(routed.runner_name.as_str()))
+            .position(|routed| registered_runner_name == &routed.runner_name)
         {
             let routed = state
                 .routed_assignments
@@ -284,8 +294,8 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         return response(status, body);
     }
 
-    if request.method == "GET" && request.target.starts_with("/api/v1/issues/") {
-        let issue_id = request.target.trim_start_matches("/api/v1/issues/");
+    if request.method == "GET" && target.starts_with("/api/v1/issues/") {
+        let issue_id = target.trim_start_matches("/api/v1/issues/");
         let expected_token = issue_id
             .strip_prefix("iss_")
             .map(|run_id| format!("Bearer issue-run-key-{run_id}"));
@@ -301,8 +311,8 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         );
     }
 
-    if request.method == "POST" && request.target.starts_with("/api/v1/runs/") {
-        let rest = request.target.trim_start_matches("/api/v1/runs/");
+    if request.method == "POST" && target.starts_with("/api/v1/runs/") {
+        let rest = target.trim_start_matches("/api/v1/runs/");
         if let Some(run_id) = rest.strip_suffix("/logs") {
             if state.failures.logs > 0 {
                 state.failures.logs -= 1;
@@ -394,6 +404,17 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<RecordedRequest> {
         headers,
         body: bytes[body_start..body_start + content_length].to_vec(),
     })
+}
+
+fn api_target(target: &str) -> &str {
+    let Some(path) = target.strip_prefix("/tines") else {
+        return target;
+    };
+    if path.is_empty() || path.starts_with('/') {
+        path
+    } else {
+        target
+    }
 }
 
 fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {

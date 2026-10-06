@@ -399,6 +399,19 @@ fn daemon_and_check_require_an_explicit_config_path() {
     }
 }
 
+#[test]
+fn selecting_a_runner_requires_an_explicit_config_path() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command.args(["--runner", "codex", "--check"]);
+    let output = command.output().expect("run without selected config path");
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        diagnostic.contains("--config <PATH> is required"),
+        "unexpected selection-without-config diagnostic: {diagnostic}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn execute_runs_harness_and_emits_one_terminal_protocol_result() {
@@ -751,6 +764,137 @@ fn explicit_configs_register_separate_runners_and_credentials() {
             credentials_path.is_file(),
             "selected config should save credentials to {}",
             credentials_path.display()
+        );
+    }
+}
+
+#[test]
+fn runner_flag_selects_each_definition_from_one_config_file() {
+    let directory = TestDirectory::new();
+    let config_path = directory.0.join("shared.toml");
+    let credentials = [
+        directory.0.join("codex").join("credentials.toml"),
+        directory.0.join("antigravity").join("credentials.toml"),
+    ];
+
+    for (runner_id, runner_name, credential_path) in [
+        ("codex", "shared-codex", &credentials[0]),
+        ("antigravity", "shared-antigravity", &credentials[1]),
+    ] {
+        let (server_url, server) = registration_server();
+        fs::write(
+            &config_path,
+            format!(
+                r#"[server]
+url = {server_url:?}
+
+[runners.codex]
+name = "shared-codex"
+credentials_file = {:?}
+executor_cwd = "~"
+max_concurrent = 2
+
+[runners.antigravity]
+name = "shared-antigravity"
+credentials_file = {:?}
+runner_type = "custom"
+custom_command = ["antigravity"]
+executor_cwd = "~"
+max_concurrent = 4
+"#,
+                credentials[0], credentials[1]
+            ),
+        )
+        .expect("write shared named-runner config");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+        command.args([
+            "--config",
+            config_path.to_str().expect("config path should be UTF-8"),
+            "--runner",
+            runner_id,
+            "--check",
+        ]);
+        directory.configure_command(&mut command);
+        let output = command
+            .env("TINES_API_KEY", "bootstrap-key-test")
+            .output()
+            .expect("check selected named runner");
+        let requests = server.join().expect("registration and token check");
+
+        assert!(
+            output.status.success(),
+            "--runner {runner_id} should select its definition: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, body) = requests[0]
+            .split_once("\r\n\r\n")
+            .expect("registration request headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("registration JSON");
+        assert_eq!(body["name"], runner_name);
+        assert_eq!(
+            body["max_concurrent"],
+            if runner_id == "codex" { 2 } else { 4 }
+        );
+        assert_eq!(
+            body["harness"],
+            if runner_id == "codex" {
+                "codex"
+            } else {
+                "custom"
+            }
+        );
+        assert!(credential_path.is_file());
+    }
+
+    assert_ne!(credentials[0], credentials[1]);
+}
+
+#[test]
+fn multiple_named_runners_require_a_valid_runner_id() {
+    let directory = TestDirectory::new();
+    let config_path = directory.0.join("shared.toml");
+    fs::write(
+        &config_path,
+        r#"[server]
+url = "https://tines.example.test"
+[runners.codex]
+name = "codex"
+credentials_file = "/tmp/codex-credentials.toml"
+executor_cwd = "~"
+[runners.antigravity]
+name = "antigravity"
+credentials_file = "/tmp/antigravity-credentials.toml"
+executor_cwd = "~"
+"#,
+    )
+    .expect("write shared named-runner config");
+
+    for (runner_id, expected) in [
+        (None, "--runner <id> is required"),
+        (Some("unknown"), "unknown runner id"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+        command.arg("--config").arg(&config_path);
+        if let Some(runner_id) = runner_id {
+            command.args(["--runner", runner_id]);
+        }
+        command.arg("--check");
+        directory.configure_command(&mut command);
+        let output = command.output().expect("run invalid runner selection");
+        let diagnostic = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success());
+        assert!(
+            diagnostic.contains(expected),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("connection failed"),
+            "selection errors should happen before network requests: {diagnostic}"
         );
     }
 }

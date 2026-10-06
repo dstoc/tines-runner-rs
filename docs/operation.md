@@ -1,7 +1,7 @@
 # Operating tines-runner-rs
 
 This guide covers installation, setup, normal operation, and common failures.
-The runner supports the `codex` harness.
+The runner supports the Codex harness and a generic custom command harness.
 
 ## How execution is split
 
@@ -94,8 +94,9 @@ installing or deploying a new binary and restarting the service.
 
 Save the runner configuration at a path you choose, such as
 `/etc/tines-runner-rs/config.toml`. The runner does not search for a
-configuration file. Pass its path with `--config` when you run the daemon or
-`--check`.
+configuration file. Pass its path with `--config` when you run the daemon,
+`--check`, or `register`. When the file defines multiple runners, also pass
+`--runner <id>`.
 
 The default workspace directories are:
 
@@ -111,13 +112,18 @@ executor uses the equivalent directories under `%USERPROFILE%\AppData\Roaming`
 and `%USERPROFILE%\AppData\Local`. XDG directory variables are used only when
 they contain absolute paths.
 
-The following example shows the supported settings and their defaults:
+The config can define more than one named runner. The table name is its stable
+local ID. Select that ID with `--runner` when more than one definition exists.
+Each runner needs a distinct credentials file and keeps its executor settings
+and assignment overrides separate. A daemon process has its own capability
+cache and persisted active-run state.
 
 ```toml
 [server]
 url = "https://tines.tbuckley.dev"
 
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 name = "workstation-codex"
 runner_type = "codex"
 workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
@@ -128,18 +134,20 @@ allow_remote_concurrency = false
 poll_interval_seconds = 15
 
 [storage]
-credentials_file = "~/.config/tines-runner-rs/credentials.toml"
 keep_workspaces = "never"
 keep_workspaces_for_hours = 72
 keep_workspaces_max = 20
 ```
 
-`[server].url`, `[runner].name`, and `[runner].executor_cwd` are required. The
-server URL must use HTTP or HTTPS. The only supported `runner_type` is
-`codex`. `executor_cwd` has no default. The runner expands `~` and resolves a
-relative path under the daemon account's home directory. The runner registers
-with Tines using the configured name and concurrency. Tines and this local
-configuration must agree about which work the runner can accept.
+`[server].url`, `[runners.codex].name`, `[runners.codex].credentials_file`,
+and `[runners.codex].executor_cwd` are required. The server URL must use HTTP
+or HTTPS. The supported `runner_type` values are `codex` and `custom`.
+`executor_cwd` has no default. The runner expands `~` and resolves a relative
+path under the daemon account's home directory. The runner registers with
+Tines using the configured name and concurrency. Tines and this local
+configuration must agree about which work the runner can accept. If a config
+defines multiple runners, pass `--runner <id>` to `--check`, `register`, and
+daemon commands.
 
 `max_concurrent` must be between 1 and 100. `poll_interval_seconds` must be
 greater than zero. A configured workspace parent must be writable in the
@@ -147,7 +155,7 @@ executor environment.
 
 ### Choose an executor environment
 
-Set `[runner].executor_cwd` in the base configuration. It is required and has
+Set `[runners.codex].executor_cwd` in the base configuration. It is required and has
 no implicit default. An override can replace its value for matching
 assignments. The daemon expands `~` and resolves a relative value under the
 daemon account's home directory, then uses that path as the working directory
@@ -159,7 +167,8 @@ Install `tines-runner-rs`, Codex CLI, and Git for the daemon account, and make
 Codex and Git credentials available to that account:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 runner_type = "codex"
 executor = ["tines-runner-rs"]
 executor_cwd = "~"
@@ -172,7 +181,8 @@ there as well. If you retain executor workspaces, mount persistent storage at
 the workspace parent, as in this example:
 
 ```toml
-[runner]
+[runners.codex]
+credentials_file = "/var/lib/tines-runner-rs/codex/credentials.toml"
 runner_type = "codex"
 executor = [
   "docker", "run", "--rm", "-i",
@@ -207,7 +217,7 @@ executor working directory for assignments that match its project, workflow,
 and state names:
 
 ```toml
-[[override]]
+[[runners.codex.override]]
 project = "Payments"
 workflow = "Implementation"
 state = "Ready"
@@ -255,7 +265,7 @@ runner ID and long-lived runner token in `credentials.toml`. The user API key
 is not saved. Do not put it in `config.toml`, a service definition, or a
 command-line argument.
 
-Run the first check as the same operating-system account that will run the
+Run each first check as the same operating-system account that will run the
 daemon. The following Bash or Zsh commands prompt for the key without adding
 it to shell history:
 
@@ -264,7 +274,8 @@ printf 'Tines API key: '
 IFS= read -r -s TINES_API_KEY
 printf '\n'
 export TINES_API_KEY
-tines-runner-rs --config /etc/tines-runner-rs/config.toml --check
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex --check
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity --check
 unset TINES_API_KEY
 ```
 
@@ -274,7 +285,8 @@ later starts, `--check` validates the existing token and does not need
 `TINES_API_KEY`. If the check succeeds, start the daemon:
 
 ```sh
-tines-runner-rs --config /etc/tines-runner-rs/config.toml
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex
+tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity
 ```
 
 The daemon reads its configuration and credentials at startup. Restart it
@@ -289,16 +301,19 @@ work.
 
 ### Credentials file
 
-The default credentials file is in the platform configuration directory:
+Legacy single-runner `[runner]` configs use a default credentials file in the
+platform configuration directory:
 
 - Linux and other Unix: `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs/credentials.toml`.
 - macOS: `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs/credentials.toml`.
 - Windows: `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs/credentials.toml` (or `%USERPROFILE%\AppData\Roaming\tines-runner-rs\credentials.toml` if `APPDATA` is unset).
 
-The runner uses `XDG_CONFIG_HOME` only when it is absolute. It affects the
-default credentials location; it does not select the runner configuration
-file. Set `[storage].credentials_file` to use another path. The runner creates
-this file after registration. Its contents have this form:
+Named `[runners.<id>]` definitions must set their own
+`credentials_file`. Use a distinct path for each definition. The runner uses
+`XDG_CONFIG_HOME` only when it is absolute. It affects the legacy default
+credentials location; it does not select the runner configuration file. The
+runner creates each credentials file after registration. Its contents have
+this form:
 
 ```toml
 runner_id = "rnr_example"
@@ -319,7 +334,8 @@ Use `register` when another service or operator manages the runner credential
 file. The command requires an explicit config and writable output path. It
 registers the runner with `TINES_API_KEY`, then writes the returned runner ID
 and token to that output. It does not read or write the config's
-`[storage].credentials_file`.
+`[runners.codex].credentials_file`. Pass `--runner <id>` to select a
+registration. Run the command once per runner and store each output separately.
 
 Run the command as the service account and choose a writable staging path:
 
@@ -330,6 +346,7 @@ printf '\n'
 export TINES_API_KEY
 tines-runner-rs register \
   --config /etc/tines-runner-rs/config.toml \
+  --runner codex \
   --output /home/tines-runner/provisioned-credentials.toml
 unset TINES_API_KEY
 ```
@@ -353,16 +370,16 @@ Set the runner's credential path to a private runtime copy. Add these settings
 to the config and system service unit:
 
 ```toml
-[storage]
-credentials_file = "/run/tines-runner-rs/credentials.toml"
+[runners.codex]
+credentials_file = "/run/tines-runner-rs-codex/credentials.toml"
 ```
 
 ```ini
 [Service]
-RuntimeDirectory=tines-runner-rs
+RuntimeDirectory=tines-runner-rs-codex
 RuntimeDirectoryMode=0700
 LoadCredentialEncrypted=runner-credentials:/etc/credstore.encrypted/tines-runner-rs.cred
-ExecStartPre=/usr/bin/install -m 0400 %d/runner-credentials /run/tines-runner-rs/credentials.toml
+ExecStartPre=/usr/bin/install -m 0400 %d/runner-credentials /run/tines-runner-rs-codex/credentials.toml
 ```
 
 systemd decrypts the credential for the unit. `ExecStartPre` copies it into
@@ -373,8 +390,9 @@ stops. The daemon loads the file without changing its permissions.
 If the host does not support `LoadCredentialEncrypted=`, use
 `LoadCredential=runner-credentials:/etc/tines-runner-rs/credentials.toml`
 with a root-owned, mode `0600` plaintext source file. Keep that source file
-private. The same runtime copy and `[storage].credentials_file` settings
-apply.
+private. The same runtime copy and `[runners.codex].credentials_file` setting
+apply. Give each additional runner its own runtime directory and system
+credential.
 
 ## Optional service examples
 
@@ -385,11 +403,12 @@ directories in `PATH`.
 
 ### systemd
 
-Save a unit such as `/etc/systemd/system/tines-runner-rs.service`:
+Save a template unit as `/etc/systemd/system/tines-runner-rs@.service`. The
+instance name selects the runner ID:
 
 ```ini
 [Unit]
-Description=Tines Rust runner
+Description=Tines Rust runner (%i)
 Wants=network-online.target
 After=network-online.target
 
@@ -398,7 +417,7 @@ Type=simple
 User=tines-runner
 Environment=HOME=/home/tines-runner
 Environment=PATH=/home/tines-runner/.cargo/bin:/home/tines-runner/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs --config /etc/tines-runner-rs/config.toml
+ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner %i
 Restart=on-abnormal
 RestartSec=5
 
@@ -406,26 +425,31 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-After saving the unit, reload unit files and enable or start
-`tines-runner-rs.service` with the host's normal systemd commands. Run the
-first registration check interactively as `tines-runner` before enabling the
-service. systemd captures the runner's JSON logs in the journal. This example
-restarts after abnormal process termination, but leaves ordinary error exits
-stopped for review. Resolve a fencing error before restarting the service.
+After saving the unit, reload unit files and start one instance for each
+configured ID. These instances use the same config file and select separate
+runner definitions:
 
 For a system unit, the usual commands are:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now tines-runner-rs.service
-sudo journalctl -u tines-runner-rs.service -f
+sudo systemctl enable --now tines-runner-rs@codex.service
+sudo systemctl enable --now tines-runner-rs@antigravity.service
+sudo journalctl -u 'tines-runner-rs@*.service' -f
 ```
+
+Run the first `--check` for each runner ID interactively as `tines-runner`
+before enabling its service. systemd captures each runner's JSON logs in the
+journal. The unit restarts after abnormal process termination but leaves
+ordinary error exits stopped for review. Resolve a fencing error before
+restarting that instance.
 
 ### launchd
 
-Save a LaunchAgent plist under
-`~/Library/LaunchAgents/dev.tines.runner-rs.plist`. Create the log directory
-before loading it. Replace `/Users/tines-runner` and the executable paths:
+Save one LaunchAgent plist per runner. This example uses the `codex` runner;
+create a second file with a distinct label and `antigravity` value to run the
+other definition. Create the log directory before loading either file.
+Replace `/Users/tines-runner` and the executable paths:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -439,6 +463,8 @@ before loading it. Replace `/Users/tines-runner` and the executable paths:
     <string>/Users/tines-runner/.cargo/bin/tines-runner-rs</string>
     <string>--config</string>
     <string>/Users/tines-runner/.config/tines-runner-rs/config.toml</string>
+    <string>--runner</string>
+    <string>codex</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/tines-runner</string>
@@ -459,11 +485,14 @@ before loading it. Replace `/Users/tines-runner` and the executable paths:
 </plist>
 ```
 
-Load and stop the LaunchAgent with the normal `launchctl` commands for the
-logged-in user's GUI session. Run the first registration check in that user's
-environment before loading the agent. This example starts at login but does
-not automatically restart after an error. Review a fencing error before you
-start the agent again.
+For the second LaunchAgent, use a unique label such as
+`dev.tines.runner-rs.antigravity`, set the runner argument to `antigravity`,
+and use separate log paths. Both agents pass the same config file. Load and
+stop each LaunchAgent with the normal `launchctl` commands for the logged-in
+user's GUI session. Run the first registration check for each ID before
+loading its agent. These examples start at login but do not automatically
+restart after an error. Review a fencing error before you start an agent
+again.
 
 ## Workspace retention
 
@@ -504,12 +533,17 @@ those log requests.
 
 - Confirm that the daemon's `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`
   match the credential and workspace locations used during setup.
-- Confirm that the file passed to `--config` exists and contains both required
-  values: `[server].url` and `[runner].name`.
+- Confirm that the file passed to `--config` exists and contains `[server].url`
+  and at least one runner definition with `name`, `credentials_file`, and
+  `executor_cwd`.
 - Daemon and `--check` commands require `--config <path>`. The runner does not
   search a default configuration location.
+- If the config defines more than one runner, pass a matching `--runner <id>`.
+  The runner lists configured IDs when `--runner` is missing or unknown.
+- Each `[runners.<id>]` definition needs its own `credentials_file`. The
+  runner rejects duplicate credential paths.
 - Check TOML syntax and field names. Unknown fields are errors.
-- If the error names `credentials.toml`, verify `[storage].credentials_file`
+- If the error names `credentials.toml`, verify `[runners.codex].credentials_file`
   and confirm that the daemon account can read and write that path.
 
 ### Tines rejects the runner token
@@ -523,18 +557,19 @@ If the saved token is invalid, follow the Tines runner lifecycle used by your
 organization before registering again. Back up or remove the invalid
 credentials file only when you intend to register a runner again. Then set a
 valid user key in `TINES_API_KEY` and run
-`tines-runner-rs --config /etc/tines-runner-rs/config.toml --check` as the
-service account. A missing credentials file triggers registration and writes
-the new runner credentials. Do not leave both old and new daemon instances
-using the same runner identity.
+`tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex --check`
+as the service account. A missing credentials file triggers registration and
+writes the selected runner's credentials. Do not leave multiple daemon
+instances using the same runner identity.
 
 ### Tines fences this daemon
 
 The error says `Tines superseded this daemon for runner ...`. Another daemon
 has taken ownership of that runner identity. Check for a second service or a
 copy running on another host with the same credentials. Stop the unintended
-instance, then start the one that should own the runner. Run one active daemon
-per credentials file unless you intend Tines to replace the earlier daemon.
+instance, then start the one that should own the runner. Keep one active
+daemon per runner registration. Define another runner with its own
+credentials file when you need a second active daemon.
 
 ### Assignments fail before Codex starts
 
