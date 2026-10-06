@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use crate::effort::{EffortCapabilities, assignment_effort_rejection};
+use crate::effort::EffortCapabilities;
 use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionRequest, LogStream, TerminalResult, TerminalStatus,
 };
@@ -26,16 +26,11 @@ impl HarnessAdapter for CustomAdapter {
         &self,
         request: &ExecutionRequest,
         workspace: &MaterializedWorkspace,
-        capabilities: &EffortCapabilities,
+        _capabilities: &EffortCapabilities,
     ) -> Result<HarnessLaunch, HarnessAdapterError> {
         if request.execution.harness != self.identifier() {
             return Err(HarnessAdapterError::new(
                 "execution request does not match the custom adapter",
-            ));
-        }
-        if assignment_effort_rejection(&request.assignment, capabilities).is_some() {
-            return Err(HarnessAdapterError::new(
-                "custom harness does not support Codex effort settings",
             ));
         }
         let configured =

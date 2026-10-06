@@ -197,6 +197,15 @@ fn configured(
     server_url: &str,
     executor: Option<&PathBuf>,
 ) -> (Config, Client, RunnerConnection) {
+    configured_with_overrides(directory, server_url, executor, "")
+}
+
+fn configured_with_overrides(
+    directory: &TestDirectory,
+    server_url: &str,
+    executor: Option<&PathBuf>,
+    overrides: &str,
+) -> (Config, Client, RunnerConnection) {
     let credentials_path = directory.0.join("credentials.toml");
     CredentialStore::at(&credentials_path)
         .save(&RunnerCredentials::new("rnr_cancel", "runner-token"))
@@ -212,7 +221,7 @@ fn configured(
         .unwrap_or_default();
     let workspace_parent = directory.0.join("workspaces");
     let config = Config::from_toml_str(&format!(
-        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\nexecutor_cwd = \"~\"\n{executor}workspace_parent = {:?}\n[storage]\ncredentials_file = {:?}\n",
+        "[server]\nurl = {server_url:?}\n[runner]\nname = \"cancel-test\"\nexecutor_cwd = \"~\"\n{executor}workspace_parent = {:?}\n{overrides}\n[storage]\ncredentials_file = {:?}\n",
         workspace_parent,
         credentials_path
     ))
@@ -549,6 +558,164 @@ fn executor_effort_capabilities_authorize_effort_without_a_legacy_launcher() {
     let (_, finish_body) = requests[2].split_once("\r\n\r\n").expect("finish body");
     let finish: serde_json::Value = serde_json::from_str(finish_body).expect("decode finish");
     assert_eq!(finish["status"], "completed");
+}
+
+#[test]
+fn codex_to_custom_override_accepts_effort_without_codex_effort_capabilities() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(3);
+    let executor = successful_executor(&directory, "custom-override-executor");
+    let (config, client, connection) = configured_with_overrides(
+        &directory,
+        &server_url,
+        Some(&executor),
+        "[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nrunner_type = \"custom\"\ncustom_command = [\"custom-command\"]\n",
+    );
+    assert_eq!(
+        config.runner_type,
+        tines_runner_rs::config::RunnerType::Codex
+    );
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+    let mut assignment = assignment(None);
+    assignment.effort = Some(RunnerAssignmentEffort {
+        version: 1,
+        value: "high".to_owned(),
+        capability_digest: Some(capabilities().catalog_digest),
+        verification: Some("asserted".to_owned()),
+    });
+    let custom_capabilities = ExecutorCapabilities {
+        version: 1,
+        harnesses: std::collections::BTreeMap::from([(
+            "custom".to_owned(),
+            ExecutorHarnessCapabilities {
+                version: "custom-command 1.0".to_owned(),
+                effort: None,
+            },
+        )]),
+        discovery_error: None,
+    };
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment,
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &custom_capabilities,
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("execute a Codex base config resolved to custom");
+
+    assert_eq!(outcome, AssignmentTaskOutcome::Finished);
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
+    assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/logs "));
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/finish "));
+}
+
+#[test]
+fn custom_override_still_requires_verified_custom_harness_support() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let executor = successful_executor(&directory, "unsupported-custom-executor");
+    let (config, client, connection) = configured_with_overrides(
+        &directory,
+        &server_url,
+        Some(&executor),
+        "[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nrunner_type = \"custom\"\ncustom_command = [\"custom-command\"]\n",
+    );
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+    let mut assignment = assignment(None);
+    assignment.effort = Some(RunnerAssignmentEffort {
+        version: 1,
+        value: "high".to_owned(),
+        capability_digest: Some(capabilities().catalog_digest),
+        verification: Some("asserted".to_owned()),
+    });
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment,
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &executor_capabilities(true),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline a custom run without custom capability support");
+
+    assert!(matches!(
+        outcome,
+        AssignmentTaskOutcome::Declined(reason)
+            if reason == "configured executor does not verify support for the custom harness"
+    ));
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
+    assert!(!directory.0.join("workspaces").exists());
+}
+
+#[test]
+fn codex_effort_assignments_still_require_verified_effort_support() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let (config, client, connection) = configured(&directory, &server_url, None);
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+    let mut assignment = assignment(None);
+    assignment.effort = Some(RunnerAssignmentEffort {
+        version: 1,
+        value: "high".to_owned(),
+        capability_digest: Some(capabilities().catalog_digest),
+        verification: Some("asserted".to_owned()),
+    });
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment,
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &executor_capabilities(false),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline effort the Codex report cannot verify");
+
+    assert!(matches!(
+        outcome,
+        AssignmentTaskOutcome::Declined(reason)
+            if reason == "the assigned model effort support could not be verified"
+    ));
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
 }
 
 #[cfg(target_os = "linux")]
