@@ -4,6 +4,7 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::config::{Config, RunnerType};
 use crate::credentials::{
@@ -30,6 +31,35 @@ pub struct RunnerConnection {
 }
 
 impl RunnerConnection {
+    /// Register this runner and atomically save its credentials to an
+    /// operator-selected path.
+    ///
+    /// This always uses `TINES_API_KEY` for registration. It does not load or
+    /// modify the credentials path from the runner configuration.
+    pub fn register(config: &Config, output_path: &Path) -> Result<RunnerCredentials, RunnerError> {
+        if !(1..=MAX_REGISTERED_CONCURRENCY).contains(&config.max_concurrent) {
+            return Err(RunnerError::InvalidConcurrency(config.max_concurrent));
+        }
+
+        let client = Client::new(config.server_url.as_str()).map_err(RunnerError::ClientSetup)?;
+        let key = BootstrapKey::from_env().map_err(RunnerError::BootstrapKey)?;
+        let response = client
+            .register_runner(key.as_str(), &registration_request(config))
+            .map_err(RunnerError::Registration)?;
+        if response.runner.id.is_empty() || response.runner_token.is_empty() {
+            return Err(RunnerError::InvalidRegistrationResponse);
+        }
+
+        let credentials = RunnerCredentials::new(response.runner.id, response.runner_token);
+        CredentialStore::at(output_path)
+            .save_atomic(&credentials)
+            .map_err(|source| RunnerError::PersistRegisteredCredentials {
+                path: output_path.to_path_buf(),
+                source,
+            })?;
+        Ok(credentials)
+    }
+
     /// Load credentials or register this runner when no credentials file
     /// exists. Malformed or unreadable credentials cause a hard failure.
     pub fn connect(config: &Config) -> Result<Self, RunnerError> {
@@ -238,10 +268,18 @@ pub enum RunnerError {
     Credentials(CredentialError),
     BootstrapKey(BootstrapKeyError),
     Registration(ClientError),
+    PersistRegisteredCredentials {
+        path: PathBuf,
+        source: CredentialError,
+    },
     InvalidConcurrency(usize),
     InvalidRegistrationResponse,
-    RejectedRunnerToken { runner_id: String },
-    Superseded { runner_id: String },
+    RejectedRunnerToken {
+        runner_id: String,
+    },
+    Superseded {
+        runner_id: String,
+    },
     Protocol(ClientError),
 }
 
@@ -254,6 +292,11 @@ impl fmt::Display for RunnerError {
                 write!(f, "no stored runner credentials; cannot register: {error}")
             }
             Self::Registration(error) => write!(f, "could not register the local runner: {error}"),
+            Self::PersistRegisteredCredentials { path, source } => write!(
+                f,
+                "runner registration succeeded, but credentials could not be persisted to {}: {source}",
+                path.display()
+            ),
             Self::InvalidConcurrency(value) => write!(
                 f,
                 "runner max_concurrent must be between 1 and {MAX_REGISTERED_CONCURRENCY} (got {value})"
@@ -281,6 +324,7 @@ impl Error for RunnerError {
                 Some(error)
             }
             Self::Credentials(error) => Some(error),
+            Self::PersistRegisteredCredentials { source, .. } => Some(source),
             Self::BootstrapKey(error) => Some(error),
             Self::InvalidConcurrency(_)
             | Self::InvalidRegistrationResponse

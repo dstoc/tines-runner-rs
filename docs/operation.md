@@ -313,6 +313,69 @@ Once this file exists, the daemon authenticates with the saved runner token.
 If Tines rejects that token, the runner exits. It does not replace the token or
 fall back to `TINES_API_KEY`.
 
+### Provision credentials for systemd
+
+Use `register` when another service or operator manages the runner credential
+file. The command requires an explicit config and writable output path. It
+registers the runner with `TINES_API_KEY`, then writes the returned runner ID
+and token to that output. It does not read or write the config's
+`[storage].credentials_file`.
+
+Run the command as the service account and choose a writable staging path:
+
+```sh
+printf 'Tines API key: '
+IFS= read -r -s TINES_API_KEY
+printf '\n'
+export TINES_API_KEY
+tines-runner-rs register \
+  --config /etc/tines-runner-rs/config.toml \
+  --output /home/tines-runner/provisioned-credentials.toml
+unset TINES_API_KEY
+```
+
+The output contains only `runner_id` and `runner_token`. On Unix, the command
+writes it atomically with mode `0600`. Keep the staging file private while you
+install or encrypt it for the service.
+
+For an encrypted system credential, install `systemd-creds` and run:
+
+```sh
+sudo install -d -m 0700 /etc/credstore.encrypted
+sudo systemd-creds encrypt --name=runner-credentials \
+  /home/tines-runner/provisioned-credentials.toml \
+  /etc/credstore.encrypted/tines-runner-rs.cred
+sudo chmod 0600 /etc/credstore.encrypted/tines-runner-rs.cred
+rm /home/tines-runner/provisioned-credentials.toml
+```
+
+Set the runner's credential path to a private runtime copy. Add these settings
+to the config and system service unit:
+
+```toml
+[storage]
+credentials_file = "/run/tines-runner-rs/credentials.toml"
+```
+
+```ini
+[Service]
+RuntimeDirectory=tines-runner-rs
+RuntimeDirectoryMode=0700
+LoadCredentialEncrypted=runner-credentials:/etc/credstore.encrypted/tines-runner-rs.cred
+ExecStartPre=/usr/bin/install -m 0400 %d/runner-credentials /run/tines-runner-rs/credentials.toml
+```
+
+systemd decrypts the credential for the unit. `ExecStartPre` copies it into
+the service's runtime directory, where the daemon can read it. The runtime
+directory is private to the service account and is removed when the service
+stops. The daemon loads the file without changing its permissions.
+
+If the host does not support `LoadCredentialEncrypted=`, use
+`LoadCredential=runner-credentials:/etc/tines-runner-rs/credentials.toml`
+with a root-owned, mode `0600` plaintext source file. Keep that source file
+private. The same runtime copy and `[storage].credentials_file` settings
+apply.
+
 ## Optional service examples
 
 These examples show service-manager configuration only. The runner does not

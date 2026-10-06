@@ -100,6 +100,23 @@ tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --check
 unset TINES_API_KEY
 ```
 
+For externally managed credentials, provision to an explicit writable path
+instead:
+
+```sh
+tines-runner-rs register \
+  --config "$HOME/.config/tines-runner-rs/config.toml" \
+  --output "$HOME/runner-credentials.toml"
+```
+
+The `register` command reads `TINES_API_KEY`, registers the configured runner,
+and writes only the returned runner ID and token to `--output`. It does not
+read or write `[storage].credentials_file`. On Unix, it writes the output
+atomically with mode `0600`. Install or encrypt this file in the service's
+secret-delivery mechanism, then set `[storage].credentials_file` to the path
+where the service can read it. See the [systemd credential workflow](docs/operation.md#provision-credentials-for-systemd)
+for an example.
+
 The default credentials file remains in the platform configuration directory:
 
 - Linux and other Unix: `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs/credentials.toml`.

@@ -22,8 +22,8 @@ struct AssignmentWorker {
     about = "An independent Rust runner for Tines assignments"
 )]
 struct Cli {
-    /// Load runner configuration from this file (required for daemon and --check).
-    #[arg(long, value_name = "PATH")]
+    /// Load runner configuration from this file (required for daemon, --check, and register).
+    #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
     /// Validate configuration and stored credentials, then exit without polling.
@@ -36,6 +36,12 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum CliCommand {
+    /// Register the configured runner and write credentials to an explicit file.
+    Register {
+        /// Write the returned runner ID and token to this file.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
     /// Read and validate one execution request from stdin.
     Execute,
     /// Report harness and effort capabilities from this executor environment.
@@ -46,20 +52,41 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     tines_runner_rs::logging::init();
 
-    let config_required = match cli.command.as_ref() {
-        None => true,
-        Some(CliCommand::Execute | CliCommand::Capabilities) => false,
-    };
+    let config_required = !matches!(
+        cli.command.as_ref(),
+        Some(CliCommand::Execute | CliCommand::Capabilities)
+    );
     if config_required && cli.config.is_none() {
+        let message = if matches!(cli.command.as_ref(), Some(CliCommand::Register { .. })) {
+            "--config <PATH> is required for register"
+        } else {
+            "--config <PATH> is required for daemon operation and --check"
+        };
         Cli::command()
-            .error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "--config <PATH> is required for daemon operation and --check",
-            )
+            .error(clap::error::ErrorKind::MissingRequiredArgument, message)
             .exit();
     }
 
     match cli.command {
+        Some(CliCommand::Register { output }) => {
+            return match register_runner(
+                cli.config.as_deref().expect("register requires --config"),
+                &output,
+            ) {
+                Ok(credentials) => {
+                    tracing::info!(
+                        runner_id = credentials.runner_id(),
+                        output = %output.display(),
+                        "runner credentials registered and saved"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "runner registration failed");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some(CliCommand::Execute) => return execute_stdin(),
         Some(CliCommand::Capabilities) => {
             return match tines_runner_rs::executor_capabilities::discover_for_cli(
@@ -87,6 +114,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn register_runner(
+    config_path: &Path,
+    output_path: &Path,
+) -> Result<tines_runner_rs::credentials::RunnerCredentials, Box<dyn Error>> {
+    let config = tines_runner_rs::config::Config::load(config_path)?;
+    Ok(tines_runner_rs::runner::RunnerConnection::register(
+        &config,
+        output_path,
+    )?)
 }
 
 fn execute_stdin() -> ExitCode {
