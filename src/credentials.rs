@@ -144,12 +144,24 @@ impl CredentialStore {
 
     /// Load and validate credentials from this store.
     ///
-    /// On Unix, this also repairs the file mode to `0600` before reading it.
+    /// Loading does not change file permissions, so externally managed
+    /// credentials can be read from locations that do not allow metadata
+    /// changes.
     pub fn load(&self) -> Result<RunnerCredentials, CredentialError> {
-        let metadata = fs::metadata(&self.path).map_err(|source| CredentialError::Open {
-            path: self.path.clone(),
-            source,
-        })?;
+        self.load_with_file_system(&HostCredentialFileSystem)
+    }
+
+    fn load_with_file_system(
+        &self,
+        file_system: &impl CredentialFileSystem,
+    ) -> Result<RunnerCredentials, CredentialError> {
+        let metadata =
+            file_system
+                .metadata(&self.path)
+                .map_err(|source| CredentialError::Open {
+                    path: self.path.clone(),
+                    source,
+                })?;
         if !metadata.is_file() {
             return Err(CredentialError::Open {
                 path: self.path.clone(),
@@ -157,13 +169,12 @@ impl CredentialStore {
             });
         }
 
-        #[cfg(unix)]
-        secure_path_permissions(&self.path)?;
-
-        let mut file = File::open(&self.path).map_err(|source| CredentialError::Open {
-            path: self.path.clone(),
-            source,
-        })?;
+        let mut file = file_system
+            .open(&self.path)
+            .map_err(|source| CredentialError::Open {
+                path: self.path.clone(),
+                source,
+            })?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .map_err(|source| CredentialError::Read {
@@ -266,6 +277,25 @@ impl CredentialStore {
         Ok(())
     }
 }
+
+trait CredentialFileSystem {
+    fn metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::metadata(path)
+    }
+
+    fn open(&self, path: &Path) -> io::Result<File> {
+        File::open(path)
+    }
+
+    #[cfg(unix)]
+    fn set_permissions(&self, path: &Path, permissions: fs::Permissions) -> io::Result<()> {
+        fs::set_permissions(path, permissions)
+    }
+}
+
+struct HostCredentialFileSystem;
+
+impl CredentialFileSystem for HostCredentialFileSystem {}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -383,12 +413,12 @@ fn default_credentials_path() -> Result<PathBuf, CredentialError> {
 fn secure_path_permissions(path: &Path) -> Result<(), CredentialError> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        CredentialError::SecurePermissions {
+    HostCredentialFileSystem
+        .set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|source| CredentialError::SecurePermissions {
             path: path.to_path_buf(),
             source,
-        }
-    })
+        })
 }
 
 #[cfg(unix)]
@@ -418,7 +448,8 @@ fn secure_file_permissions(file: &File, path: &Path) -> Result<(), CredentialErr
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapKey, BootstrapKeyError, CredentialError, CredentialStore, RunnerCredentials,
+        BootstrapKey, BootstrapKeyError, CredentialError, CredentialFileSystem, CredentialStore,
+        RunnerCredentials,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -437,6 +468,23 @@ mod tests {
 
     fn credentials() -> RunnerCredentials {
         RunnerCredentials::new("rnr_test", "runner-token-test-secret")
+    }
+
+    #[cfg(unix)]
+    struct ReadOnlyCredentialFileSystem;
+
+    #[cfg(unix)]
+    impl CredentialFileSystem for ReadOnlyCredentialFileSystem {
+        fn set_permissions(
+            &self,
+            _path: &std::path::Path,
+            _permissions: fs::Permissions,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "externally managed credentials are read-only",
+            ))
+        }
     }
 
     #[test]
@@ -467,7 +515,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn creates_and_repairs_permissions_to_owner_only() {
+    fn creates_credentials_with_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let path = temporary_file();
@@ -478,11 +526,72 @@ mod tests {
             0o600
         );
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        store.load().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loads_read_only_external_credentials_without_changing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temporary_file();
+        let expected = credentials();
+        fs::write(
+            &path,
+            format!(
+                "runner_id = {:?}\nrunner_token = {:?}\n",
+                expected.runner_id(),
+                expected.runner_token()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let actual = CredentialStore::at(&path).load().unwrap();
+
+        assert_eq!(actual, expected);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
+            0o444
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loads_credentials_when_permission_changes_are_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temporary_file();
+        let expected = credentials();
+        fs::write(
+            &path,
+            format!(
+                "runner_id = {:?}\nrunner_token = {:?}\n",
+                expected.runner_id(),
+                expected.runner_token()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let read_only_file_system = ReadOnlyCredentialFileSystem;
+        let permission_error = read_only_file_system
+            .set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .unwrap_err();
+        assert_eq!(
+            permission_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let actual = CredentialStore::at(&path)
+            .load_with_file_system(&read_only_file_system)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
         );
         let _ = fs::remove_file(path);
     }
