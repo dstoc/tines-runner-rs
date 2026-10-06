@@ -53,18 +53,10 @@ different `PATH` and credentials than an interactive shell.
 
 ### 1. Create the configuration file
 
-Create `config.toml` in the runner configuration directory:
-
-| Platform | Default configuration file |
-| --- | --- |
-| Linux and other Unix | `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs/config.toml` |
-| macOS | `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs/config.toml` |
-| Windows | `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs/config.toml` |
-
-The runner uses `XDG_CONFIG_HOME` only when it is an absolute path. On
-Windows, it uses `%USERPROFILE%\AppData\Roaming` when `APPDATA` is not set.
-Pass `--config /path/to/config.toml` to select a different file. Without this
-option, the runner uses the default path in the table.
+Save `config.toml` at a path you choose. For example, on Linux or macOS, use
+`$HOME/.config/tines-runner-rs/config.toml`. The runner does not search for a
+configuration file. Pass its path with `--config` when you run the daemon or
+`--check`.
 
 Start with this configuration and replace the URL and runner name:
 
@@ -104,18 +96,25 @@ printf 'Tines API key: '
 IFS= read -r -s TINES_API_KEY
 printf '\n'
 export TINES_API_KEY
-tines-runner-rs --check
+tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --check
 unset TINES_API_KEY
 ```
 
-The default credentials file is in the platform configuration directory. Set
-`[storage].credentials_file` to choose another path. On Unix, the runner
-creates or repairs the file with mode `0600`. Keep it private and use the same
-file when restarting the daemon. Later `--check` runs use the saved runner
-token and do not need `TINES_API_KEY`:
+The default credentials file remains in the platform configuration directory:
+
+- Linux and other Unix: `${XDG_CONFIG_HOME:-~/.config}/tines-runner-rs/credentials.toml`.
+- macOS: `${XDG_CONFIG_HOME:-~/Library/Application Support}/tines-runner-rs/credentials.toml`.
+- Windows: `${XDG_CONFIG_HOME:-%APPDATA%}/tines-runner-rs/credentials.toml` (or `%USERPROFILE%\AppData\Roaming` if `APPDATA` is unset).
+
+The runner uses `XDG_CONFIG_HOME` only when it is absolute. It affects the
+default credentials location; it does not select the runner configuration
+file. Set `[storage].credentials_file` to choose a different credentials path.
+On Unix, the runner creates or repairs the file with mode `0600`. Keep it
+private and use the same file when restarting the daemon. Later `--check` runs
+use the saved runner token and do not need `TINES_API_KEY`:
 
 ```sh
-tines-runner-rs --check
+tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --check
 ```
 
 ### Run multiple runners
@@ -160,7 +159,7 @@ Each config keeps the runner's registration and local state separate. Run
 After `--check` succeeds, start the runner:
 
 ```sh
-tines-runner-rs
+tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml"
 ```
 
 The process polls until stopped. Use Ctrl-C in a terminal or the service
@@ -423,8 +422,8 @@ retained.
   execution. `--check` does not test Codex authentication, Git access, or
   workspace permissions.
 - **Configuration fails to load:** check the selected file path, TOML syntax,
-  and that the server URL and runner name are set. Without `--config`, the
-  runner reads `config.toml` from the default configuration directory.
+  and that the server URL and runner name are set. The daemon and `--check`
+  require `--config <path>`; the runner does not search a default location.
 - **First registration fails:** confirm `TINES_API_KEY` is set for the
   `--check` process and can access the configured Tines instance. The key is
   needed only when no saved runner credentials exist.

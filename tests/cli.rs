@@ -68,6 +68,12 @@ impl TestDirectory {
         self.0.join("config")
     }
 
+    fn runner_config_path(&self) -> PathBuf {
+        self.config_dir()
+            .join("tines-runner-rs")
+            .join("config.toml")
+    }
+
     fn credentials_path(&self) -> PathBuf {
         self.0.join("credentials.toml")
     }
@@ -80,6 +86,10 @@ impl TestDirectory {
             .env("XDG_CONFIG_HOME", &config_dir)
             .env("APPDATA", &config_dir)
             .env("LOCALAPPDATA", &config_dir);
+    }
+
+    fn select_runner_config(&self, command: &mut Command) {
+        command.arg("--config").arg(self.runner_config_path());
     }
 }
 
@@ -351,6 +361,42 @@ fn version_flag_reports_package_version() {
         String::from_utf8(output.stdout).expect("version output should be UTF-8"),
         format!("tines-runner-rs {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn daemon_and_check_require_an_explicit_config_path() {
+    let directory = TestDirectory::new();
+    let config_path = directory.runner_config_path();
+    fs::create_dir_all(config_path.parent().unwrap()).expect("create default config directory");
+    fs::write(&config_path, "[server\nurl = [broken").expect("write implicit config fixture");
+
+    for check in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+        if check {
+            command.arg("--check");
+        }
+        directory.configure_command(&mut command);
+        let output = command.output().expect("run without --config");
+        let diagnostic = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(!output.status.success(), "missing --config must fail");
+        assert!(
+            diagnostic.contains("--config <PATH> is required"),
+            "missing --config should produce a usage error: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("Usage:"),
+            "missing --config should show usage: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("invalid config file"),
+            "the XDG config location must not be probed: {diagnostic}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -774,6 +820,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     .expect("write runner config");
 
     let mut first_start = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.select_runner_config(&mut first_start);
     first_start.arg("--check");
     directory.configure_command(&mut first_start);
     let first_start = first_start
@@ -835,6 +882,7 @@ fn startup_registers_persists_credentials_and_restarts_without_bootstrap_key() {
     )
     .expect("update runner config for restart");
     let mut second_start = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.select_runner_config(&mut second_start);
     second_start.arg("--check");
     directory.configure_command(&mut second_start);
     let second_start = second_start
@@ -887,6 +935,7 @@ fn daemon_uses_its_first_poll_to_authenticate_and_detect_fencing() {
     .expect("write runner config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.select_runner_config(&mut command);
     directory.configure_command(&mut command);
     let output = command
         .env_remove("TINES_API_KEY")
@@ -950,6 +999,7 @@ fn startup_fails_when_saved_runner_token_is_rejected() {
     .expect("write runner config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.select_runner_config(&mut command);
     command.arg("--check");
     directory.configure_command(&mut command);
     let output = command
@@ -1007,6 +1057,7 @@ fn startup_fails_when_tines_is_unavailable() {
     .expect("write runner config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.select_runner_config(&mut command);
     command.arg("--check");
     directory.configure_command(&mut command);
     let output = command
@@ -1074,6 +1125,7 @@ fn sigterm_drains_daemon_kills_harness_and_reports_interrupted() {
     .expect("write runner config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    directory.select_runner_config(&mut command);
     directory.configure_command(&mut command);
     command
         .env("PATH", path)

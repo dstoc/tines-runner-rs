@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -22,7 +22,7 @@ struct AssignmentWorker {
     about = "An independent Rust runner for Tines assignments"
 )]
 struct Cli {
-    /// Load configuration from this file instead of the platform default.
+    /// Load runner configuration from this file (required for daemon and --check).
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -46,6 +46,19 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     tines_runner_rs::logging::init();
 
+    let config_required = match cli.command.as_ref() {
+        None => true,
+        Some(CliCommand::Execute | CliCommand::Capabilities) => false,
+    };
+    if config_required && cli.config.is_none() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--config <PATH> is required for daemon operation and --check",
+            )
+            .exit();
+    }
+
     match cli.command {
         Some(CliCommand::Execute) => return execute_stdin(),
         Some(CliCommand::Capabilities) => {
@@ -62,7 +75,12 @@ fn main() -> ExitCode {
         None => {}
     }
 
-    match start_runner(cli.check, cli.config.as_deref()) {
+    match start_runner(
+        cli.check,
+        cli.config
+            .as_deref()
+            .expect("runner mode requires --config"),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "runner startup failed");
@@ -93,11 +111,8 @@ fn execute_stdin() -> ExitCode {
     }
 }
 
-fn start_runner(check: bool, config_path: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    let config = match config_path {
-        Some(path) => tines_runner_rs::config::Config::load(path)?,
-        None => tines_runner_rs::config::Config::load_default()?,
-    };
+fn start_runner(check: bool, config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let config = tines_runner_rs::config::Config::load(config_path)?;
     let shutdown = if check {
         None
     } else {
