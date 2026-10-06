@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Runner identity and its long-lived token.
 ///
@@ -276,6 +277,139 @@ impl CredentialStore {
         })?;
         Ok(())
     }
+
+    /// Save credentials through a temporary file in the destination directory,
+    /// then atomically replace the destination.
+    ///
+    /// On Unix, the temporary file has mode `0600` before credential data is
+    /// written. A failed write leaves any existing destination unchanged.
+    pub fn save_atomic(&self, credentials: &RunnerCredentials) -> Result<(), CredentialError> {
+        if credentials.runner_id.is_empty() {
+            return Err(CredentialError::InvalidField {
+                path: self.path.clone(),
+                field: "runner_id",
+            });
+        }
+        if credentials.runner_token.is_empty() {
+            return Err(CredentialError::InvalidField {
+                path: self.path.clone(),
+                field: "runner_token",
+            });
+        }
+
+        let document = CredentialDocument {
+            runner_id: credentials.runner_id.clone(),
+            runner_token: credentials.runner_token.clone(),
+        };
+        let contents = toml::to_string(&document).map_err(|_| CredentialError::Serialize)?;
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| CredentialError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+
+        let file_name = self
+            .path
+            .file_name()
+            .ok_or_else(|| CredentialError::Write {
+                path: self.path.clone(),
+                source: io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"),
+            })?;
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".{}.tmp", Uuid::new_v4()));
+        let temporary_path = parent.join(temporary_name);
+
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary_path)
+            .map_err(|source| CredentialError::Open {
+                path: temporary_path.clone(),
+                source,
+            })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(source) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                drop(file);
+                let _ = fs::remove_file(&temporary_path);
+                return Err(CredentialError::SecurePermissions {
+                    path: temporary_path.clone(),
+                    source,
+                });
+            }
+        }
+
+        let write_result = (|| {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(source) = write_result {
+            drop(file);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(CredentialError::Write {
+                path: temporary_path,
+                source,
+            });
+        }
+        drop(file);
+
+        if let Err(source) = atomically_replace(&temporary_path, &self.path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(CredentialError::Write {
+                path: self.path.clone(),
+                source,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn atomically_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn atomically_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Both pointers refer to NUL-terminated buffers that remain alive for the
+    // duration of the call.
+    let replaced = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), 0x1 | 0x8) };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomically_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
 }
 
 trait CredentialFileSystem {
@@ -498,6 +632,20 @@ mod tests {
     }
 
     #[test]
+    fn atomically_replaces_and_reloads_credentials() {
+        let path = temporary_file();
+        let store = CredentialStore::at(&path);
+        let original = RunnerCredentials::new("rnr_old", "old-token");
+        let expected = credentials();
+        store.save(&original).unwrap();
+
+        store.save_atomic(&expected).unwrap();
+
+        assert_eq!(store.load().unwrap(), expected);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn default_path_is_under_the_runner_configuration_directory() {
         let credentials_path = CredentialStore::default_path().unwrap();
         let config_dir = credentials_path.parent().unwrap();
@@ -514,6 +662,23 @@ mod tests {
         let path = temporary_file();
         let store = CredentialStore::at(&path);
         store.save(&credentials()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomically_creates_credentials_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temporary_file();
+        CredentialStore::at(&path)
+            .save_atomic(&credentials())
+            .unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

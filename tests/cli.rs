@@ -756,6 +756,230 @@ fn explicit_configs_register_separate_runners_and_credentials() {
 }
 
 #[test]
+fn register_command_writes_requested_credentials_for_read_only_daemon_use() {
+    let directory = TestDirectory::new();
+    let config_path = directory.0.join("config.toml");
+    let output_path = directory.0.join("provisioned").join("credentials.toml");
+    let configured_credentials_path = directory.0.join("external-credentials.toml");
+    let original_external_credentials =
+        "runner_id = \"rnr_external\"\nrunner_token = \"externally-managed-token\"\n";
+    fs::write(&configured_credentials_path, original_external_credentials)
+        .expect("write externally managed credentials");
+    #[cfg(unix)]
+    fs::set_permissions(
+        &configured_credentials_path,
+        fs::Permissions::from_mode(0o444),
+    )
+    .expect("make configured credentials read-only");
+
+    let (server_url, server) = mock_server(vec![(
+        201,
+        r#"{"runner":{"id":"rnr_provisioned"},"runner_token":"provisioned-runner-token"}"#,
+    )]);
+    fs::write(
+        &config_path,
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"provisioned-runner\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {:?}\n",
+            configured_credentials_path
+        ),
+    )
+    .expect("write runner config");
+
+    let mut register = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    register.args([
+        "register",
+        "--config",
+        config_path.to_str().expect("config path should be UTF-8"),
+        "--output",
+        output_path.to_str().expect("output path should be UTF-8"),
+    ]);
+    directory.configure_command(&mut register);
+    let output = register
+        .env("TINES_API_KEY", "bootstrap-key-test")
+        .output()
+        .expect("register runner into selected credential file");
+    let requests = server.join().expect("registration request");
+
+    assert!(
+        output.status.success(),
+        "register should persist credentials: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 1, "register must not poll or verify");
+    let (headers, body) = requests[0]
+        .split_once("\r\n\r\n")
+        .expect("registration request headers");
+    assert!(headers.contains("POST /api/v1/runners/register HTTP/1.1"));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer bootstrap-key-test")
+    );
+    let body: serde_json::Value = serde_json::from_str(body).expect("registration JSON");
+    assert_eq!(body["name"], "provisioned-runner");
+
+    let saved = fs::read_to_string(&output_path).expect("read provisioned credentials");
+    assert!(saved.contains("rnr_provisioned"));
+    assert!(saved.contains("provisioned-runner-token"));
+    assert!(!saved.contains("bootstrap-key-test"));
+    assert_eq!(
+        fs::read_to_string(&configured_credentials_path).unwrap(),
+        original_external_credentials,
+        "register must only write its explicit output path"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(&output_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&configured_credentials_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        fs::set_permissions(&output_path, fs::Permissions::from_mode(0o444))
+            .expect("make provisioned credentials read-only");
+    }
+
+    let (server_url, server) = mock_server(vec![(
+        400,
+        r#"{"error":{"code":"invalid_json","message":"Request body must be valid JSON"}}"#,
+    )]);
+    fs::write(
+        &config_path,
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"provisioned-runner\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {:?}\n",
+            output_path
+        ),
+    )
+    .expect("point runner config at provisioned credentials");
+    let mut check = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    check.args([
+        "--config",
+        config_path.to_str().expect("config path should be UTF-8"),
+        "--check",
+    ]);
+    directory.configure_command(&mut check);
+    let check_output = check
+        .env("TINES_API_KEY", "unused-bootstrap-key")
+        .output()
+        .expect("validate credentials from read-only location");
+    let check_requests = server.join().expect("runner credential validation");
+
+    assert!(
+        check_output.status.success(),
+        "--check should read provisioned credentials: {}",
+        String::from_utf8_lossy(&check_output.stderr)
+    );
+    assert_eq!(
+        check_requests.len(),
+        1,
+        "startup should only validate token"
+    );
+    let (headers, body) = check_requests[0]
+        .split_once("\r\n\r\n")
+        .expect("credential validation headers");
+    assert!(headers.contains("POST /api/v1/runners/rnr_provisioned/poll HTTP/1.1"));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer provisioned-runner-token")
+    );
+    assert_eq!(body, "{");
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&output_path).unwrap().permissions().mode() & 0o777,
+        0o444,
+        "startup must not change externally managed credentials"
+    );
+}
+
+#[test]
+fn register_reports_when_registered_credentials_cannot_be_persisted() {
+    let directory = TestDirectory::new();
+    let config_path = directory.0.join("config.toml");
+    let blocked_parent = directory.0.join("not-a-directory");
+    fs::write(&blocked_parent, "occupied").expect("create a file at the parent path");
+    let output_path = blocked_parent.join("credentials.toml");
+    let (server_url, server) = mock_server(vec![(
+        201,
+        r#"{"runner":{"id":"rnr_registered"},"runner_token":"runner-secret"}"#,
+    )]);
+    fs::write(
+        &config_path,
+        format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"failed-persist-runner\"\nexecutor_cwd = \"~\"\n"
+        ),
+    )
+    .expect("write runner config");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command.args([
+        "register",
+        "--config",
+        config_path.to_str().expect("config path should be UTF-8"),
+        "--output",
+        output_path.to_str().expect("output path should be UTF-8"),
+    ]);
+    directory.configure_command(&mut command);
+    let output = command
+        .env("TINES_API_KEY", "bootstrap-key-test")
+        .output()
+        .expect("run registration with an invalid output path");
+    let requests = server.join().expect("successful registration request");
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(requests.len(), 1, "Tines should have registered the runner");
+    assert!(!output.status.success());
+    assert!(
+        diagnostic.contains(&format!(
+            "runner registration succeeded, but credentials could not be persisted to {}",
+            output_path.display()
+        )),
+        "diagnostic should distinguish persistence failure: {diagnostic}"
+    );
+    assert!(!diagnostic.contains("runner-secret"));
+    assert!(!diagnostic.contains("bootstrap-key-test"));
+}
+
+#[test]
+fn register_requires_an_explicit_config_path() {
+    let directory = TestDirectory::new();
+    let output_path = directory.0.join("credentials.toml");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command.args([
+        "register",
+        "--output",
+        output_path.to_str().expect("output path should be UTF-8"),
+    ]);
+    directory.configure_command(&mut command);
+    let output = command
+        .env_remove("TINES_API_KEY")
+        .output()
+        .expect("run register without its required config path");
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        diagnostic.contains("--config <PATH> is required for register"),
+        "unexpected missing-config diagnostic: {diagnostic}"
+    );
+    assert!(!output_path.exists());
+}
+
+#[test]
 fn selected_config_errors_name_the_file() {
     let directory = TestDirectory::new();
     let missing_path = directory.0.join("missing.toml");
