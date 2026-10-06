@@ -8,6 +8,7 @@ use crate::effort::assignment_effort_rejection;
 use crate::execution::{self, ExecutionOutcome};
 use crate::executor_capabilities::ExecutorCapabilities;
 use crate::executor_transport::ExecutorTransport;
+use crate::logging::FailureReporter;
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::Client;
 use crate::runner::RunnerConnection;
@@ -34,6 +35,35 @@ pub fn run_assignment(
     cancellation: &CancellationToken,
     context: &execution::ExecutionContext<'_>,
 ) -> Result<AssignmentTaskOutcome, String> {
+    run_assignment_with_reporter(
+        config,
+        connection,
+        issue_client,
+        assignment,
+        run_logs,
+        default_capabilities_transport,
+        advertised_capabilities,
+        &FailureReporter::default(),
+        cancellation,
+        context,
+    )
+}
+
+/// Run an assignment while sharing operational failure suppression with the
+/// daemon poll loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_assignment_with_reporter(
+    config: &Config,
+    connection: &RunnerConnection,
+    issue_client: &Client,
+    assignment: RunnerAssignment,
+    run_logs: crate::protocol::client::RunLogBuffer,
+    default_capabilities_transport: &ExecutorTransport,
+    advertised_capabilities: &ExecutorCapabilities,
+    failure_reporter: &FailureReporter,
+    cancellation: &CancellationToken,
+    context: &execution::ExecutionContext<'_>,
+) -> Result<AssignmentTaskOutcome, String> {
     run_assignment_inner(
         AssignmentContext {
             config,
@@ -41,6 +71,7 @@ pub fn run_assignment(
             issue_client,
             default_capabilities_transport,
             advertised_capabilities,
+            failure_reporter,
             cancellation,
             context,
         },
@@ -55,6 +86,7 @@ struct AssignmentContext<'a> {
     issue_client: &'a Client,
     default_capabilities_transport: &'a ExecutorTransport,
     advertised_capabilities: &'a ExecutorCapabilities,
+    failure_reporter: &'a FailureReporter,
     cancellation: &'a CancellationToken,
     context: &'a execution::ExecutionContext<'a>,
 }
@@ -70,6 +102,7 @@ fn run_assignment_inner(
         issue_client,
         default_capabilities_transport,
         advertised_capabilities,
+        failure_reporter,
         cancellation,
         context,
     } = context;
@@ -121,9 +154,7 @@ fn run_assignment_inner(
     let capabilities = if &capabilities_transport == default_capabilities_transport {
         advertised_capabilities.clone()
     } else {
-        capabilities_transport
-            .discover_capabilities()
-            .unwrap_or_else(|error| ExecutorCapabilities::unavailable(error.to_string()))
+        capabilities_transport.discover_capabilities_reported(failure_reporter)
     };
     if cancellation.is_cancelled() {
         return Ok(AssignmentTaskOutcome::Cancelled);
@@ -172,13 +203,12 @@ fn run_assignment_inner(
     if cancellation.is_cancelled() {
         return Ok(AssignmentTaskOutcome::Cancelled);
     }
-    tracing::info!(
-        run_id = %assignment.run.id,
-        project = resolved.context().project(),
-        workflow = resolved.context().workflow(),
-        state = resolved.context().state(),
-        matched_overrides = ?resolved.resolution().matching_overrides(),
-        "assignment resolved for executor"
+    log_assignment_resolution(
+        &assignment.run.id,
+        resolved.context().project(),
+        resolved.context().workflow(),
+        resolved.context().state(),
+        &resolved.resolution().matching_overrides(),
     );
     let prepared =
         crate::assignment::PreparedAssignment::new(resolved).with_run_log_buffer(run_logs);
@@ -195,6 +225,23 @@ fn run_assignment_inner(
         ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
     })
     .map_err(|error| error.to_string())
+}
+
+fn log_assignment_resolution(
+    run_id: &str,
+    project: &str,
+    workflow: &str,
+    state: &str,
+    matched_overrides: &impl std::fmt::Debug,
+) {
+    tracing::debug!(
+        run_id,
+        project,
+        workflow,
+        state,
+        matched_overrides = ?matched_overrides,
+        "assignment resolved for executor"
+    );
 }
 
 fn report_interrupted_before_execution(
@@ -217,4 +264,32 @@ fn report_interrupted_before_execution(
         ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::log_assignment_resolution;
+    use crate::logging::test_support::capture_events;
+
+    #[test]
+    fn assignment_resolution_details_are_debug_events() {
+        let events = capture_events(|| {
+            log_assignment_resolution(
+                "arun_debug",
+                "Payments",
+                "Implementation",
+                "Implement",
+                &vec!["project override"],
+            );
+        });
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, tracing::Level::DEBUG);
+        assert!(
+            events[0]
+                .fields
+                .contains("assignment resolved for executor")
+        );
+        assert!(events[0].fields.contains("project override"));
+    }
 }

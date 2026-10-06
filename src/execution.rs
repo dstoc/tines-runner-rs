@@ -110,7 +110,9 @@ fn execute_assignment_cancellable_inner(
     if cancellation.is_cancelled() {
         return settle_canceled_assignment(&assignment, context.active_runs);
     }
-    let finish_request = output.stream.finish_request(
+    let finish_request = finish_executor_result(
+        &run_id,
+        &output.stream,
         output.failure.as_deref(),
         &output.stderr,
         output.interrupted,
@@ -161,6 +163,12 @@ fn run_executor(
     let mut stream = ExecutorEventStream::new_with_secrets(&request, &additional_secrets);
     let transport = ExecutorTransport::from_resolved(config);
     let run_id = assignment.assignment().run.id.clone();
+    tracing::debug!(
+        run_id,
+        transport = transport.config_source(),
+        harness = request.execution.harness,
+        "starting executor transport"
+    );
     let runner_token = connection.credentials().runner_token().to_owned();
     let run_logs = assignment.run_log_buffer();
     let deadline = Cell::new(None::<Instant>);
@@ -227,11 +235,6 @@ fn run_executor(
                         error.logs,
                         run_deadline,
                     );
-                    tracing::warn!(
-                        run_id,
-                        error = %error_message,
-                        "executor emitted invalid protocol output"
-                    );
                     *protocol_failure.borrow_mut() =
                         Some(format!("executor protocol failure: {error_message}"));
                 }
@@ -265,13 +268,6 @@ fn run_executor(
     let mut failure = protocol_failure.into_inner();
     let (stderr, cancelled, interrupted) = match result {
         Ok(output) => {
-            if !output.stderr.trim().is_empty() {
-                tracing::warn!(
-                    run_id,
-                    diagnostic = %output.stderr,
-                    "executor wrote to its diagnostic stream"
-                );
-            }
             if output.timed_out {
                 failure.get_or_insert_with(|| {
                     format!(
@@ -294,12 +290,9 @@ fn run_executor(
             (output.stderr, output.cancelled, output.interrupted)
         }
         Err(error) => {
+            let stderr = error.diagnostic_stderr().unwrap_or_default().to_owned();
             failure.get_or_insert_with(|| error.to_string());
-            (
-                String::new(),
-                cancellation.is_cancelled(),
-                shutdown.is_requested(),
-            )
+            (stderr, cancellation.is_cancelled(), shutdown.is_requested())
         }
     };
 
@@ -309,6 +302,49 @@ fn run_executor(
         stderr,
         cancelled,
         interrupted,
+    }
+}
+
+fn finish_executor_result(
+    run_id: &str,
+    stream: &ExecutorEventStream,
+    failure: Option<&str>,
+    stderr: &str,
+    interrupted: bool,
+) -> FinishRunRequest {
+    let primary = stream.finish_request(failure, "", interrupted);
+    let finish_request = stream.finish_request(failure, stderr, interrupted);
+    if finish_request.status == FinishStatus::Failed && !interrupted {
+        report_executor_result(
+            run_id,
+            primary
+                .error
+                .as_deref()
+                .or(Some("executor reported a failed run")),
+            stderr,
+        );
+    }
+    finish_request
+}
+
+fn report_executor_result(run_id: &str, failure: Option<&str>, stderr: &str) {
+    let Some(error) = failure else {
+        return;
+    };
+    let error = crate::diagnostic::format_bounded_diagnostic(
+        error,
+        crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+        crate::diagnostic::KeepPart::Suffix,
+    );
+    if stderr.trim().is_empty() {
+        tracing::error!(run_id, error, "executor invocation failed");
+    } else {
+        let diagnostic = crate::diagnostic::format_bounded_diagnostic(
+            stderr,
+            crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+            crate::diagnostic::KeepPart::Suffix,
+        );
+        tracing::error!(run_id, error, diagnostic, "executor invocation failed");
     }
 }
 
@@ -453,5 +489,75 @@ impl Error for ExecutionError {
             Self::FinishReport(error) => Some(error),
             Self::ActiveStateCleanup(error) => Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::{finish_executor_result, report_executor_result};
+    use crate::executor_events::ExecutorEventStream;
+    use crate::logging::test_support::capture_events;
+    use crate::protocol::FinishStatus;
+
+    #[test]
+    fn executor_failure_logs_bounded_error_and_useful_stderr() {
+        let stderr = format!("{}permission denied by executor", "diagnostic ".repeat(100));
+        let events = capture_events(|| {
+            report_executor_result("arun_failed", Some("executor exited with code 9"), &stderr);
+        });
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, tracing::Level::ERROR);
+        assert!(events[0].fields.contains("executor invocation failed"));
+        assert!(events[0].fields.contains("permission denied by executor"));
+        assert!(events[0].fields.contains("truncated"));
+        assert!(events[0].fields.chars().count() < 1_200);
+    }
+
+    #[test]
+    fn successful_executor_stderr_does_not_emit_a_warning() {
+        let events = capture_events(|| {
+            report_executor_result("arun_ok", None, "informational executor message");
+        });
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn production_finish_logging_keeps_primary_failure_with_long_stderr() {
+        let request =
+            serde_json::from_str(include_str!("../tests/fixtures/execution-request-v1.json"))
+                .expect("decode execution request fixture");
+        let stream = ExecutorEventStream::new(&request);
+        let stderr = format!("{}final useful stderr detail", "diagnostic ".repeat(100));
+
+        let (finish, events) = {
+            let mut finish = None;
+            let events = capture_events(|| {
+                finish = Some(finish_executor_result(
+                    "arun_failed",
+                    &stream,
+                    Some("executor protocol failure: invalid terminal event"),
+                    &stderr,
+                    false,
+                ));
+            });
+            (finish.expect("build finish request"), events)
+        };
+
+        assert_eq!(finish.status, FinishStatus::Failed);
+        assert!(finish.error.as_deref().is_some_and(|error| {
+            error.contains("executor protocol failure: invalid terminal event")
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, tracing::Level::ERROR);
+        assert!(
+            events[0]
+                .fields
+                .contains("executor protocol failure: invalid terminal event")
+        );
+        assert!(events[0].fields.contains("final useful stderr detail"));
+        assert!(events[0].fields.contains("truncated"));
+        assert!(events[0].fields.chars().count() < 1_200);
     }
 }

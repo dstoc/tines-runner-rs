@@ -10,6 +10,7 @@ use crate::assignment::PreparedAssignment;
 use crate::config::Config;
 use crate::executor_capabilities::ExecutorCapabilities;
 use crate::executor_transport::ExecutorTransport;
+use crate::logging::{FailureDisposition, FailureReporter};
 use crate::protocol::client::{ErrorCategory, RunLogBuffer};
 use crate::protocol::{
     RunnerCancellationAck, RunnerConcurrencyApplied, RunnerConcurrencyReport, RunnerPollRequest,
@@ -18,6 +19,7 @@ use crate::protocol::{
 use crate::runner::{RunnerConnection, RunnerError};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const POLL_FAILURE_PATH: &str = "runner-poll";
 
 /// Local ownership and protocol state kept across poll failures.
 ///
@@ -42,6 +44,7 @@ pub struct PollState {
     executor_harness: String,
     executor_capabilities: Option<ExecutorCapabilities>,
     executor_capabilities_refreshed_at: Option<Instant>,
+    failure_reporter: FailureReporter,
 }
 
 /// Result of reserving one server-delivered assignment in the local run set.
@@ -78,6 +81,7 @@ impl PollState {
             },
             executor_capabilities: None,
             executor_capabilities_refreshed_at: None,
+            failure_reporter: FailureReporter::default(),
         }
     }
 
@@ -188,14 +192,18 @@ impl PollState {
         if force || expired {
             self.executor_capabilities = Some(
                 self.capabilities_transport
-                    .discover_capabilities()
-                    .unwrap_or_else(|error| ExecutorCapabilities::unavailable(error.to_string())),
+                    .discover_capabilities_reported(&self.failure_reporter),
             );
             self.executor_capabilities_refreshed_at = Some(now);
         }
         self.executor_capabilities
             .as_ref()
             .expect("executor capabilities are discovered before use")
+    }
+
+    /// Shared operational failure tracking for capability probes and workers.
+    pub fn failure_reporter(&self) -> FailureReporter {
+        self.failure_reporter.clone()
     }
 
     /// The local concurrency cap after applying the latest server instruction.
@@ -393,10 +401,32 @@ impl PollLoop {
             let request = self.state.request();
             match self.connection.poll(&request) {
                 Ok(response) => {
+                    if let Some(recovery) = self.state.failure_reporter.recovered(POLL_FAILURE_PATH)
+                    {
+                        tracing::info!(
+                            failure_count = recovery.failures,
+                            outage_seconds = recovery.outage.as_secs(),
+                            "runner poll recovered"
+                        );
+                    }
+                    tracing::debug!(
+                        assignments = response.assignments.len(),
+                        cancel_requests = response.cancel_requests.len(),
+                        cancels = response.cancels.len(),
+                        "runner poll succeeded"
+                    );
                     if request.draining == Some(true) {
                         self.state.draining_poll_reported = true;
                     }
-                    self.state.observe(&response)?;
+                    if let Err(error) = self.state.observe(&response) {
+                        let diagnostic = crate::diagnostic::format_bounded_diagnostic(
+                            &error.to_string(),
+                            crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+                            crate::diagnostic::KeepPart::Suffix,
+                        );
+                        tracing::error!(error = %diagnostic, "runner rejected poll response");
+                        return Err(error);
+                    }
                     handle_response(&response, &mut self.state);
                     for (run_id, error) in self.state.assignment_failures() {
                         let mut finish_failures = 0u32;
@@ -442,11 +472,28 @@ impl PollLoop {
                 Err(error) if is_retryable(&error) => {
                     let delay = retry_delay(consecutive_failures);
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    tracing::warn!(
-                        error = %error,
-                        backoff_seconds = delay.as_secs(),
-                        "runner poll failed; retrying"
+                    let error = crate::diagnostic::format_bounded_diagnostic(
+                        &error.to_string(),
+                        crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+                        crate::diagnostic::KeepPart::Suffix,
                     );
+                    match self
+                        .state
+                        .failure_reporter
+                        .record_failure(POLL_FAILURE_PATH, &error)
+                    {
+                        FailureDisposition::First => tracing::warn!(
+                            error,
+                            backoff_seconds = delay.as_secs(),
+                            "runner poll failed; retrying"
+                        ),
+                        FailureDisposition::Repeated { failures } => tracing::debug!(
+                            error,
+                            failure_count = failures,
+                            backoff_seconds = delay.as_secs(),
+                            "runner poll still failing; retrying"
+                        ),
+                    }
                     let delay = if self.state.draining {
                         delay.min(Duration::from_secs(1))
                     } else {
@@ -460,7 +507,15 @@ impl PollLoop {
                         &mut self.state,
                     );
                 }
-                Err(error) => return Err(PollError::Runner(error)),
+                Err(error) => {
+                    let diagnostic = crate::diagnostic::format_bounded_diagnostic(
+                        &error.to_string(),
+                        crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
+                        crate::diagnostic::KeepPart::Suffix,
+                    );
+                    tracing::error!(error = %diagnostic, "runner poll failed permanently");
+                    return Err(PollError::Runner(error));
+                }
             }
         }
         Ok(())
@@ -557,6 +612,7 @@ mod tests {
     use crate::credentials::{CredentialStore, RunnerCredentials};
     use crate::effort::{EffortCapabilities, EffortModelCapability};
     use crate::executor_capabilities::{ExecutorCapabilities, ExecutorHarnessCapabilities};
+    use crate::logging::test_support::capture_events;
     use crate::protocol::client::RunLogBuffer;
     use crate::protocol::{RunnerCancellationAck, RunnerPollResponse};
     use crate::runner::RunnerConnection;
@@ -684,6 +740,15 @@ mod tests {
             config_with_concurrency(url, store.path(), allow_remote_concurrency, max_concurrent);
         let connection = RunnerConnection::connect(&config).expect("load runner connection");
         PollLoop::new(connection, &config)
+    }
+
+    fn cache_empty_capabilities(poller: &mut PollLoop) {
+        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
+            version: 1,
+            harnesses: BTreeMap::new(),
+            discovery_error: None,
+        });
+        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
     }
 
     #[test]
@@ -1261,6 +1326,158 @@ mod tests {
             .expect_err("rejected runner token must stop the daemon");
         assert!(error.to_string().contains("rejected the runner token"));
         assert_eq!(server.join().expect("mock server").len(), 1);
+    }
+
+    #[test]
+    fn successful_polls_are_debug_events_without_per_poll_info() {
+        let directory = TestDirectory::new();
+        let empty = r#"{"assignments":[],"cancels":[]}"#;
+        let (url, server) = mock_server(vec![(200, empty), (200, empty)]);
+        let mut poller = poller(&directory, &url, false);
+        cache_empty_capabilities(&mut poller);
+        let polls = Cell::new(0);
+
+        let events = capture_events(|| {
+            poller
+                .run_with(
+                    |_, _| polls.set(polls.get() + 1),
+                    || polls.get() < 2,
+                    |_| {},
+                )
+                .expect("complete two healthy polls");
+        });
+
+        assert_eq!(server.join().expect("mock server").len(), 2);
+        let poll_events = events
+            .iter()
+            .filter(|event| event.fields.contains("runner poll succeeded"))
+            .collect::<Vec<_>>();
+        assert_eq!(poll_events.len(), 2);
+        assert!(
+            poll_events
+                .iter()
+                .all(|event| event.level == tracing::Level::DEBUG)
+        );
+        assert!(!events.iter().any(|event| {
+            event.level == tracing::Level::INFO && event.fields.contains("runner poll succeeded")
+        }));
+    }
+
+    #[test]
+    fn repeated_poll_failures_are_suppressed_and_recovery_is_reported() {
+        let directory = TestDirectory::new();
+        let empty = r#"{"assignments":[],"cancels":[]}"#;
+        let retry = r#"{"error":{"code":"unavailable","message":"retry"}}"#;
+        let (url, server) = mock_server(vec![(503, retry), (503, retry), (200, empty)]);
+        let mut poller = poller(&directory, &url, false);
+        cache_empty_capabilities(&mut poller);
+        let successful_polls = Cell::new(0);
+
+        let events = capture_events(|| {
+            poller
+                .run_with(
+                    |_, _| successful_polls.set(successful_polls.get() + 1),
+                    || successful_polls.get() == 0,
+                    |_| {},
+                )
+                .expect("recover from transient poll failures");
+        });
+
+        assert_eq!(server.join().expect("mock server").len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.level == tracing::Level::WARN
+                        && event.fields.contains("runner poll failed; retrying")
+                })
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            event.level == tracing::Level::DEBUG
+                && event.fields.contains("runner poll still failing")
+                && event.fields.contains("failure_count=2")
+        }));
+        assert!(events.iter().any(|event| {
+            event.level == tracing::Level::INFO
+                && event.fields.contains("runner poll recovered")
+                && event.fields.contains("failure_count=2")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_probe_failure_logs_redacted_stderr_once_and_reports_recovery() {
+        let directory = TestDirectory::new();
+        let script = directory.0.join("capability-probe");
+        let fail_flag = directory.0.join("probe-fails");
+        fs::write(&fail_flag, "fail").expect("enable probe failure");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then printf 'capability permission denied: %s\\n' \"$1\" >&2; exit 9; fi\nprintf '%s\\n' '{{\"version\":1,\"harnesses\":{{}}}}'\n",
+                fail_flag.display()
+            ),
+        )
+        .expect("write capability probe");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make capability probe executable");
+        let argv = serde_json::to_string(&vec![
+            script.to_string_lossy().into_owned(),
+            "capability-argv-secret".to_owned(),
+        ])
+        .expect("encode capability command");
+        let cwd = serde_json::to_string(&directory.0.to_string_lossy().as_ref())
+            .expect("encode executor cwd");
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"probe-log-test\"\nexecutor = []\ncapabilities_executor = {argv}\nexecutor_cwd = {cwd}\n"
+        ))
+        .expect("parse test config");
+        let mut state = PollState::new(&config);
+
+        let events = capture_events(|| {
+            state.refresh_executor_capabilities(true);
+            state.refresh_executor_capabilities(true);
+            fs::remove_file(&fail_flag).expect("allow probe recovery");
+            state.refresh_executor_capabilities(true);
+        });
+
+        let probe_warnings = events
+            .iter()
+            .filter(|event| {
+                event.level == tracing::Level::WARN
+                    && event
+                        .fields
+                        .contains("executor capability discovery failed")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(probe_warnings.len(), 1);
+        assert!(
+            probe_warnings[0]
+                .fields
+                .contains("capability permission denied")
+        );
+        assert!(probe_warnings[0].fields.contains("[REDACTED]"));
+        assert!(!probe_warnings[0].fields.contains("capability-argv-secret"));
+        assert!(events.iter().any(|event| {
+            event.level == tracing::Level::DEBUG
+                && event
+                    .fields
+                    .contains("executor capability discovery still failing")
+                && event.fields.contains("failure_count=2")
+        }));
+        assert!(events.iter().any(|event| {
+            event.level == tracing::Level::INFO
+                && event
+                    .fields
+                    .contains("executor capability discovery recovered")
+                && event.fields.contains("failure_count=2")
+        }));
+        assert!(events.iter().any(|event| {
+            event.level == tracing::Level::DEBUG
+                && event.fields.contains("executor capabilities discovered")
+        }));
     }
 
     #[test]
