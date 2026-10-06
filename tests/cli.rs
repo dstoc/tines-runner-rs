@@ -877,14 +877,16 @@ fn multiple_named_runners_require_a_valid_runner_id() {
         &config_path,
         r#"[server]
 url = "https://tines.example.test"
+[runners.default]
+executor_cwd = "~"
 [runners.codex]
 name = "codex"
 credentials_file = "/tmp/codex-credentials.toml"
-executor_cwd = "~"
+runner_type = "codex"
 [runners.antigravity]
 name = "antigravity"
 credentials_file = "/tmp/antigravity-credentials.toml"
-executor_cwd = "~"
+runner_type = "codex"
 "#,
     )
     .expect("write shared named-runner config");
@@ -892,6 +894,7 @@ executor_cwd = "~"
     for (runner_id, expected) in [
         (None, "--runner <id> is required"),
         (Some("unknown"), "unknown runner id"),
+        (Some("default"), "reserved for [runners.default]"),
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
         command.arg("--config").arg(&config_path);
