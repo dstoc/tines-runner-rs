@@ -42,10 +42,12 @@ impl fmt::Display for ErrorCategory {
 }
 
 /// An HTTP failure that never stores a request header, response body, or URL.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Registration failures may retain a bounded, one-line validation message.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientError {
     category: ErrorCategory,
     status: Option<StatusCode>,
+    safe_message: Option<String>,
 }
 
 impl ClientError {
@@ -53,6 +55,7 @@ impl ClientError {
         Self {
             category: ErrorCategory::Protocol,
             status: None,
+            safe_message: None,
         }
     }
 
@@ -60,6 +63,7 @@ impl ClientError {
         Self {
             category: ErrorCategory::Retryable,
             status: None,
+            safe_message: None,
         }
     }
 
@@ -67,10 +71,20 @@ impl ClientError {
         Self {
             category: classify_http_status(status),
             status: Some(status),
+            safe_message: None,
         }
     }
 
+    #[cfg(test)]
     fn http_response(status: StatusCode, body: &serde_json::Value) -> Self {
+        Self::http_response_with_safe_message(status, body, false)
+    }
+
+    fn http_response_with_safe_message(
+        status: StatusCode,
+        body: &serde_json::Value,
+        preserve_validation_message: bool,
+    ) -> Self {
         // The current server uses 409 for both takeover fencing and a
         // retryable policy-reconciliation race. The message is the only
         // distinction in that protocol response.
@@ -85,14 +99,21 @@ impl ClientError {
                 classify_http_status(status)
             },
             status: Some(status),
+            safe_message: if preserve_validation_message && status.is_client_error() {
+                body["error"]["message"]
+                    .as_str()
+                    .and_then(sanitize_validation_message)
+            } else {
+                None
+            },
         }
     }
 
-    pub fn category(self) -> ErrorCategory {
+    pub fn category(&self) -> ErrorCategory {
         self.category
     }
 
-    pub fn status(self) -> Option<StatusCode> {
+    pub fn status(&self) -> Option<StatusCode> {
         self.status
     }
 }
@@ -100,14 +121,40 @@ impl ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.status {
-            Some(status) => write!(
-                f,
-                "Tines HTTP request failed with status {status} ({})",
-                self.category
-            ),
+            Some(status) => {
+                write!(
+                    f,
+                    "Tines HTTP request failed with status {status} ({})",
+                    self.category
+                )?;
+                if let Some(message) = &self.safe_message {
+                    write!(f, "; Tines validation message: {message}")?;
+                }
+                Ok(())
+            }
             None => write!(f, "Tines request failed ({})", self.category),
         }
     }
+}
+
+const MAX_VALIDATION_MESSAGE_LENGTH: usize = 300;
+
+fn sanitize_validation_message(message: &str) -> Option<String> {
+    let mut sanitized = String::new();
+    for character in message.chars() {
+        if character.is_control() {
+            if character.is_whitespace() && !sanitized.ends_with(' ') {
+                sanitized.push(' ');
+            }
+        } else {
+            sanitized.push(character);
+        }
+        if sanitized.chars().count() >= MAX_VALIDATION_MESSAGE_LENGTH {
+            break;
+        }
+    }
+    let sanitized = sanitized.trim();
+    (!sanitized.is_empty()).then(|| sanitized.to_owned())
 }
 
 impl std::error::Error for ClientError {}
@@ -177,7 +224,7 @@ impl Client {
         user_api_key: &str,
         request: &RegisterRunnerRequest,
     ) -> Result<RunnerTokenResponse, ClientError> {
-        self.post_json(&["runners", "register"], user_api_key, request)
+        self.post_json_with_safe_error_message(&["runners", "register"], user_api_key, request)
     }
 
     /// Check a runner token without letting the poll endpoint deliver work.
@@ -272,7 +319,20 @@ impl Client {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.post_json_with_deadline(path, bearer_token, body, None)
+        self.post_json_with_options(path, bearer_token, body, None, false)
+    }
+
+    fn post_json_with_safe_error_message<T, B>(
+        &self,
+        path: &[&str],
+        bearer_token: &str,
+        body: &B,
+    ) -> Result<T, ClientError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        self.post_json_with_options(path, bearer_token, body, None, true)
     }
 
     fn post_json_with_deadline<T, B>(
@@ -281,6 +341,21 @@ impl Client {
         bearer_token: &str,
         body: &B,
         deadline: Option<std::time::Instant>,
+    ) -> Result<T, ClientError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        self.post_json_with_options(path, bearer_token, body, deadline, false)
+    }
+
+    fn post_json_with_options<T, B>(
+        &self,
+        path: &[&str],
+        bearer_token: &str,
+        body: &B,
+        deadline: Option<std::time::Instant>,
+        preserve_validation_message: bool,
     ) -> Result<T, ClientError>
     where
         T: DeserializeOwned,
@@ -300,7 +375,7 @@ impl Client {
             }
             request = request.timeout(remaining.min(self.request_timeout));
         }
-        self.send_json(request, bearer_token)
+        self.send_json_with_options(request, bearer_token, preserve_validation_message)
     }
 
     fn send_json<T: DeserializeOwned>(
@@ -308,11 +383,24 @@ impl Client {
         request: RequestBuilder,
         bearer_token: &str,
     ) -> Result<T, ClientError> {
+        self.send_json_with_options(request, bearer_token, false)
+    }
+
+    fn send_json_with_options<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        bearer_token: &str,
+        preserve_validation_message: bool,
+    ) -> Result<T, ClientError> {
         let response = self.send(request, bearer_token)?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.json::<serde_json::Value>().unwrap_or_default();
-            return Err(ClientError::http_response(status, &body));
+            return Err(ClientError::http_response_with_safe_message(
+                status,
+                &body,
+                preserve_validation_message,
+            ));
         }
         response
             .json::<T>()
@@ -962,6 +1050,46 @@ mod tests {
         ] {
             assert_eq!(classify_http_status(status), ErrorCategory::Protocol);
         }
+    }
+
+    #[test]
+    fn registration_error_retains_only_a_bounded_single_line_validation_message() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "invalid_field",
+                "message": format!("invalid command\n{}", "x".repeat(400)),
+                "details": {"secret": "must not be retained"}
+            }
+        });
+        let error = super::ClientError::http_response_with_safe_message(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &body,
+            true,
+        );
+        let display = error.to_string();
+        let message = display
+            .split_once("Tines validation message: ")
+            .expect("include the validation message")
+            .1;
+
+        assert!(message.starts_with("invalid command "));
+        assert_eq!(
+            message.chars().count(),
+            super::MAX_VALIDATION_MESSAGE_LENGTH
+        );
+        assert!(!message.contains('\n'));
+        assert!(!display.contains("must not be retained"));
+
+        let ordinary_error =
+            super::ClientError::http_response(StatusCode::UNPROCESSABLE_ENTITY, &body);
+        assert!(!ordinary_error.to_string().contains("invalid command"));
+
+        let server_error = super::ClientError::http_response_with_safe_message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &body,
+            true,
+        );
+        assert!(!server_error.to_string().contains("invalid command"));
     }
 
     #[test]

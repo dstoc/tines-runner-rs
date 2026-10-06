@@ -17,6 +17,7 @@ use crate::protocol::{
 };
 
 const MAX_REGISTERED_CONCURRENCY: usize = 100;
+const MAX_REGISTERED_COMMAND_LENGTH: usize = 1000;
 
 /// A registered or reconnected local runner session.
 ///
@@ -41,10 +42,11 @@ impl RunnerConnection {
             return Err(RunnerError::InvalidConcurrency(config.max_concurrent));
         }
 
+        let request = registration_request(config)?;
         let client = Client::new(config.server_url.as_str()).map_err(RunnerError::ClientSetup)?;
         let key = BootstrapKey::from_env().map_err(RunnerError::BootstrapKey)?;
         let response = client
-            .register_runner(key.as_str(), &registration_request(config))
+            .register_runner(key.as_str(), &request)
             .map_err(RunnerError::Registration)?;
         if response.runner.id.is_empty() || response.runner_token.is_empty() {
             return Err(RunnerError::InvalidRegistrationResponse);
@@ -89,9 +91,10 @@ impl RunnerConnection {
             Err(CredentialError::Open { source, .. })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
+                let request = registration_request(config)?;
                 let key = bootstrap_key().map_err(RunnerError::BootstrapKey)?;
                 let response = client
-                    .register_runner(key.as_str(), &registration_request(config))
+                    .register_runner(key.as_str(), &request)
                     .map_err(RunnerError::Registration)?;
                 if response.runner.id.is_empty() || response.runner_token.is_empty() {
                     return Err(RunnerError::InvalidRegistrationResponse);
@@ -230,16 +233,25 @@ impl RunnerConnection {
     }
 }
 
-fn registration_request(config: &Config) -> RegisterRunnerRequest {
+fn registration_request(config: &Config) -> Result<RegisterRunnerRequest, RunnerError> {
     let harness = match config.runner_type {
         RunnerType::Codex => RunnerHarness::Codex,
         RunnerType::Custom => RunnerHarness::Custom,
     };
+    let command = match config.runner_type {
+        RunnerType::Codex => None,
+        RunnerType::Custom => Some(render_registered_command(
+            config
+                .custom_command
+                .as_deref()
+                .ok_or(RunnerError::MissingCustomCommand)?,
+        )?),
+    };
 
-    RegisterRunnerRequest {
+    Ok(RegisterRunnerRequest {
         name: config.runner_name.clone(),
         harness: Some(harness),
-        command: None,
+        command,
         max_concurrent: Some(config.max_concurrent as u32),
         max_run_minutes: None,
         hostname: local_hostname(),
@@ -248,7 +260,51 @@ fn registration_request(config: &Config) -> RegisterRunnerRequest {
             std::env::consts::OS,
             std::env::consts::ARCH
         )),
+    })
+}
+
+/// Render argv as POSIX shell-style metadata. The result is sent only as
+/// registration/display data; execution continues to use the original argv.
+fn render_registered_command(arguments: &[String]) -> Result<String, RunnerError> {
+    if arguments.is_empty()
+        || arguments[0].trim().is_empty()
+        || arguments.iter().any(|arg| arg.contains('\0'))
+    {
+        return Err(RunnerError::InvalidCustomCommand);
     }
+
+    let mut rendered = String::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            rendered.push(' ');
+        }
+        if !argument.is_empty() && argument.chars().all(is_shell_safe_unquoted) {
+            rendered.push_str(argument);
+        } else {
+            rendered.push('\'');
+            for character in argument.chars() {
+                if character == '\'' {
+                    rendered.push_str("'\\''");
+                } else {
+                    rendered.push(character);
+                }
+            }
+            rendered.push('\'');
+        }
+    }
+
+    let length = rendered.encode_utf16().count();
+    if length > MAX_REGISTERED_COMMAND_LENGTH {
+        return Err(RunnerError::RegisteredCommandTooLong {
+            length,
+            limit: MAX_REGISTERED_COMMAND_LENGTH,
+        });
+    }
+    Ok(rendered)
+}
+
+fn is_shell_safe_unquoted(character: char) -> bool {
+    character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character)
 }
 
 fn local_hostname() -> Option<String> {
@@ -273,6 +329,12 @@ pub enum RunnerError {
         source: CredentialError,
     },
     InvalidConcurrency(usize),
+    MissingCustomCommand,
+    InvalidCustomCommand,
+    RegisteredCommandTooLong {
+        length: usize,
+        limit: usize,
+    },
     InvalidRegistrationResponse,
     RejectedRunnerToken {
         runner_id: String,
@@ -301,6 +363,16 @@ impl fmt::Display for RunnerError {
                 f,
                 "runner max_concurrent must be between 1 and {MAX_REGISTERED_CONCURRENCY} (got {value})"
             ),
+            Self::MissingCustomCommand => {
+                f.write_str("custom runner registration requires a configured custom_command")
+            }
+            Self::InvalidCustomCommand => f.write_str(
+                "custom runner registration requires a non-empty executable argument and arguments without null bytes",
+            ),
+            Self::RegisteredCommandTooLong { length, limit } => write!(
+                f,
+                "rendered custom command is {length} UTF-16 code units; Tines supports at most {limit}"
+            ),
             Self::InvalidRegistrationResponse => {
                 f.write_str("Tines returned an empty runner ID or runner token")
             }
@@ -327,6 +399,9 @@ impl Error for RunnerError {
             Self::PersistRegisteredCredentials { source, .. } => Some(source),
             Self::BootstrapKey(error) => Some(error),
             Self::InvalidConcurrency(_)
+            | Self::MissingCustomCommand
+            | Self::InvalidCustomCommand
+            | Self::RegisteredCommandTooLong { .. }
             | Self::InvalidRegistrationResponse
             | Self::RejectedRunnerToken { .. } => None,
             Self::Superseded { .. } => None,
@@ -336,7 +411,10 @@ impl Error for RunnerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunnerConnection, RunnerError, registration_request};
+    use super::{
+        MAX_REGISTERED_COMMAND_LENGTH, RunnerConnection, RunnerError, registration_request,
+        render_registered_command,
+    };
     use crate::config::Config;
     use crate::credentials::{BootstrapKey, CredentialStore, RunnerCredentials};
     use crate::protocol::client::{Client, RunLogBuffer};
@@ -473,6 +551,7 @@ mod tests {
         let body = request_json(&request);
         assert_eq!(body["name"], "codex-test");
         assert_eq!(body["harness"], "codex");
+        assert!(body.get("command").is_none());
         assert_eq!(body["max_concurrent"], 3);
         assert_eq!(
             body["platform"],
@@ -497,11 +576,145 @@ mod tests {
         ))
         .expect("custom runner config");
 
-        let request = serde_json::to_value(registration_request(&config))
-            .expect("serialize registration request");
+        let request =
+            serde_json::to_value(registration_request(&config).expect("registration request"))
+                .expect("serialize registration request");
         assert_eq!(request["harness"], "custom");
         assert_eq!(request["name"], "checks-runner");
-        assert!(request.get("command").is_none());
+        assert_eq!(request["command"], "checks");
+    }
+
+    #[test]
+    fn custom_registration_sends_a_quoted_display_command() {
+        let directory = TestDirectory::new();
+        let (url, server) = mock_response(
+            201,
+            r#"{"runner":{"id":"rnr_custom"},"runner_token":"runner-secret"}"#,
+        );
+        let mut config = config(&url, &directory.credentials_path());
+        config.runner_name = "checks-runner".to_owned();
+        config.runner_type = crate::config::RunnerType::Custom;
+        config.custom_command = Some(vec![
+            "node".to_owned(),
+            "/home/user/github-status-checks.mjs".to_owned(),
+            "--prompt".to_owned(),
+            "{prompt_file}".to_owned(),
+            "--workspace".to_owned(),
+            "{workspace}".to_owned(),
+            "value with spaces".to_owned(),
+            "it's $HOME".to_owned(),
+        ]);
+
+        let connection = RunnerConnection::connect_with_key_provider(
+            &config,
+            Client::new(&url).expect("Tines client"),
+            || BootstrapKey::from_value("user-api-secret"),
+        )
+        .expect("custom runner registration");
+        assert!(connection.registered());
+
+        let request = server.join().expect("mock registration request");
+        let body = request_json(&request);
+        assert_eq!(body["harness"], "custom");
+        assert_eq!(
+            body["command"],
+            "node /home/user/github-status-checks.mjs --prompt '{prompt_file}' --workspace '{workspace}' 'value with spaces' 'it'\\''s $HOME'"
+        );
+    }
+
+    #[test]
+    fn custom_registration_reports_tines_validation_messages() {
+        let directory = TestDirectory::new();
+        let (url, server) = mock_response(
+            422,
+            r#"{"error":{"code":"invalid_field","message":"The custom harness needs a config.command template"}}"#,
+        );
+        let mut config = config(&url, &directory.credentials_path());
+        config.runner_type = crate::config::RunnerType::Custom;
+        config.custom_command = Some(vec!["checks".to_owned()]);
+
+        let error = match RunnerConnection::connect_with_key_provider(
+            &config,
+            Client::new(&url).expect("Tines client"),
+            || BootstrapKey::from_value("user-api-secret"),
+        ) {
+            Ok(_) => panic!("validation failure should be reported"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request failed with status 422")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("The custom harness needs a config.command template")
+        );
+        let request = server.join().expect("mock registration request");
+        assert_eq!(request_json(&request)["harness"], "custom");
+    }
+
+    #[test]
+    fn overlong_custom_registration_command_fails_locally() {
+        let directory = TestDirectory::new();
+        let mut config = config("http://127.0.0.1:1", &directory.credentials_path());
+        config.runner_type = crate::config::RunnerType::Custom;
+        config.custom_command = Some(vec!["x".repeat(MAX_REGISTERED_COMMAND_LENGTH + 1)]);
+
+        let error = match RunnerConnection::connect_with_key_provider(
+            &config,
+            Client::new(config.server_url.as_str()).expect("Tines client"),
+            || panic!("an invalid command must fail before reading the bootstrap key"),
+        ) {
+            Ok(_) => panic!("overlong command must fail before registration"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RunnerError::RegisteredCommandTooLong {
+                length: 1001,
+                limit: 1000
+            }
+        ));
+        assert!(error.to_string().contains("Tines supports at most 1000"));
+    }
+
+    #[test]
+    fn registered_command_renderer_quotes_shell_special_characters_and_empty_args() {
+        let command = render_registered_command(&[
+            "node".to_owned(),
+            "two words".to_owned(),
+            "it's".to_owned(),
+            String::new(),
+            "$(echo hi)".to_owned(),
+        ])
+        .expect("render command");
+
+        assert_eq!(command, "node 'two words' 'it'\\''s' '' '$(echo hi)'");
+    }
+
+    #[test]
+    fn registered_command_length_matches_tines_utf16_limit() {
+        let command =
+            render_registered_command(&["😀".repeat((MAX_REGISTERED_COMMAND_LENGTH - 2) / 2)])
+                .expect("1000 UTF-16 code units are accepted");
+        assert_eq!(
+            command.encode_utf16().count(),
+            MAX_REGISTERED_COMMAND_LENGTH
+        );
+
+        let error = render_registered_command(&["😀".repeat(MAX_REGISTERED_COMMAND_LENGTH / 2)])
+            .expect_err("1002 UTF-16 code units exceed the limit");
+        assert!(matches!(
+            error,
+            RunnerError::RegisteredCommandTooLong {
+                length: 1002,
+                limit: 1000
+            }
+        ));
     }
 
     #[test]
