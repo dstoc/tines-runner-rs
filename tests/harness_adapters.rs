@@ -119,9 +119,20 @@ fn semantic_selection_builds_codex_command_in_executor_path_with_safe_diagnostic
 fn custom_adapter_does_not_require_codex_effort_capabilities() {
     let mut request = request();
     request.execution.harness = "custom".to_owned();
-    request.execution.custom_command = Some(vec!["custom-command".to_owned()]);
+    request.execution.custom_command = Some(vec![
+        "custom-command".to_owned(),
+        "argument with spaces".to_owned(),
+        "literal $HOME; $(touch sentinel)".to_owned(),
+        "{prompt_file}".to_owned(),
+        "{workspace}".to_owned(),
+    ]);
     let original_effort = request.assignment.effort.clone();
     let (_parent, workspace) = workspace_for(&request);
+    let workspace_path = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let prompt_file = workspace_path.join("prompt.md");
     let adapter = adapter_for(&request.execution.harness).expect("select custom adapter");
     let capabilities =
         EffortCapabilities::unavailable("0.1.0", "codex", "Codex capability discovery failed");
@@ -131,6 +142,19 @@ fn custom_adapter_does_not_require_codex_effort_capabilities() {
         .expect("build custom launch without Codex effort support");
 
     assert_eq!(launch.command().get_program(), "custom-command");
+    assert_eq!(
+        launch
+            .command()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        [
+            "argument with spaces",
+            "literal $HOME; $(touch sentinel)",
+            prompt_file.to_str().expect("prompt path"),
+            workspace_path.to_str().expect("workspace path"),
+        ]
+    );
     assert_eq!(request.assignment.effort, original_effort);
     assert!(!launch.diagnostics().contains("effort="));
     workspace.cleanup().expect("remove executor workspace");
