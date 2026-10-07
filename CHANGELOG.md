@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/dstoc/tines-runner-rs/compare/v0.6.0...v0.7.0) (2026-10-07)
+
+
+### Features
+
+* **runner:** supervise all configured runners ([#68](https://github.com/dstoc/tines-runner-rs/issues/68)) ([573a778](https://github.com/dstoc/tines-runner-rs/commit/573a7786e559ec939d7ce84baa892e9b05b8449b))
+
+
+### Bug Fixes
+
+* **poll:** omit effort capabilities for custom runners ([#67](https://github.com/dstoc/tines-runner-rs/issues/67)) ([2561964](https://github.com/dstoc/tines-runner-rs/commit/2561964b91299ca45c0998ba8ca73e32eb132775))
+
 ## [0.6.0](https://github.com/dstoc/tines-runner-rs/compare/v0.5.0...v0.6.0) (2026-10-06)
 
 
