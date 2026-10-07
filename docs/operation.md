@@ -146,9 +146,11 @@ and `[runners.codex].executor_cwd` are required. `[storage].state_dir` is
 optional and defaults to a writable platform state directory. The server URL
 must use HTTP or HTTPS. The supported `runner_type` values are `codex` and
 `custom`.
-`executor_cwd` has no default. The runner expands `~` and resolves a relative
-path under the daemon account's home directory. The runner registers with
-Tines using the configured name and concurrency. Tines and this local
+`executor_cwd` has no default. The runner keeps absolute paths, expands `~`
+against the daemon user's home, and resolves other relative daemon-side paths
+against the directory that contains the selected config file. This also
+applies to `credentials_file` and `[storage].state_dir`. The runner registers
+with Tines using the configured name and concurrency. Tines and this local
 configuration must agree about which work the runner can accept. If a config
 defines multiple runners, pass `--runner <id>` to `--check` and `register`.
 Omit `--runner` on a daemon command to start all named runners.
@@ -161,8 +163,8 @@ executor environment.
 
 Set `[runners.codex].executor_cwd` in the base configuration. It is required and has
 no implicit default. An override can replace its value for matching
-assignments. The daemon expands `~` and resolves a relative value under the
-daemon account's home directory, then uses that path as the working directory
+assignments. The daemon expands `~` and resolves a relative value against the
+selected config file's directory, then uses that path as the working directory
 when it starts the executor transport process. The path must exist and be
 accessible to that account.
 
@@ -211,8 +213,10 @@ retention settings. The executor resolves that value in its own filesystem
 and creates one `run-<UUID>` workspace there. A configured `~` resolves under
 the executor account's home. If `workspace_parent` is omitted, the executor
 uses its platform default. The daemon expands `~` in its own paths, including
-`executor_cwd` and `credentials_file`. Unknown configuration keys cause
-startup to fail.
+`executor_cwd` and `credentials_file`. Other relative paths for daemon-side
+settings resolve against the selected config file's directory. The daemon
+leaves `workspace_parent` and values inside executor argv arrays unchanged.
+Unknown configuration keys cause startup to fail.
 
 ### Active-run state directory
 
@@ -223,7 +227,7 @@ recovery state is separate from credentials. The default state
 directory is `${XDG_STATE_HOME:-~/.local/state}/tines-runner-rs` on Linux,
 `${XDG_STATE_HOME:-~/Library/Application Support}/tines-runner-rs` on macOS,
 and `${XDG_STATE_HOME:-%LOCALAPPDATA%}/tines-runner-rs` on Windows. An explicit
-relative `[storage].state_dir` resolves under the daemon account's home
+relative `[storage].state_dir` resolves against the selected config file's
 directory. The runner uses `XDG_STATE_HOME` only when it is an absolute path.
 
 At startup, the daemon creates the directory if needed and checks that it can
