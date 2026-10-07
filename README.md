@@ -65,15 +65,16 @@ Start with this configuration and replace the URL and runner name:
 url = "https://tines.example.com"
 
 [runners.codex]
-credentials_file = "~/.config/tines-runner-rs/codex-credentials.toml"
+credentials_file = "./credentials/codex-credentials.toml"
 name = "workstation-codex"
 runner_type = "codex"
 executor = ["tines-runner-rs"]
-executor_cwd = "~"
+executor_cwd = "."
 max_concurrent = 1
 poll_interval_seconds = 15
 
 [storage]
+state_dir = "./state"
 keep_workspaces = "never"
 ```
 
@@ -81,11 +82,14 @@ keep_workspaces = "never"
 and `[runners.codex].executor_cwd` are required. `[storage].state_dir` is
 optional and defaults to a writable per-user state directory. The table name
 `codex` is the local runner ID. The runner type defaults to `codex`. Set it to
-`custom` to run a configured command. The daemon expands `~` in its paths, including
-`executor_cwd` and `credentials_file`. It sends the configured
-`workspace_parent` to the executor, which resolves it in its own environment.
-If it is omitted, the executor uses its platform default. Unknown settings
-cause startup to fail.
+`custom` to run a configured command. The daemon keeps absolute paths, expands
+`~` against the daemon user's home, and resolves other relative daemon-side
+paths against the directory that contains the selected config file. This
+applies to `credentials_file`, `[storage].state_dir`, and `executor_cwd`. In
+this example, those relative paths are under the directory containing
+`config.toml`. The daemon sends `workspace_parent` to the executor, which
+resolves it in its own environment. If it is omitted, the executor uses its
+platform default. Unknown settings cause startup to fail.
 
 ### 2. Register and validate
 
@@ -262,7 +266,7 @@ lists remain local to each named runner.
 | `[runners.<id>].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
 | `[runners.<id>].executor` | Argument array used to reach the executor. The runner appends `execute` and does not use a shell. Defaults to `["tines-runner-rs"]`. |
 | `[runners.<id>].capabilities_executor` | Optional argument array used only for capability discovery. The runner appends `capabilities`; when unset, it uses the resolved `executor` command. |
-| `[runners.<id>].executor_cwd` | Required after inheritance. Set it on this runner or `[runners.default]`. A relative path resolves under the daemon account's home directory. |
+| `[runners.<id>].executor_cwd` | Required after inheritance. Set it on this runner or `[runners.default]`. A relative path resolves against the selected config file's directory. |
 | `[runners.<id>].run_key_delivery` | How the daemon sends each assignment's run key to the executor transport: `request` (default) or `environment`. |
 | `[runners.<id>].max_concurrent` | Maximum local assignments at once; must be greater than zero. Defaults to `1`. |
 | `[runners.<id>].poll_interval_seconds` | Poll interval. Must be greater than zero; defaults to `15`. |

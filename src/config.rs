@@ -223,7 +223,10 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml_str_for_runner(&contents, runner_id).map_err(|error| error.with_path(path))
+        let mut defaults = default_paths()?;
+        defaults.config_dir = config_file_directory(path)?;
+        Self::from_toml_str_with_defaults_and_runner(&contents, defaults, runner_id)
+            .map_err(|error| error.with_path(path))
     }
 
     /// Load every named runner for daemon supervision, or one selected runner.
@@ -237,16 +240,21 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml_str_for_daemon(&contents, runner_id).map_err(|error| error.with_path(path))
+        let mut defaults = default_paths()?;
+        defaults.config_dir = config_file_directory(path)?;
+        Self::from_toml_str_for_daemon(&contents, runner_id, defaults)
+            .map_err(|error| error.with_path(path))
     }
 
     fn from_toml_str_for_daemon(
         contents: &str,
         runner_id: Option<&str>,
+        defaults: DefaultPaths,
     ) -> Result<Vec<Self>, ConfigError> {
         if let Some(runner_id) = runner_id {
-            return Ok(vec![Self::from_toml_str_for_runner(
+            return Ok(vec![Self::from_toml_str_with_defaults_and_runner(
                 contents,
+                defaults,
                 Some(runner_id),
             )?]);
         }
@@ -260,17 +268,25 @@ impl Config {
             .cloned()
             .collect::<Vec<_>>();
         if runner_ids.is_empty() {
-            return Ok(vec![Self::from_toml_str_for_runner(contents, None)?]);
+            return Ok(vec![Self::from_toml_str_with_defaults_and_runner(
+                contents, defaults, None,
+            )?]);
         }
 
         runner_ids
             .iter()
-            .map(|runner_id| Self::from_toml_str_for_runner(contents, Some(runner_id)))
+            .map(|runner_id| {
+                Self::from_toml_str_with_defaults_and_runner(
+                    contents,
+                    defaults.clone(),
+                    Some(runner_id),
+                )
+            })
             .collect()
     }
 
-    /// Parse configuration TOML and expand path settings using the current
-    /// home and platform/XDG directories.
+    /// Parse TOML without a config file path. Relative daemon-side paths use
+    /// the platform config directory as their base.
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
         Self::from_toml_str_for_runner(contents, None)
     }
@@ -420,14 +436,17 @@ impl Config {
                 )
             })?,
             &defaults.home,
+            &defaults.config_dir,
         )?;
-        let credentials_file = expand_path(&credentials_path, &defaults.home)?;
+        let credentials_file =
+            resolve_daemon_path(&credentials_path, &defaults.home, &defaults.config_dir)?;
         let state_dir = resolve_state_dir(
             raw_storage
                 .state_dir
                 .as_deref()
                 .unwrap_or(&defaults.state_dir),
             &defaults.home,
+            &defaults.config_dir,
         )?;
         let active_runs_file =
             active_runs_file(&state_dir, local_id.as_deref().unwrap_or("default"));
@@ -490,7 +509,9 @@ impl Config {
                     executor_cwd: rule
                         .executor_cwd
                         .as_deref()
-                        .map(|path| resolve_executor_cwd(path, &defaults.home))
+                        .map(|path| {
+                            resolve_executor_cwd(path, &defaults.home, &defaults.config_dir)
+                        })
                         .transpose()?,
                 })
             })
@@ -628,7 +649,8 @@ fn select_runner(
                     "[runners.{id}].credentials_file must not be empty"
                 )));
             }
-            let credentials_file = expand_path(credentials_file, &defaults.home)?;
+            let credentials_file =
+                resolve_daemon_path(credentials_file, &defaults.home, &defaults.config_dir)?;
             let comparison_path = normalize_path_for_comparison(&credentials_file);
             if let Some(other_id) = credential_owners.insert(comparison_path, id.clone()) {
                 return Err(ConfigError::Invalid(format!(
@@ -692,24 +714,7 @@ fn validate_runner_template(template: &RawRunner) -> Result<(), ConfigError> {
 }
 
 fn normalize_path_for_comparison(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir().unwrap_or_default().join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
+    normalize_path_lexically(path)
 }
 
 fn active_runs_file(state_dir: &Path, runner_id: &str) -> PathBuf {
@@ -895,6 +900,8 @@ struct RawOverride {
 #[derive(Clone, Debug)]
 struct DefaultPaths {
     home: PathBuf,
+    /// Base directory for daemon-side paths from the selected config file.
+    config_dir: PathBuf,
     workspace_parent: PathBuf,
     credentials_file: PathBuf,
     state_dir: PathBuf,
@@ -996,38 +1003,89 @@ fn default_paths_for(
 
     DefaultPaths {
         home: home.clone(),
+        config_dir: config_dir.clone(),
         credentials_file: config_dir.join("credentials.toml"),
         workspace_parent: data_dir.join("tines-runner-rs").join("workspaces"),
         state_dir,
     }
 }
 
-fn resolve_executor_cwd(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
+fn resolve_executor_cwd(
+    path: &Path,
+    home: &Path,
+    config_dir: &Path,
+) -> Result<PathBuf, ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid(
             "executor_cwd must not be empty".to_owned(),
         ));
     }
-    let expanded = expand_path(path, home)?;
-    if expanded.is_absolute() {
-        Ok(expanded)
-    } else {
-        Ok(home.join(expanded))
-    }
+    resolve_daemon_path(path, home, config_dir)
 }
 
-fn resolve_state_dir(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
+fn resolve_state_dir(path: &Path, home: &Path, config_dir: &Path) -> Result<PathBuf, ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid(
             "state_dir must not be empty".to_owned(),
         ));
     }
+    resolve_daemon_path(path, home, config_dir)
+}
+
+fn resolve_daemon_path(
+    path: &Path,
+    home: &Path,
+    config_dir: &Path,
+) -> Result<PathBuf, ConfigError> {
     let expanded = expand_path(path, home)?;
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
-        Ok(home.join(expanded))
+        Ok(normalize_path_lexically(&config_dir.join(expanded)))
     }
+}
+
+fn config_file_directory(path: &Path) -> Result<PathBuf, ConfigError> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| {
+                ConfigError::Invalid(format!("could not resolve config file directory: {error}"))
+            })?
+            .join(path)
+    };
+    let directory = absolute_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "could not determine parent directory for config file {}",
+                path.display()
+            ))
+        })?;
+    Ok(normalize_path_lexically(&directory))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let is_absolute = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some_and(|name| name != "..") {
+                    normalized.pop();
+                } else if !is_absolute {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn validate_custom_command(command: &[String]) -> Result<(), ConfigError> {
@@ -1063,11 +1121,29 @@ fn expand_path(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use super::*;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("tines-runner-config-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create config test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn defaults() -> DefaultPaths {
         let home = PathBuf::from("/home/tester");
         let config_dir = home.join(".config/tines-runner-rs");
         DefaultPaths {
             home: home.clone(),
+            config_dir: config_dir.clone(),
             workspace_parent: home.join(".local/share/tines-runner-rs/workspaces"),
             credentials_file: config_dir.join("credentials.toml"),
             state_dir: home.join(".local/state/tines-runner-rs"),
@@ -1580,7 +1656,7 @@ executor_cwd = "/srv/antigravity"
         .unwrap();
         assert_eq!(
             relative.state_dir,
-            PathBuf::from("/home/tester/runner-state")
+            defaults().config_dir.join("runner-state")
         );
     }
 
@@ -2125,7 +2201,7 @@ executor_cwd = "review"
 
         let state = config.resolve(context("Other", "Build", "review"));
         assert_eq!(state.executor[0], "docker");
-        assert_eq!(state.executor_cwd, PathBuf::from("/home/tester/review"));
+        assert_eq!(state.executor_cwd, defaults().config_dir.join("review"));
 
         let fallback = config.resolve(context("Other", "Build", "Ready"));
         assert_eq!(fallback.executor, ["tines-runner-rs"]);
@@ -2202,13 +2278,13 @@ executor = ["review-executor"]
     }
 
     #[test]
-    fn explicit_executor_cwd_resolves_under_home_and_empty_is_rejected() {
+    fn tilde_executor_cwd_resolves_under_home_and_empty_is_rejected() {
         let config = Config::from_toml_str_with_defaults(
             r#"[server]
 url = "https://tines.example.test"
 [runner]
 name = "test-runner"
-executor_cwd = "executor"
+executor_cwd = "~/executor"
 "#,
             defaults(),
         )
@@ -2226,6 +2302,103 @@ executor_cwd = ""
         )
         .unwrap_err();
         assert!(error.to_string().contains("executor_cwd must not be empty"));
+    }
+
+    #[test]
+    fn file_loaded_paths_use_the_config_directory_and_keep_executor_values_opaque() {
+        let directory = TestDirectory::new();
+        let config_dir = directory.0.join("config");
+        fs::create_dir_all(&config_dir).expect("create config directory");
+        let config_path = config_dir.join("runner.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+url = "https://tines.example.test"
+
+[runners.default]
+executor = ["transport", "file:./secrets/foo"]
+capabilities_executor = ["probe", "./probe-config"]
+executor_cwd = "."
+workspace_parent = "./workspaces"
+
+[runners.codex]
+name = "codex"
+runner_type = "codex"
+credentials_file = "./credentials/codex.toml"
+custom_command = ["./custom-agent", "--config", "./agent/config.toml"]
+
+[[runners.codex.override]]
+project = "Payments"
+executor_cwd = "./project-cwd"
+workspace_parent = "./payment-workspaces"
+capabilities_executor = ["probe", "file:./payment-secrets/probe"]
+
+[[runners.codex.override]]
+workflow = "Build"
+executor_cwd = "./workflow-cwd"
+
+[[runners.codex.override]]
+state = "Review"
+executor_cwd = "./state-cwd"
+
+[storage]
+state_dir = "./state"
+"#,
+        )
+        .expect("write config file");
+
+        let configs = Config::load_for_daemon(&config_path, None).unwrap();
+        assert_eq!(configs.len(), 1);
+        let config = &configs[0];
+        assert_ne!(std::env::current_dir().unwrap(), config_dir);
+        assert_eq!(
+            config.credentials_file,
+            config_dir.join("credentials/codex.toml")
+        );
+        assert_eq!(config.state_dir, config_dir.join("state"));
+        assert_eq!(config.executor_cwd, config_dir);
+        assert_eq!(config.workspace_parent, Some(PathBuf::from("./workspaces")));
+        assert_eq!(config.executor, ["transport", "file:./secrets/foo"]);
+        assert_eq!(
+            config.capabilities_executor,
+            Some(vec!["probe".to_owned(), "./probe-config".to_owned()])
+        );
+        assert_eq!(
+            config.custom_command,
+            Some(vec![
+                "./custom-agent".to_owned(),
+                "--config".to_owned(),
+                "./agent/config.toml".to_owned()
+            ])
+        );
+
+        let payment = config.resolve(context("Payments", "Other", "Other"));
+        assert_eq!(
+            payment.executor_cwd,
+            config_path.parent().unwrap().join("project-cwd")
+        );
+        assert_eq!(
+            payment.workspace_parent,
+            Some(PathBuf::from("./payment-workspaces"))
+        );
+        assert_eq!(
+            payment.capabilities_executor,
+            Some(vec![
+                "probe".to_owned(),
+                "file:./payment-secrets/probe".to_owned()
+            ])
+        );
+        let workflow = config.resolve(context("Other", "Build", "Implement"));
+        assert_eq!(
+            workflow.executor_cwd,
+            config_path.parent().unwrap().join("workflow-cwd")
+        );
+        let state = config.resolve(context("Other", "Other", "Review"));
+        assert_eq!(
+            state.executor_cwd,
+            config_path.parent().unwrap().join("state-cwd")
+        );
     }
 
     #[test]

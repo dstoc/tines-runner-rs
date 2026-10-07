@@ -570,6 +570,61 @@ fn sends_large_request_on_stdin_with_explicit_cwd_and_direct_argv() {
 }
 
 #[test]
+fn relative_config_executor_cwd_is_used_to_launch_the_transport() {
+    let directory = TestDirectory::new();
+    let config_directory = directory.0.join("config");
+    fs::create_dir_all(&config_directory).expect("create config directory");
+    let cwd_path = directory.0.join("seen-config-cwd");
+    let stub = directory.0.join("executor-stub");
+    write_executable(
+        &stub,
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\npwd > '{}'\nprintf '%s' '{}'\n",
+            cwd_path.display(),
+            result_event()
+        ),
+    );
+    let argv = serde_json::to_string(&[stub.to_string_lossy().into_owned()])
+        .expect("serialize executor argv");
+    let config_path = config_directory.join("runner.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"relative-path-test\"\nexecutor = {argv}\nexecutor_cwd = \".\"\ncredentials_file = \"./credentials/codex.toml\"\n[storage]\nstate_dir = \"./state\"\n"
+        ),
+    )
+    .expect("write config file");
+
+    let config = Config::load(&config_path).expect("load config-relative runner paths");
+    assert_eq!(config.executor_cwd, config_directory);
+    assert_eq!(
+        config.credentials_file,
+        config_directory.join("credentials/codex.toml")
+    );
+    assert_eq!(config.state_dir, config_directory.join("state"));
+    let resolved = config.resolve(MatchContext {
+        project: "Tines",
+        workflow: "Implementation",
+        state: "Implement",
+    });
+    let transport = ExecutorTransport::from_resolved(&resolved);
+    let output = transport
+        .run(
+            &request("relative config cwd".to_owned()),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            |_| {},
+        )
+        .expect("run executor from config-relative cwd");
+
+    assert_eq!(output.exit, ProcessExit::Code(0));
+    assert_eq!(
+        fs::read_to_string(cwd_path).unwrap().trim(),
+        config_directory.canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[test]
 fn launches_container_style_argv_and_redacts_bounded_stderr() {
     let directory = TestDirectory::new();
     let working_directory = directory.0.join("container-cwd");
