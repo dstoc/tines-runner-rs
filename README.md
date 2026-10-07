@@ -80,9 +80,8 @@ keep_workspaces = "never"
 `[server].url`, `[runners.codex].name`, `[runners.codex].credentials_file`,
 and `[runners.codex].executor_cwd` are required. `[storage].state_dir` is
 optional and defaults to a writable per-user state directory. The table name
-`codex` is the local runner ID. Pass it with `--runner codex` when the file defines more than
-one runner. The runner type defaults to `codex`. Set it to `custom` to run a
-configured command. The daemon expands `~` in its paths, including
+`codex` is the local runner ID. The runner type defaults to `codex`. Set it to
+`custom` to run a configured command. The daemon expands `~` in its paths, including
 `executor_cwd` and `credentials_file`. It sends the configured
 `workspace_parent` to the executor, which resolves it in its own environment.
 If it is omitted, the executor uses its platform default. Unknown settings
@@ -211,19 +210,20 @@ Each named runner must set its own `name`, `runner_type`, and
 overrides remain local to each named runner. Keep shared recovery storage in
 the top-level `[storage].state_dir` table.
 
-Register, check, and start each runner with the same config and its ID:
+Register and check each runner with the same config and its ID. Starting the
+daemon without `--runner` supervises every named runner in one process:
 
 ```sh
 tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex --check
 tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity --check
-tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex
-tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity
+tines-runner-rs --config /etc/tines-runner-rs/config.toml
 ```
 
-Each command starts one daemon for the selected definition. The credentials
-paths must be distinct, so the definitions register as separate Tines runners
-and keep persisted state separate. Each process also keeps its own capability
-cache. Set `TINES_API_KEY` for the first `--check` of each runner.
+Each runner needs its own credentials file and Tines registration. The daemon
+keeps each runner's poll loop, capability cache, concurrency limit, and recovery
+state separate. Set `TINES_API_KEY` for the first `--check` of each runner.
+Pass `--runner <id>` to start only one named runner for debugging or a
+specialized deployment.
 
 ### 3. Start the daemon
 
@@ -233,9 +233,11 @@ After `--check` succeeds, start the runner:
 tines-runner-rs --config "$HOME/.config/tines-runner-rs/config.toml" --runner codex
 ```
 
-The process polls until stopped. Use Ctrl-C in a terminal or the service
-manager's normal stop command. Restart it after changing `config.toml` or
-`credentials.toml`.
+The process polls until stopped. If the file defines multiple named runners,
+omitting `--runner` starts all of them. Use Ctrl-C in a terminal or the service
+manager's normal stop command to stop every runner loop and active executor.
+Pass `--runner <id>` to run only one definition. Restart the daemon after
+changing `config.toml` or a credentials file.
 
 ## Configuration
 

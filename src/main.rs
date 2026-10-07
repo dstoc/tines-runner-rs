@@ -26,7 +26,7 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
-    /// Select one named runner definition from the config file.
+    /// Select one named runner definition; daemon mode starts all named runners when omitted.
     #[arg(long, value_name = "ID", global = true)]
     runner: Option<String>,
 
@@ -169,12 +169,90 @@ fn start_runner(
     config_path: &Path,
     runner_id: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    let config = tines_runner_rs::config::Config::load_for_runner(config_path, runner_id)?;
-    let shutdown = if check {
-        None
+    if check {
+        let config = tines_runner_rs::config::Config::load_for_runner(config_path, runner_id)?;
+        return run_runner(config, true, None);
+    }
+
+    let configs = tines_runner_rs::config::Config::load_for_daemon(config_path, runner_id)?;
+    supervise_runners(configs)
+}
+
+fn supervise_runners(configs: Vec<tines_runner_rs::config::Config>) -> Result<(), Box<dyn Error>> {
+    let shutdown = tines_runner_rs::shutdown::ShutdownSignal::install()?;
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let mut workers = Vec::with_capacity(configs.len());
+    let mut failures = Vec::new();
+
+    for config in configs {
+        let local_id = config.local_id.clone();
+        let task_id = local_id.clone();
+        let runner_shutdown = shutdown.clone();
+        let task_completion = completion_tx.clone();
+        let span = tracing::info_span!("runner", local_id = %local_id);
+        match thread::Builder::new()
+            .name(format!("runner-{local_id}"))
+            .spawn(move || {
+                let _entered = span.enter();
+                tracing::info!("runner supervision task started");
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_runner(config, false, Some(runner_shutdown))
+                        .map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("runner supervision task panicked".to_owned()));
+                let _ = task_completion.send((task_id, result));
+            }) {
+            Ok(handle) => workers.push(handle),
+            Err(error) => {
+                tracing::error!(local_id, error = %error, "could not start runner supervision task");
+                failures.push(local_id);
+            }
+        }
+    }
+
+    drop(completion_tx);
+    for _ in 0..workers.len() {
+        let Ok((local_id, result)) = completion_rx.recv() else {
+            failures.push("unknown".to_owned());
+            break;
+        };
+        match result {
+            Ok(()) if shutdown.is_requested() => {
+                tracing::info!(local_id, "runner supervision task stopped after shutdown");
+            }
+            Ok(()) => {
+                tracing::error!(local_id, "runner supervision task stopped unexpectedly");
+                failures.push(local_id);
+            }
+            Err(error) => {
+                tracing::error!(local_id, error, "runner supervision task failed");
+                failures.push(local_id);
+            }
+        }
+    }
+    for handle in workers {
+        if handle.join().is_err() {
+            tracing::error!("runner supervisor thread panicked outside its task guard");
+            failures.push("unknown".to_owned());
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
     } else {
-        Some(tines_runner_rs::shutdown::ShutdownSignal::install()?)
-    };
+        Err(std::io::Error::other(format!(
+            "runner supervision failed for: {}",
+            failures.join(", ")
+        ))
+        .into())
+    }
+}
+
+fn run_runner(
+    config: tines_runner_rs::config::Config,
+    check: bool,
+    shutdown: Option<tines_runner_rs::shutdown::ShutdownSignal>,
+) -> Result<(), Box<dyn Error>> {
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
     let _ownership = if check {
         None
@@ -310,9 +388,11 @@ fn start_runner(
                 let worker_assignment = assignment.clone();
                 let worker_shutdown = shutdown.clone();
                 let worker_active_runs = active_runs.clone();
+                let worker_span = tracing::Span::current();
                 match thread::Builder::new()
                     .name(format!("runner-run-{run_id}"))
                     .spawn(move || {
+                        let _entered = worker_span.enter();
                         let context = tines_runner_rs::execution::ExecutionContext::new(
                             &worker_shutdown,
                             &worker_active_runs,

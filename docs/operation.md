@@ -95,8 +95,9 @@ installing or deploying a new binary and restarting the service.
 Save the runner configuration at a path you choose, such as
 `/etc/tines-runner-rs/config.toml`. The runner does not search for a
 configuration file. Pass its path with `--config` when you run the daemon,
-`--check`, or `register`. When the file defines multiple runners, also pass
-`--runner <id>`.
+`--check`, or `register`. A daemon starts every named runner when `--runner`
+is omitted. Use `--runner <id>` to start only one runner. The `--check` and
+`register` commands still select one runner at a time.
 
 The default workspace directories are:
 
@@ -113,10 +114,10 @@ and `%USERPROFILE%\AppData\Local`. XDG directory variables are used only when
 they contain absolute paths.
 
 The config can define more than one named runner. The table name is its stable
-local ID. Select that ID with `--runner` when more than one definition exists.
-Each runner needs a distinct credentials file and keeps its executor settings
-and assignment overrides separate. A daemon process has its own capability
-cache and persisted active-run state.
+local ID. Each runner needs a distinct credentials file and keeps its executor
+settings, assignment overrides, capability cache, and persisted active-run
+state separate. A daemon starts all named runners by default. Use `--runner`
+to start one runner for debugging or a specialized deployment.
 
 ```toml
 [server]
@@ -149,8 +150,8 @@ must use HTTP or HTTPS. The supported `runner_type` values are `codex` and
 path under the daemon account's home directory. The runner registers with
 Tines using the configured name and concurrency. Tines and this local
 configuration must agree about which work the runner can accept. If a config
-defines multiple runners, pass `--runner <id>` to `--check`, `register`, and
-daemon commands.
+defines multiple runners, pass `--runner <id>` to `--check` and `register`.
+Omit `--runner` on a daemon command to start all named runners.
 
 `max_concurrent` must be between 1 and 100. `poll_interval_seconds` must be
 greater than zero. A configured workspace parent must be writable in the
@@ -310,14 +311,15 @@ later starts, `--check` validates the existing token and does not need
 `TINES_API_KEY`. If the check succeeds, start the daemon:
 
 ```sh
-tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner codex
-tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner antigravity
+tines-runner-rs --config /etc/tines-runner-rs/config.toml
 ```
 
-The daemon reads its configuration and credentials at startup. Restart it
-after you change either file. Stop a foreground daemon with Ctrl-C. Service
-managers can stop it with their normal termination signal; the runner handles
-graceful shutdown and reports that it is draining.
+This starts every named runner in one process. Pass `--runner <id>` to start
+only one runner for debugging or a specialized deployment. The daemon reads
+its configuration and credentials at startup. Restart it after you change
+either file. Stop a foreground daemon with Ctrl-C. Service managers can stop
+it with their normal termination signal; all runner loops and active executor
+transports drain before the process exits.
 
 `--check` validates configuration and Tines credentials. It does not test
 Codex authentication, Codex capability discovery, Git access, or workspace
@@ -384,20 +386,20 @@ For an encrypted system credential, install `systemd-creds` and run:
 
 ```sh
 sudo install -d -m 0700 /etc/credstore.encrypted
-sudo systemd-creds encrypt --name=runner-credentials \
+sudo systemd-creds encrypt --name=codex-credentials \
   /home/tines-runner/provisioned-credentials.toml \
-  /etc/credstore.encrypted/tines-runner-rs.cred
-sudo chmod 0600 /etc/credstore.encrypted/tines-runner-rs.cred
+  /etc/credstore.encrypted/tines-runner-rs-codex.cred
+sudo chmod 0600 /etc/credstore.encrypted/tines-runner-rs-codex.cred
 rm /home/tines-runner/provisioned-credentials.toml
 ```
 
-For the `tines-runner-rs@codex.service` instance, point the runner directly at
-systemd's private, read-only credential copy. Add these settings to the config
-and service unit:
+For each runner, point its `credentials_file` at systemd's private, read-only
+credential copy. This example configures the `codex` credential for the
+single `tines-runner-rs.service` unit:
 
 ```toml
 [runners.codex]
-credentials_file = "/run/credentials/tines-runner-rs@codex.service/runner-credentials"
+credentials_file = "/run/credentials/tines-runner-rs.service/codex-credentials"
 
 [storage]
 state_dir = "/var/lib/tines-runner-rs/state"
@@ -406,16 +408,19 @@ state_dir = "/var/lib/tines-runner-rs/state"
 ```ini
 [Service]
 StateDirectory=tines-runner-rs
-LoadCredentialEncrypted=runner-credentials:/etc/credstore.encrypted/tines-runner-rs.cred
+LoadCredentialEncrypted=codex-credentials:/etc/credstore.encrypted/tines-runner-rs-codex.cred
 ```
 
 systemd makes the credential readable to the unit without allowing the daemon
 to change it. `StateDirectory=` gives the service account writable persistent
 storage for `[storage].state_dir`; active-run records are never written under
-`/run/credentials`.
+`/run/credentials`. Add a distinct encrypted credential and
+`LoadCredentialEncrypted` entry for each named runner, and set each runner's
+`credentials_file` to its matching file under
+`/run/credentials/tines-runner-rs.service/`.
 
 If the host does not support `LoadCredentialEncrypted=`, use
-`LoadCredential=runner-credentials:/etc/tines-runner-rs/credentials.toml`
+`LoadCredential=codex-credentials:/etc/tines-runner-rs/codex-credentials.toml`
 with a root-owned, mode `0600` plaintext source file. Keep that source file
 private. Use the corresponding path under `/run/credentials/` for the
 service's `credentials_file`. Give each runner its own system credential. All
@@ -431,12 +436,12 @@ directories in `PATH`.
 
 ### systemd
 
-Save a template unit as `/etc/systemd/system/tines-runner-rs@.service`. The
-instance name selects the runner ID:
+Save a unit as `/etc/systemd/system/tines-runner-rs.service`. With no
+`--runner` argument, one service supervises every named runner in the config:
 
 ```ini
 [Unit]
-Description=Tines Rust runner (%i)
+Description=Tines Rust runners
 Wants=network-online.target
 After=network-online.target
 
@@ -446,7 +451,7 @@ User=tines-runner
 StateDirectory=tines-runner-rs
 Environment=HOME=/home/tines-runner
 Environment=PATH=/home/tines-runner/.cargo/bin:/home/tines-runner/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs --config /etc/tines-runner-rs/config.toml --runner %i
+ExecStart=/home/tines-runner/.cargo/bin/tines-runner-rs --config /etc/tines-runner-rs/config.toml
 Restart=on-abnormal
 RestartSec=5
 
@@ -454,24 +459,21 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-After saving the unit, reload unit files and start one instance for each
-configured ID. These instances use the same config file and select separate
-runner definitions:
+After saving the unit, reload unit files and start the service:
 
 For a system unit, the usual commands are:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now tines-runner-rs@codex.service
-sudo systemctl enable --now tines-runner-rs@antigravity.service
-sudo journalctl -u 'tines-runner-rs@*.service' -f
+sudo systemctl enable --now tines-runner-rs.service
+sudo journalctl -u tines-runner-rs.service -f
 ```
 
 Run the first `--check` for each runner ID interactively as `tines-runner`
-before enabling its service. systemd captures each runner's JSON logs in the
-journal. The unit restarts after abnormal process termination but leaves
-ordinary error exits stopped for review. Resolve a fencing error before
-restarting that instance.
+before enabling the service. systemd captures JSON logs for all runner tasks
+in the journal, with each event attributed to its local runner ID. The unit
+restarts after abnormal process termination but leaves ordinary error exits
+stopped for review. Resolve a fencing error before restarting the service.
 
 ### launchd
 
@@ -567,8 +569,9 @@ those log requests.
   `executor_cwd`.
 - Daemon and `--check` commands require `--config <path>`. The runner does not
   search a default configuration location.
-- If the config defines more than one runner, pass a matching `--runner <id>`.
-  The runner lists configured IDs when `--runner` is missing or unknown.
+- Use `--runner <id>` to start one named runner. Without it, a daemon starts
+  all named runners. The `--check` and `register` commands require one ID when
+  the config defines more than one runner.
 - Each `[runners.<id>]` definition needs its own `credentials_file`. The
   runner rejects duplicate credential paths.
 - Check TOML syntax and field names. Unknown fields are errors.
