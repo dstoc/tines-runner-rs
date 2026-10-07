@@ -1041,7 +1041,7 @@ fn resolve_daemon_path(
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
-        Ok(normalize_path_lexically(&config_dir.join(expanded)))
+        Ok(config_dir.join(expanded))
     }
 }
 
@@ -1064,7 +1064,7 @@ fn config_file_directory(path: &Path) -> Result<PathBuf, ConfigError> {
                 path.display()
             ))
         })?;
-    Ok(normalize_path_lexically(&directory))
+    Ok(directory)
 }
 
 fn normalize_path_lexically(path: &Path) -> PathBuf {
@@ -2398,6 +2398,106 @@ state_dir = "./state"
         assert_eq!(
             state.executor_cwd,
             config_path.parent().unwrap().join("state-cwd")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_paths_preserve_symlink_semantics_for_parent_components() {
+        let directory = TestDirectory::new();
+        let config_dir = directory.0.join("config");
+        let target_dir = directory.0.join("target");
+        fs::create_dir_all(&config_dir).expect("create config directory");
+        fs::create_dir_all(target_dir.join("nested")).expect("create symlink target");
+        fs::create_dir_all(target_dir.join("state")).expect("create target state directory");
+        fs::create_dir_all(target_dir.join("executor")).expect("create target executor directory");
+        fs::write(target_dir.join("credentials.toml"), "credentials")
+            .expect("create target credentials file");
+        std::os::unix::fs::symlink(target_dir.join("nested"), config_dir.join("link"))
+            .expect("create config symlink");
+
+        let config_path = config_dir.join("runner.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+url = "https://tines.example.test"
+[runner]
+name = "symlink-path-test"
+credentials_file = "link/../credentials.toml"
+executor_cwd = "link/../executor"
+[storage]
+state_dir = "link/../state"
+"#,
+        )
+        .expect("write config file");
+
+        let config = Config::load(&config_path).expect("load symlink-relative paths");
+        assert_eq!(
+            config.credentials_file.canonicalize().unwrap(),
+            target_dir.join("credentials.toml").canonicalize().unwrap()
+        );
+        assert_eq!(
+            config.state_dir.canonicalize().unwrap(),
+            target_dir.join("state").canonicalize().unwrap()
+        );
+        assert_eq!(
+            config.executor_cwd.canonicalize().unwrap(),
+            target_dir.join("executor").canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_parent_preserves_symlink_semantics_for_parent_components() {
+        let directory = TestDirectory::new();
+        let path_base = directory.0.join("path-base");
+        let target_dir = directory.0.join("target");
+        let actual_config_dir = target_dir.join("config");
+        fs::create_dir_all(&path_base).expect("create config path base");
+        fs::create_dir_all(target_dir.join("nested")).expect("create symlink target");
+        fs::create_dir_all(actual_config_dir.join("credentials"))
+            .expect("create target credentials directory");
+        fs::create_dir_all(actual_config_dir.join("state")).expect("create target state directory");
+        fs::write(
+            actual_config_dir.join("credentials/codex.toml"),
+            "credentials",
+        )
+        .expect("create target credentials file");
+        std::os::unix::fs::symlink(target_dir.join("nested"), path_base.join("link"))
+            .expect("create config path symlink");
+
+        let config_path = path_base.join("link/../config/runner.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+url = "https://tines.example.test"
+[runner]
+name = "symlink-config-path-test"
+credentials_file = "./credentials/codex.toml"
+executor_cwd = "."
+[storage]
+state_dir = "./state"
+"#,
+        )
+        .expect("write config file through symlink path");
+
+        let config = Config::load(&config_path).expect("load config through symlink path");
+        assert_eq!(
+            config.credentials_file.canonicalize().unwrap(),
+            actual_config_dir
+                .join("credentials/codex.toml")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            config.state_dir.canonicalize().unwrap(),
+            actual_config_dir.join("state").canonicalize().unwrap()
+        );
+        assert_eq!(
+            config.executor_cwd.canonicalize().unwrap(),
+            actual_config_dir.canonicalize().unwrap()
         );
     }
 
