@@ -110,6 +110,26 @@ impl TestDirectory {
         fs::write(config_dir.join("config.toml"), config).expect("write native runner config");
     }
 
+    fn configure_custom(&self, server_url: &str, stub: &std::path::Path, max_concurrent: usize) {
+        let config_dir = self.path.join("config/tines-runner-rs");
+        fs::create_dir_all(&config_dir).expect("create runner config directory");
+        let credentials = self.path.join("credentials.toml");
+        let state_dir = self.path.join("state");
+        let workspaces = self.path.join("workspaces");
+        let events = self.path.join("events");
+        let captures = self.path.join("captures");
+        let control = self.path.join("control");
+        for directory in [&events, &captures, &control, &workspaces] {
+            fs::create_dir_all(directory).expect("create custom runner fixture directory");
+        }
+        let executor = executor(stub, "custom", &events, &captures, &control);
+        let config = format!(
+            "[server]\nurl = {server_url:?}\n[runner]\nname = \"fake-custom-tines-integration\"\nrunner_type = \"custom\"\ncustom_command = [\"custom-agent\"]\nexecutor_cwd = \"~\"\nexecutor = {executor}\nworkspace_parent = {:?}\nmax_concurrent = {max_concurrent}\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\nstate_dir = {:?}\n",
+            workspaces, credentials, state_dir
+        );
+        fs::write(config_dir.join("config.toml"), config).expect("write custom runner config");
+    }
+
     fn credentials_path(&self) -> std::path::PathBuf {
         self.path.join("credentials.toml")
     }
@@ -608,6 +628,41 @@ fn native_executor_maps_codex_rate_limits_and_enforces_assignment_timeout() {
     );
     wait_for_quiet_poll(&fake, "arun_native_timeout");
     stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
+fn custom_runner_polls_tines_without_an_effort_report() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    directory.configure_custom(fake.url().as_str(), &stub, 1);
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    let requests = fake.wait_for(Duration::from_secs(10), |requests| {
+        poll_requests(requests).len() >= 2
+    });
+    let polls = poll_requests(&requests);
+    assert!(
+        polls
+            .iter()
+            .all(|request| request.json().get("effort_capabilities").is_none()),
+        "custom runner poll requests must omit effort_capabilities: {:?}",
+        polls
+            .iter()
+            .map(|request| request.json())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        runner
+            .child
+            .try_wait()
+            .expect("check runner process")
+            .is_none(),
+        "the runner should continue polling after Tines accepts its request"
+    );
+
+    stop_gracefully(&fake, &mut runner);
+    assert!(fake.unexpected_requests().is_empty());
 }
 
 #[test]

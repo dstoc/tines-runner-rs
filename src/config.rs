@@ -22,6 +22,16 @@ pub enum RunnerType {
     Custom,
 }
 
+impl RunnerType {
+    /// The Tines effort-capability harness ID, when this runner type opts in.
+    pub const fn effort_capability_harness(self) -> Option<&'static str> {
+        match self {
+            Self::Codex => Some("codex"),
+            Self::Custom => None,
+        }
+    }
+}
+
 /// Whether a completed assignment's workspace should be retained.
 #[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]

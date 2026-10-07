@@ -41,7 +41,7 @@ pub struct PollState {
     draining: bool,
     draining_poll_reported: bool,
     capabilities_transport: ExecutorTransport,
-    executor_harness: String,
+    effort_capability_harness: Option<&'static str>,
     executor_capabilities: Option<ExecutorCapabilities>,
     executor_capabilities_refreshed_at: Option<Instant>,
     failure_reporter: FailureReporter,
@@ -75,10 +75,7 @@ impl PollState {
             draining: false,
             draining_poll_reported: false,
             capabilities_transport: ExecutorTransport::for_capabilities(config),
-            executor_harness: match config.runner_type {
-                crate::config::RunnerType::Codex => "codex".to_owned(),
-                crate::config::RunnerType::Custom => "custom".to_owned(),
-            },
+            effort_capability_harness: config.runner_type.effort_capability_harness(),
             executor_capabilities: None,
             executor_capabilities_refreshed_at: None,
             failure_reporter: FailureReporter::default(),
@@ -272,8 +269,10 @@ impl PollState {
             declined_assignments,
             draining: Some(self.draining),
             env_delivery: Some(1),
-            effort_capabilities: self.executor_capabilities.as_ref().map(|capabilities| {
-                capabilities.effort_report(&self.executor_harness, crate::VERSION)
+            effort_capabilities: self.effort_capability_harness.and_then(|harness| {
+                self.executor_capabilities
+                    .as_ref()
+                    .map(|capabilities| capabilities.effort_report(harness, crate::VERSION))
             }),
         }
     }
@@ -608,7 +607,7 @@ impl Error for PollError {
 #[cfg(test)]
 mod tests {
     use super::{PollLoop, PollState, retry_delay};
-    use crate::config::Config;
+    use crate::config::{Config, RunnerType};
     use crate::credentials::{CredentialStore, RunnerCredentials};
     use crate::effort::{EffortCapabilities, EffortModelCapability};
     use crate::executor_capabilities::{ExecutorCapabilities, ExecutorHarnessCapabilities};
@@ -923,6 +922,56 @@ mod tests {
                 "models": [{ "model": "gpt-5.6", "efforts": ["low", "high"] }],
                 "accepts_asserted_effort": true
             })
+        );
+    }
+
+    #[test]
+    fn custom_poll_omits_effort_report_and_keeps_custom_discovery() {
+        let directory = TestDirectory::new();
+        let (url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
+        let store = CredentialStore::at(directory.credentials_path());
+        store
+            .save(&RunnerCredentials::new("rnr_poll", "poll-token"))
+            .expect("store runner token");
+        let mut config = config(&url, store.path(), false);
+        config.runner_type = RunnerType::Custom;
+        let connection = RunnerConnection::connect(&config).expect("load runner connection");
+        let mut poller = PollLoop::new(connection, &config);
+        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
+            version: 1,
+            harnesses: BTreeMap::from([(
+                "custom".to_owned(),
+                ExecutorHarnessCapabilities {
+                    version: "custom-agent 1.0".to_owned(),
+                    effort: None,
+                },
+            )]),
+            discovery_error: None,
+        });
+        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
+        let polls = Cell::new(0);
+
+        poller
+            .run_with(
+                |_, _| polls.set(polls.get() + 1),
+                || polls.get() == 0,
+                |_| panic!("one poll should finish without sleeping"),
+            )
+            .expect("poll custom runner without an effort report");
+
+        let requests = server.join().expect("fake server request");
+        assert!(
+            requests[0].get("effort_capabilities").is_none(),
+            "custom runner poll must omit effort_capabilities: {}",
+            requests[0]
+        );
+        assert!(
+            poller
+                .state()
+                .executor_capabilities
+                .as_ref()
+                .expect("custom executor capability discovery remains available")
+                .supports("custom")
         );
     }
 

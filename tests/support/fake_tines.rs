@@ -253,6 +253,10 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
                 json!({"error": {"code": "invalid_json", "message": "invalid JSON"}}),
             );
         }
+        let poll_request = serde_json::from_slice::<Value>(&request.body).unwrap_or_default();
+        if let Some(error) = effort_capabilities_validation_error(&poll_request) {
+            return response(422, error);
+        }
         if state.failures.polls > 0 {
             state.failures.polls -= 1;
             return response(503, json!({"error": {"code": "unavailable"}}));
@@ -276,7 +280,6 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
             .pop_front()
             .unwrap_or_else(|| (200, json!({"assignments": [], "cancels": []})));
         if status == 200 {
-            let poll_request = serde_json::from_slice::<Value>(&request.body).unwrap_or_default();
             let body_object = body
                 .as_object_mut()
                 .expect("fake poll responses must be JSON objects");
@@ -346,6 +349,32 @@ fn response_for(request: &RecordedRequest, state: &mut State) -> Response {
         404,
         json!({"error": {"code": "unexpected_request", "target": request.target}}),
     )
+}
+
+/// Mirror the current Tines V1 poll contract for effort-aware harness IDs.
+fn effort_capabilities_validation_error(request: &Value) -> Option<Value> {
+    let report = request.get("effort_capabilities")?;
+    if !report.is_object() {
+        return Some(json!({
+            "error": {"code": "invalid_field", "message": "\"effort_capabilities\" must be an object"}
+        }));
+    }
+    if request["instance_id"].as_str().is_none() {
+        return Some(json!({
+            "error": {"code": "invalid_field", "message": "\"effort_capabilities\" requires \"instance_id\""}
+        }));
+    }
+    if report["version"] == 1
+        && !matches!(
+            report["harness"].as_str(),
+            Some("claude_code" | "codex" | "pi")
+        )
+    {
+        return Some(json!({
+            "error": {"code": "invalid_field", "message": "malformed V1 effort capability report"}
+        }));
+    }
+    None
 }
 
 fn response(status: u16, body: Value) -> Response {
@@ -445,4 +474,36 @@ fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effort_capabilities_validation_error;
+    use serde_json::json;
+
+    #[test]
+    fn current_tines_contract_rejects_custom_v1_but_accepts_codex_and_omission() {
+        let request = |harness: &str| {
+            json!({
+                "instance_id": "boot-1",
+                "effort_capabilities": {
+                    "version": 1,
+                    "daemon_version": "0.1.0",
+                    "harness": harness,
+                    "harness_version": "codex-cli 0.153.4",
+                    "catalog_digest": "sha256:test",
+                    "models": []
+                }
+            })
+        };
+
+        let error = effort_capabilities_validation_error(&request("custom"))
+            .expect("Tines rejects custom V1 effort reports");
+        assert_eq!(
+            error["error"]["message"],
+            "malformed V1 effort capability report"
+        );
+        assert!(effort_capabilities_validation_error(&request("codex")).is_none());
+        assert!(effort_capabilities_validation_error(&json!({"instance_id": "boot-1"})).is_none());
+    }
 }
