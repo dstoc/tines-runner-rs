@@ -179,6 +179,18 @@ impl Error for ConfigError {
     }
 }
 
+impl ConfigError {
+    fn with_path(self, path: &Path) -> Self {
+        match self {
+            Self::Parse { source, .. } => Self::Parse {
+                path: Some(path.to_path_buf()),
+                source,
+            },
+            error => error,
+        }
+    }
+}
+
 impl Config {
     /// Return workspace roots needed to recover state from older daemons.
     pub fn legacy_workspace_roots(&self) -> Vec<PathBuf> {
@@ -211,13 +223,50 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml_str_for_runner(&contents, runner_id).map_err(|error| match error {
-            ConfigError::Parse { source, .. } => ConfigError::Parse {
-                path: Some(path.to_path_buf()),
-                source,
-            },
-            error => error,
-        })
+        Self::from_toml_str_for_runner(&contents, runner_id).map_err(|error| error.with_path(path))
+    }
+
+    /// Load every named runner for daemon supervision, or one selected runner.
+    /// A legacy `[runner]` configuration always produces one runner.
+    pub fn load_for_daemon(
+        path: impl AsRef<Path>,
+        runner_id: Option<&str>,
+    ) -> Result<Vec<Self>, ConfigError> {
+        let path = path.as_ref();
+        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_toml_str_for_daemon(&contents, runner_id).map_err(|error| error.with_path(path))
+    }
+
+    fn from_toml_str_for_daemon(
+        contents: &str,
+        runner_id: Option<&str>,
+    ) -> Result<Vec<Self>, ConfigError> {
+        if let Some(runner_id) = runner_id {
+            return Ok(vec![Self::from_toml_str_for_runner(
+                contents,
+                Some(runner_id),
+            )?]);
+        }
+
+        let raw: RawConfig =
+            toml::from_str(contents).map_err(|source| ConfigError::Parse { path: None, source })?;
+        let runner_ids = raw
+            .runners
+            .keys()
+            .filter(|id| id.as_str() != "default")
+            .cloned()
+            .collect::<Vec<_>>();
+        if runner_ids.is_empty() {
+            return Ok(vec![Self::from_toml_str_for_runner(contents, None)?]);
+        }
+
+        runner_ids
+            .iter()
+            .map(|runner_id| Self::from_toml_str_for_runner(contents, Some(runner_id)))
+            .collect()
     }
 
     /// Parse configuration TOML and expand path settings using the current

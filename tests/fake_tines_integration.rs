@@ -130,6 +130,33 @@ impl TestDirectory {
         fs::write(config_dir.join("config.toml"), config).expect("write custom runner config");
     }
 
+    fn configure_named_runners(
+        &self,
+        server_url: &str,
+        stub: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let events = self.path.join("events");
+        let captures = self.path.join("captures");
+        let control = self.path.join("control");
+        let workspaces = self.path.join("workspaces");
+        let state_dir = self.path.join("state");
+        for directory in [&events, &captures, &control, &workspaces] {
+            fs::create_dir_all(directory).expect("create named-runner fixture directory");
+        }
+        let codex_executor = executor(stub, "codex", &events, &captures, &control);
+        let checks_executor = executor(stub, "checks", &events, &captures, &control);
+        let config_path = self.path.join("named-runners.toml");
+        let config = format!(
+            "[server]\nurl = {server_url:?}\n[runners.default]\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 1\npoll_interval_seconds = 1\n[runners.codex]\nname = \"build-codex\"\ncredentials_file = {:?}\nrunner_type = \"codex\"\nexecutor = {codex_executor}\nmax_concurrent = 2\n[runners.checks]\nname = \"review-checks\"\ncredentials_file = {:?}\nrunner_type = \"codex\"\nexecutor = {checks_executor}\nmax_concurrent = 3\n[storage]\nstate_dir = {:?}\n",
+            workspaces,
+            self.path.join("codex/credentials.toml"),
+            self.path.join("checks/credentials.toml"),
+            state_dir
+        );
+        fs::write(&config_path, config).expect("write named-runner config");
+        config_path
+    }
+
     fn credentials_path(&self) -> std::path::PathBuf {
         self.path.join("credentials.toml")
     }
@@ -426,6 +453,261 @@ fn stop_gracefully(fake: &FakeTines, runner: &mut RunnerProcess) {
         poll_requests(requests)
             .iter()
             .any(|request| request.json()["draining"] == true)
+    });
+}
+
+#[test]
+fn one_daemon_supervises_named_runners_with_independent_state_and_shutdown() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    let config_path = directory.configure_named_runners(fake.url().as_str(), &stub);
+    let control = directory.path.join("control");
+    for run_id in ["arun_multi_codex", "arun_multi_checks"] {
+        fs::write(control.join(format!("{run_id}.barrier")), "2")
+            .expect("configure concurrent executor barrier");
+    }
+    fake.route_issue("build-codex", assignment("arun_multi_codex", 5, Vec::new()));
+    fake.route_issue(
+        "review-checks",
+        assignment("arun_multi_checks", 5, Vec::new()),
+    );
+
+    let mut command = directory.runner_command(&config_path, None, Some("fake-bootstrap-key"));
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUST_LOG", "info");
+    let runner = RunnerProcess {
+        child: command.spawn().expect("start all configured runners"),
+    };
+
+    let requests = fake.wait_for(Duration::from_secs(10), |requests| {
+        let registrations = requests
+            .iter()
+            .filter(|request| request.target == "/api/v1/runners/register")
+            .count();
+        let polls = poll_requests(requests);
+        registrations == 2
+            && polls
+                .iter()
+                .any(|request| request.json()["max_concurrent"] == 2)
+            && polls
+                .iter()
+                .any(|request| request.json()["max_concurrent"] == 3)
+    });
+    let registrations = requests
+        .iter()
+        .filter(|request| request.target == "/api/v1/runners/register")
+        .map(|request| {
+            (
+                request.json()["name"].as_str().unwrap().to_owned(),
+                request.json(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(registrations.iter().any(|(name, _)| name == "build-codex"));
+    assert!(
+        registrations
+            .iter()
+            .any(|(name, _)| name == "review-checks")
+    );
+
+    let codex_credentials = fs::read_to_string(directory.path.join("codex/credentials.toml"))
+        .expect("codex runner credentials");
+    let checks_credentials = fs::read_to_string(directory.path.join("checks/credentials.toml"))
+        .expect("checks runner credentials");
+    let codex_runner_id = toml::from_str::<toml::Value>(&codex_credentials)
+        .expect("parse codex credentials")["runner_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checks_runner_id = toml::from_str::<toml::Value>(&checks_credentials)
+        .expect("parse checks credentials")["runner_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(codex_runner_id, checks_runner_id);
+
+    let polls = poll_requests(&requests);
+    let codex_poll = polls
+        .iter()
+        .find(|request| request.target.contains(&codex_runner_id))
+        .expect("codex runner poll");
+    let checks_poll = polls
+        .iter()
+        .find(|request| request.target.contains(&checks_runner_id))
+        .expect("checks runner poll");
+    assert_eq!(codex_poll.json()["max_concurrent"], 2);
+    assert_eq!(checks_poll.json()["max_concurrent"], 3);
+    assert_ne!(
+        codex_poll.json()["instance_id"],
+        checks_poll.json()["instance_id"]
+    );
+    assert!(control.join("capabilities.codex").is_file());
+    assert!(control.join("capabilities.checks").is_file());
+    assert_eq!(
+        fs::read_dir(directory.path.join("state"))
+            .expect("runner state directories")
+            .count(),
+        2
+    );
+
+    let finishes = fake.wait_for_finishes(2, Duration::from_secs(20));
+    assert_eq!(finishes.len(), 2);
+    assert!(
+        finishes
+            .iter()
+            .all(|finish| finish["status"] == "completed")
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path.join("captures/arun_multi_codex.executor"))
+            .expect("codex execution capture")
+            .trim(),
+        "codex"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path.join("captures/arun_multi_checks.executor"))
+            .expect("checks execution capture")
+            .trim(),
+        "checks"
+    );
+
+    runner.signal("TERM");
+    let output = runner.wait_with_output(Duration::from_secs(10));
+    assert!(
+        output.status.success(),
+        "graceful shutdown failed: {output:?}"
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("\"local_id\":\"codex\""),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("\"local_id\":\"checks\""),
+        "{diagnostic}"
+    );
+    fake.wait_for(Duration::from_secs(3), |requests| {
+        let draining = poll_requests(requests)
+            .into_iter()
+            .filter(|request| request.json()["draining"] == true)
+            .filter_map(|request| request.target.split('/').nth(4))
+            .collect::<std::collections::BTreeSet<_>>();
+        draining.contains(codex_runner_id.as_str()) && draining.contains(checks_runner_id.as_str())
+    });
+
+    let request_count = fake.requests().len();
+    let selected = directory.runner_for(&config_path, Some("checks"), None);
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        requests.iter().skip(request_count).any(|request| {
+            request.target.contains(&checks_runner_id) && request.target.ends_with("/poll")
+        })
+    });
+    selected.signal("TERM");
+    let selected_output = selected.wait_with_output(Duration::from_secs(10));
+    assert!(
+        selected_output.status.success(),
+        "selected-runner shutdown failed: {selected_output:?}"
+    );
+    let final_requests = fake.requests();
+    let selected_polls = poll_requests(&final_requests[request_count..]);
+    assert!(!selected_polls.is_empty());
+    assert!(
+        selected_polls
+            .iter()
+            .all(|request| request.target.contains(&checks_runner_id))
+    );
+}
+
+#[test]
+fn a_failed_named_runner_is_attributed_without_stopping_its_sibling() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    let config_path = directory.configure_named_runners(fake.url().as_str(), &stub);
+
+    let mut bootstrap = directory.runner_for(&config_path, None, Some("fake-bootstrap-key"));
+    let requests = fake.wait_for(Duration::from_secs(10), |requests| {
+        let registrations = requests
+            .iter()
+            .filter(|request| request.target == "/api/v1/runners/register")
+            .count();
+        registrations == 2 && poll_requests(requests).len() >= 2
+    });
+    let codex_credentials = fs::read_to_string(directory.path.join("codex/credentials.toml"))
+        .expect("codex runner credentials");
+    let checks_credentials = fs::read_to_string(directory.path.join("checks/credentials.toml"))
+        .expect("checks runner credentials");
+    let codex_runner_id = toml::from_str::<toml::Value>(&codex_credentials)
+        .expect("parse codex credentials")["runner_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checks_runner_id = toml::from_str::<toml::Value>(&checks_credentials)
+        .expect("parse checks credentials")["runner_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    stop_gracefully(&fake, &mut bootstrap);
+    assert!(
+        poll_requests(&requests)
+            .iter()
+            .any(|request| request.target.contains(&codex_runner_id))
+    );
+
+    fs::write(
+        directory.path.join("checks/credentials.toml"),
+        "not valid credentials",
+    )
+    .expect("corrupt checks runner credentials");
+    let request_count = fake.requests().len();
+    let mut command = directory.runner_command(&config_path, None, None);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUST_LOG", "info");
+    let mut runner = RunnerProcess {
+        child: command
+            .spawn()
+            .expect("start daemon with one invalid runner"),
+    };
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        requests.iter().skip(request_count).any(|request| {
+            request.target.contains(&codex_runner_id) && request.target.ends_with("/poll")
+        })
+    });
+    runner.assert_running();
+    let active_requests = fake.requests();
+    assert!(
+        !poll_requests(&active_requests[request_count..])
+            .iter()
+            .any(|request| request.target.contains(&checks_runner_id))
+    );
+
+    runner.signal("TERM");
+    let output = runner.wait_with_output(Duration::from_secs(10));
+    assert!(
+        !output.status.success(),
+        "the daemon must report the failed runner after its sibling drains"
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("\"local_id\":\"checks\""),
+        "failed runner must be identified in logs: {diagnostic}"
+    );
+    fake.wait_for(Duration::from_secs(3), |requests| {
+        poll_requests(requests).iter().any(|request| {
+            request.target.contains(&codex_runner_id) && request.json()["draining"] == true
+        })
     });
 }
 
