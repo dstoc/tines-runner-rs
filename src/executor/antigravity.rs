@@ -11,7 +11,7 @@ use crate::effort::{EffortCapabilities, EffortModelCapability, catalog_digest};
 use crate::execution_protocol::ExecutionRequest;
 use crate::executor::workspace::MaterializedWorkspace;
 
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DISCOVERY_OUTPUT: usize = 1024 * 1024;
 const MAX_VERSION_LENGTH: usize = 100;
 const MAX_MODELS: usize = 256;
@@ -129,8 +129,15 @@ pub fn discover(daemon_version: &str) -> AntigravityDiscovery {
 }
 
 fn discover_with_program(program: &str, daemon_version: &str) -> AntigravityDiscovery {
-    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
-    let version_output = match run_capture(program, &["--version"], deadline) {
+    discover_with_program_and_timeout(program, daemon_version, DISCOVERY_COMMAND_TIMEOUT)
+}
+
+fn discover_with_program_and_timeout(
+    program: &str,
+    daemon_version: &str,
+    command_timeout: Duration,
+) -> AntigravityDiscovery {
+    let version_output = match run_capture(program, &["--version"], command_timeout) {
         Ok(output) => output,
         Err(error) => {
             return AntigravityDiscovery {
@@ -170,7 +177,7 @@ fn discover_with_program(program: &str, daemon_version: &str) -> AntigravityDisc
         };
     }
 
-    let models_output = match run_capture(program, &["models"], deadline) {
+    let models_output = match run_capture(program, &["models"], command_timeout) {
         Ok(output) => output,
         Err(error) => {
             return AntigravityDiscovery {
@@ -197,6 +204,18 @@ fn discover_with_program(program: &str, daemon_version: &str) -> AntigravityDisc
             };
         }
     };
+    if models.is_empty() {
+        let error = if models_output.trim().is_empty() {
+            "agy model catalog was empty"
+        } else {
+            "agy model output contained no recognized model slugs"
+        };
+        return AntigravityDiscovery {
+            version: Some(version.to_owned()),
+            effort: None,
+            error: Some(error.to_owned()),
+        };
+    }
     let catalog_digest = catalog_digest(&models);
     AntigravityDiscovery {
         version: Some(version.to_owned()),
@@ -269,7 +288,8 @@ fn version_tuple(output: &str) -> Option<(u64, u64, u64)> {
     })
 }
 
-fn run_capture(program: &str, args: &[&str], deadline: Instant) -> Result<Vec<u8>, String> {
+fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -354,7 +374,10 @@ fn redact(value: &str, secrets: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MODELS, discover_with_program, parse_models, version_tuple};
+    use super::{
+        MAX_MODELS, discover_with_program, discover_with_program_and_timeout, parse_models,
+        version_tuple,
+    };
 
     #[test]
     fn parses_model_slugs_in_order_and_deduplicates_without_effort_inference() {
@@ -413,7 +436,7 @@ mod tests {
         let program = directory.join("agy");
         std::fs::write(
             &program,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'agy v1.3.1'; else printf '%s\\n' 'gemini-3.8-flash-high Gemini 3.8 Flash (High)' 'claude-opus-5-5-medium Claude Opus (Medium)'; fi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'agy v1.3.1'; else printf '%s\\n' 'not/a/model Unrecognized row' 'gemini-3.8-flash-high Gemini 3.8 Flash (High)' 'claude-opus-5-5-medium Claude Opus (Medium)' 'gemini-3.8-flash-high duplicate'; fi\n",
         )
         .expect("write agy fixture");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
@@ -434,6 +457,106 @@ mod tests {
             ["gemini-3.8-flash-high", "claude-opus-5-5-medium"]
         );
         assert!(effort.models.iter().all(|model| model.efforts.is_empty()));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_and_model_commands_have_independent_deadlines() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let directory = std::env::temp_dir().join(format!(
+            "tines-agy-independent-timeouts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create discovery directory");
+        let program = directory.join("agy");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 1.2; printf '%s\\n' 'agy v1.3.1'; else sleep 1.2; printf '%s\\n' 'gemini-3.8-flash-high Gemini 3.8 Flash'; fi\n",
+        )
+        .expect("write slow agy fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make agy fixture executable");
+
+        let started = Instant::now();
+        let discovery = discover_with_program_and_timeout(
+            program.to_str().expect("program path"),
+            "0.1.0",
+            Duration::from_secs(2),
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(discovery.error, None);
+        assert_eq!(discovery.effort.expect("model catalog").models.len(), 1);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_empty_and_unrecognized_model_catalogs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cases = [
+            ("", "agy model catalog was empty"),
+            (" \n\t \n", "agy model catalog was empty"),
+            (
+                "not/a/model Display\n---\ninvalid!slug Name\n",
+                "agy model output contained no recognized model slugs",
+            ),
+        ];
+
+        for (model_output, expected_error) in cases {
+            let directory = std::env::temp_dir()
+                .join(format!("tines-agy-empty-catalog-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).expect("create discovery directory");
+            let program = directory.join("agy");
+            let script = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'agy v1.3.1'; else printf '%s' '{model_output}'; fi\n"
+            );
+            std::fs::write(&program, script).expect("write agy fixture");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                .expect("make agy fixture executable");
+
+            let discovery = discover_with_program(program.to_str().expect("program path"), "0.1.0");
+
+            assert_eq!(discovery.version.as_deref(), Some("agy v1.3.1"));
+            assert!(discovery.effort.is_none());
+            assert_eq!(discovery.error.as_deref(), Some(expected_error));
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_command_timeout_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let directory = std::env::temp_dir().join(format!(
+            "tines-agy-command-timeout-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create discovery directory");
+        let program = directory.join("agy");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 5\n").expect("write slow agy fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make agy fixture executable");
+
+        let started = Instant::now();
+        let discovery = discover_with_program_and_timeout(
+            program.to_str().expect("program path"),
+            "0.1.0",
+            Duration::from_millis(100),
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(discovery.effort, None);
+        assert_eq!(
+            discovery.error.as_deref(),
+            Some("agy --version command timed out")
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 
