@@ -1,0 +1,30 @@
+name: Merge queue
+
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request:
+    types: [auto_merge_enabled, synchronize]
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: merge-worker
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  advance:
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      github.event.review.state == 'approved'
+    uses: dstoc/merge-action/.github/workflows/merge.yml@v2
+    with:
+      base-branch: main
+    secrets:
+      PR_GH_TOKEN: ${{ secrets.PR_GH_TOKEN }}
