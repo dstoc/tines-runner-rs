@@ -2,8 +2,8 @@
 
 use crate::effort::EffortCapabilities;
 use crate::execution_protocol::{
-    ExecutionEvent, ExecutionEventKind, ExecutionRequest, ExecutionUsage, LogStream,
-    TerminalResult, TerminalStatus,
+    ExecutionEvent, ExecutionEventKind, ExecutionRateLimit, ExecutionRequest, ExecutionUsage,
+    LogStream, TerminalResult, TerminalStatus,
 };
 use crate::executor::antigravity::AntigravityLaunch;
 use crate::executor::antigravity_stream::{AntigravityEvent, AntigravityStreamParser};
@@ -11,9 +11,11 @@ use crate::executor::harness::{
     HarnessAdapter, HarnessAdapterError, HarnessEventParser, HarnessExit, HarnessLaunch,
 };
 use crate::executor::workspace::MaterializedWorkspace;
+use chrono::DateTime;
 use serde_json::Value;
 
 const STDERR_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+const AGY_ERROR_RECORD_LIMIT: usize = STDERR_DIAGNOSTIC_LIMIT;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Dedicated adapter for Google's Antigravity CLI.
@@ -64,6 +66,10 @@ struct AntigravityEventParser {
     response_redactor: StreamingSecretRedactor,
     stderr_pending: String,
     stderr_diagnostic: String,
+    stderr_record_pending: String,
+    stderr_record_oversized: bool,
+    provider_error: Option<AntigravityProviderError>,
+    rate_limit: Option<ExecutionRateLimit>,
     secret_patterns: Vec<String>,
     stderr_redaction_window: usize,
 }
@@ -73,6 +79,62 @@ struct AntigravityTerminal {
     status: String,
     error: Option<String>,
     denied_actions: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AntigravityProviderError {
+    status: Option<String>,
+    http_code: Option<String>,
+    grpc_code: Option<String>,
+    retryable: Option<bool>,
+    error_id: Option<String>,
+    message: Option<String>,
+    resume_at: Option<u64>,
+    rate_limited: bool,
+}
+
+impl AntigravityProviderError {
+    fn code(&self, secrets: &[String]) -> Option<String> {
+        self.status
+            .clone()
+            .or_else(|| self.http_code.as_ref().map(|code| format!("HTTP_{code}")))
+            .or_else(|| self.grpc_code.as_ref().map(|code| format!("gRPC_{code}")))
+            .or_else(|| self.error_id.clone())
+            .map(|code| clip(&redact_complete(&code, secrets), 100))
+    }
+
+    fn is_retryable(&self) -> bool {
+        self.rate_limited || self.retryable == Some(true)
+    }
+
+    fn diagnostic(&self, secrets: &[String]) -> String {
+        let field = |value: &str, limit| clip(&redact_complete(value, secrets), limit);
+        let mut details = Vec::new();
+        if let Some(status) = &self.status {
+            details.push(format!("status={}", field(status, 80)));
+        }
+        if let Some(code) = &self.http_code {
+            details.push(format!("http_code={}", field(code, 16)));
+        }
+        if let Some(code) = &self.grpc_code {
+            details.push(format!("grpc_code={}", field(code, 40)));
+        }
+        if let Some(retryable) = self.retryable {
+            details.push(format!("retryable={retryable}"));
+        }
+        if let Some(id) = &self.error_id {
+            details.push(format!("error_id={}", field(id, 120)));
+        }
+        if let Some(message) = &self.message {
+            details.push(field(message, 1_600));
+        }
+        let details = if details.is_empty() {
+            "provider failure".to_owned()
+        } else {
+            details.join(" ")
+        };
+        clip(&format!("AGY_ERROR {details}"), 2_000)
+    }
 }
 
 impl AntigravityEventParser {
@@ -256,6 +318,59 @@ impl AntigravityEventParser {
             self.stderr_diagnostic = self.stderr_diagnostic.chars().skip(skip).collect();
         }
     }
+
+    fn observe_stderr_records(&mut self, text: &str, finish: bool) -> Vec<ExecutionEvent> {
+        let mut events = Vec::new();
+        for character in text.chars() {
+            if self.stderr_record_oversized {
+                if character == '\n' {
+                    self.stderr_record_oversized = false;
+                }
+                continue;
+            }
+            if character == '\n' {
+                let line = std::mem::take(&mut self.stderr_record_pending);
+                events.extend(self.parse_stderr_record(&line));
+                continue;
+            }
+            self.stderr_record_pending.push(character);
+            if self.stderr_record_pending.len() > AGY_ERROR_RECORD_LIMIT {
+                self.stderr_record_pending.clear();
+                self.stderr_record_oversized = true;
+            }
+        }
+        if finish && !self.stderr_record_oversized {
+            let line = std::mem::take(&mut self.stderr_record_pending);
+            events.extend(self.parse_stderr_record(&line));
+        }
+        events
+    }
+
+    fn parse_stderr_record(&mut self, line: &str) -> Vec<ExecutionEvent> {
+        let Some(error) = parse_agy_error(line) else {
+            return Vec::new();
+        };
+        let diagnostic = error.diagnostic(&self.secret_patterns);
+        // Protocol v1 uses its rate-limit judgment for retryable provider failures.
+        let rate_limit = error.is_retryable().then(|| ExecutionRateLimit {
+            resume_at: error.resume_at,
+            message: Some(diagnostic.clone()),
+        });
+        let event = ExecutionEvent::new(ExecutionEventKind::ProviderError {
+            provider: "antigravity".to_owned(),
+            code: error.code(&self.secret_patterns),
+            message: diagnostic,
+        });
+        self.provider_error = Some(error);
+        self.rate_limit = rate_limit.clone();
+        let mut events = vec![event];
+        if let Some(rate_limit) = rate_limit {
+            events.push(ExecutionEvent::new(ExecutionEventKind::RateLimit {
+                rate_limit,
+            }));
+        }
+        events
+    }
 }
 
 impl HarnessEventParser for AntigravityEventParser {
@@ -282,18 +397,23 @@ impl HarnessEventParser for AntigravityEventParser {
     fn push_stderr(&mut self, chunk: &str) -> Vec<ExecutionEvent> {
         let message = self.take_safe_stderr_prefix(chunk, false);
         self.retain_stderr(&message);
-        log_stderr(&message)
+        let mut events = log_stderr(&message);
+        events.extend(self.observe_stderr_records(&message, false));
+        events
     }
 
     fn finish_stderr(&mut self) -> Vec<ExecutionEvent> {
         let message = self.take_safe_stderr_prefix("", true);
         self.retain_stderr(&message);
-        log_stderr(&message)
+        let mut events = log_stderr(&message);
+        events.extend(self.observe_stderr_records(&message, true));
+        events
     }
 
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent {
         let stderr_tail = self.take_safe_stderr_prefix("", true);
         self.retain_stderr(&stderr_tail);
+        drop(self.observe_stderr_records(&stderr_tail, true));
         let terminal = self.terminal.clone();
         let provider_interrupted = terminal
             .as_ref()
@@ -301,18 +421,29 @@ impl HarnessEventParser for AntigravityEventParser {
         let interrupted = exit.interrupted || provider_interrupted;
         let success = !interrupted
             && !self.malformed
+            && self.provider_error.is_none()
             && exit.exit_code == Some(0)
             && exit.error.is_none()
             && terminal
                 .as_ref()
                 .is_some_and(|result| result.status == "SUCCESS" && !result.denied_actions);
-        let status = if success {
+        let rate_limit = (!interrupted).then(|| self.rate_limit.clone()).flatten();
+        let status = if rate_limit.is_some() {
+            TerminalStatus::RateLimited
+        } else if success {
             TerminalStatus::Completed
         } else {
             TerminalStatus::Failed
         };
         let error = if success {
             None
+        } else if let Some(provider_error) = &self.provider_error {
+            let mut message = provider_error.diagnostic(&self.secret_patterns);
+            if !self.stderr_diagnostic.is_empty() {
+                message.push_str("\nAntigravity stderr:\n");
+                message.push_str(&self.stderr_diagnostic);
+            }
+            Some(message)
         } else {
             let base = if interrupted {
                 Some("Antigravity execution was interrupted".to_owned())
@@ -372,7 +503,7 @@ impl HarnessEventParser for AntigravityEventParser {
                 usage: self.usage.clone(),
                 pricing_evidence: None,
                 interrupted,
-                rate_limit: None,
+                rate_limit,
             },
         })
     }
@@ -395,6 +526,157 @@ fn parse_usage(value: &Value) -> Option<ExecutionUsage> {
         || usage.output_tokens.is_some()
         || usage.cache_read_tokens.is_some())
     .then_some(usage)
+}
+
+fn parse_agy_error(line: &str) -> Option<AntigravityProviderError> {
+    let payload = line.trim().strip_prefix("AGY_ERROR:")?.trim();
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let object = value.as_object()?;
+    let status = string_field(
+        object,
+        &[
+            "canonical_status",
+            "canonicalStatus",
+            "canonical_code",
+            "canonicalCode",
+            "provider_status",
+            "providerStatus",
+            "status",
+        ],
+    );
+    let http_code = scalar_field(
+        object,
+        &[
+            "http_code",
+            "http_status",
+            "http_status_code",
+            "httpCode",
+            "httpStatus",
+            "httpStatusCode",
+        ],
+    );
+    let grpc_code = scalar_field(
+        object,
+        &[
+            "grpc_code",
+            "grpc_status",
+            "grpc_status_code",
+            "grpcCode",
+            "grpcStatus",
+            "grpcStatusCode",
+        ],
+    );
+    let retryable = object.get("retryable").and_then(Value::as_bool);
+    let error_id = string_field(
+        object,
+        &[
+            "error_id",
+            "errorId",
+            "provider_error_id",
+            "providerErrorId",
+            "model_error_id",
+            "modelErrorId",
+        ],
+    );
+    let message = string_field(object, &["message", "short_error", "shortError", "error"]);
+    let resume_at = [
+        "resume_at",
+        "resumeAt",
+        "retry_at",
+        "retryAt",
+        "reset_at",
+        "resetAt",
+        "resets_at",
+        "resetsAt",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).and_then(parse_provider_timestamp));
+    let rate_limited = is_rate_limit_error(
+        status.as_deref(),
+        http_code.as_deref(),
+        grpc_code.as_deref(),
+    );
+
+    (status.is_some()
+        || http_code.is_some()
+        || grpc_code.is_some()
+        || retryable.is_some()
+        || error_id.is_some()
+        || message.is_some())
+    .then_some(AntigravityProviderError {
+        status,
+        http_code,
+        grpc_code,
+        retryable,
+        error_id,
+        message,
+        resume_at,
+        rate_limited,
+    })
+}
+
+fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn scalar_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| match object.get(*key)? {
+        Value::String(value) if !value.trim().is_empty() => Some(value.trim().to_owned()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn is_rate_limit_error(
+    status: Option<&str>,
+    http_code: Option<&str>,
+    grpc_code: Option<&str>,
+) -> bool {
+    let normalized = |value: &str| value.trim().to_ascii_uppercase().replace(['-', ' '], "_");
+    http_code.is_some_and(|code| code.trim() == "429")
+        || status.is_some_and(|status| {
+            matches!(
+                normalized(status).as_str(),
+                "RESOURCE_EXHAUSTED"
+                    | "QUOTA_EXCEEDED"
+                    | "RATE_LIMIT_EXCEEDED"
+                    | "TOO_MANY_REQUESTS"
+            )
+        })
+        || grpc_code
+            .is_some_and(|code| matches!(normalized(code).as_str(), "8" | "RESOURCE_EXHAUSTED"))
+}
+
+fn parse_provider_timestamp(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return normalize_provider_timestamp(number);
+    }
+    let value = value.as_str()?.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(normalize_provider_timestamp)
+        .or_else(|| {
+            u64::try_from(DateTime::parse_from_rfc3339(value).ok()?.timestamp_millis())
+                .ok()
+                .filter(|timestamp| *timestamp <= MAX_SAFE_JSON_INTEGER)
+        })
+}
+
+fn normalize_provider_timestamp(value: u64) -> Option<u64> {
+    if value == 0 {
+        None
+    } else if value < 1_000_000_000_000 {
+        value
+            .checked_mul(1_000)
+            .filter(|timestamp| *timestamp <= MAX_SAFE_JSON_INTEGER)
+    } else {
+        (value <= MAX_SAFE_JSON_INTEGER).then_some(value)
+    }
 }
 
 fn is_nonempty_value(value: &Value) -> bool {
@@ -551,7 +833,10 @@ fn redact_complete(text: &str, patterns: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AntigravityEventParser, HarnessEventParser, HarnessExit, STDERR_DIAGNOSTIC_LIMIT};
+    use super::{
+        AGY_ERROR_RECORD_LIMIT, AntigravityEventParser, HarnessEventParser, HarnessExit,
+        STDERR_DIAGNOSTIC_LIMIT,
+    };
     use crate::execution_protocol::{ExecutionEventKind, LogStream, TerminalStatus};
 
     fn feed(
@@ -572,6 +857,15 @@ mod tests {
             error: None,
             interrupted: false,
         })
+    }
+
+    fn stderr(
+        parser: &mut AntigravityEventParser,
+        text: &str,
+    ) -> Vec<crate::execution_protocol::ExecutionEvent> {
+        let mut events = parser.push_stderr(text);
+        events.extend(parser.finish_stderr());
+        events
     }
 
     #[test]
@@ -858,5 +1152,156 @@ mod tests {
         } else {
             panic!("terminal result event expected");
         }
+    }
+
+    #[test]
+    fn classifies_structured_http_429_and_quota_errors_as_rate_limited() {
+        let mut parser = AntigravityEventParser::default();
+        let events = stderr(
+            &mut parser,
+            "AGY_ERROR: {\"canonical_status\":\"RESOURCE_EXHAUSTED\",\"http_code\":429,\"grpc_code\":8,\"retryable\":false,\"error_id\":\"provider-17\",\"retry_at\":2000000000,\"message\":\"provider quota reached\"}\n",
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::ProviderError { code: Some(code), message, .. }
+                if code == "RESOURCE_EXHAUSTED"
+                    && message.contains("http_code=429")
+                    && message.contains("grpc_code=8")
+                    && message.contains("error_id=provider-17")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::RateLimit { rate_limit }
+                if rate_limit.resume_at == Some(2_000_000_000_000)
+                    && rate_limit.message.as_deref().is_some_and(|message| message.contains("provider quota reached"))
+        )));
+        assert!(matches!(
+            terminal(&mut parser, 3).kind,
+            ExecutionEventKind::Result { result }
+                if result.status == TerminalStatus::RateLimited
+                    && result.rate_limit.as_ref().is_some_and(|limit| limit.resume_at == Some(2_000_000_000_000))
+        ));
+
+        let mut parser = AntigravityEventParser::default();
+        let events = stderr(
+            &mut parser,
+            "AGY_ERROR: {\"canonical_status\":\"QUOTA_EXCEEDED\",\"retryable\":false,\"message\":\"daily quota reached\"}\n",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, ExecutionEventKind::RateLimit { .. }))
+        );
+        assert!(matches!(
+            terminal(&mut parser, 3).kind,
+            ExecutionEventKind::Result { result } if result.status == TerminalStatus::RateLimited
+        ));
+    }
+
+    #[test]
+    fn classifies_retryable_transient_errors_but_keeps_deterministic_errors_failed() {
+        let mut parser = AntigravityEventParser::default();
+        let events = stderr(
+            &mut parser,
+            "AGY_ERROR: {\"canonical_status\":\"UNAVAILABLE\",\"http_code\":503,\"retryable\":true,\"error_id\":\"transient-503\"}\n",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, ExecutionEventKind::RateLimit { .. }))
+        );
+        assert!(matches!(
+            terminal(&mut parser, 3).kind,
+            ExecutionEventKind::Result { result }
+                if result.status == TerminalStatus::RateLimited
+                    && result.error.as_deref().is_some_and(|error| error.contains("retryable=true"))
+        ));
+
+        let mut parser = AntigravityEventParser::default();
+        let events = stderr(
+            &mut parser,
+            "AGY_ERROR: {\"canonical_status\":\"NOT_FOUND\",\"http_code\":404,\"retryable\":false,\"error_id\":\"model-not-found\"}\n",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, ExecutionEventKind::RateLimit { .. }))
+        );
+        assert!(matches!(
+            terminal(&mut parser, 3).kind,
+            ExecutionEventKind::Result { result }
+                if result.status == TerminalStatus::Failed
+                    && result.rate_limit.is_none()
+                    && result.error.as_deref().is_some_and(|error| error.contains("NOT_FOUND"))
+        ));
+    }
+
+    #[test]
+    fn malformed_unknown_and_oversized_provider_records_fall_back_to_stderr() {
+        let mut parser = AntigravityEventParser::default();
+        let events = stderr(
+            &mut parser,
+            "ordinary diagnostic\nAGY_ERROR: not-json\nAGY_ERROR: {\"future_field\":\"value\"}\n",
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.kind,
+            ExecutionEventKind::ProviderError { .. } | ExecutionEventKind::RateLimit { .. }
+        )));
+        let logs = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stderr,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(logs.contains("ordinary diagnostic"));
+        assert!(logs.contains("AGY_ERROR: not-json"));
+
+        let mut parser = AntigravityEventParser::default();
+        let oversized = format!(
+            "AGY_ERROR: {{\"retryable\":true,\"message\":\"{}\"}}\n",
+            "x".repeat(AGY_ERROR_RECORD_LIMIT)
+        );
+        let events = stderr(&mut parser, &oversized);
+        assert!(!events.iter().any(|event| matches!(
+            event.kind,
+            ExecutionEventKind::ProviderError { .. } | ExecutionEventKind::RateLimit { .. }
+        )));
+        assert!(parser.stderr_diagnostic.chars().count() <= STDERR_DIAGNOSTIC_LIMIT);
+    }
+
+    #[test]
+    fn redacts_structured_fields_before_events_and_terminal_diagnostics() {
+        let secret = "synthetic-provider-secret";
+        let raw = format!(
+            "AGY_ERROR: {{\"canonical_status\":\"{secret}\",\"retryable\":true,\"error_id\":\"{secret}\",\"message\":\"quota {secret}\"}}\n"
+        );
+        let split = raw.find(secret).expect("secret in record") + 9;
+        let mut parser = AntigravityEventParser::with_secrets(vec![secret.to_owned()]);
+        let mut events = parser.push_stderr(&raw[..split]);
+        events.extend(parser.push_stderr(&raw[split..]));
+        events.extend(parser.finish_stderr());
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::ProviderError { code: Some(code), .. } if code == "***"
+        )));
+        let result = terminal(&mut parser, 3);
+        let rendered = format!(
+            "{}{}",
+            serde_json::to_string(&events).expect("serialize structured events"),
+            serde_json::to_string(&result).expect("serialize terminal result")
+        );
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("***"));
+        let ExecutionEventKind::Result { result } = result.kind else {
+            panic!("terminal result event expected");
+        };
+        let error = result.error.expect("provider failure includes diagnostic");
+        assert!(error.contains("***"));
+        assert!(error.chars().count() <= STDERR_DIAGNOSTIC_LIMIT + 2_100);
+        assert_eq!(result.status, TerminalStatus::RateLimited);
     }
 }
