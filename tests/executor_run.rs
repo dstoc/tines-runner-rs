@@ -133,7 +133,13 @@ fn run_antigravity_executor(directory: &Path, request: &Value, agy: &str) -> Exe
     let mut events = parser
         .push(&output.stdout)
         .expect("executor output is valid JSONL");
-    if let Some(terminal) = parser.finish().expect("executor emits one result") {
+    if let Some(terminal) = parser.finish().unwrap_or_else(|error| {
+        panic!(
+            "Antigravity executor output has a protocol error: {error}; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }) {
         events.push(terminal);
     }
     ExecutorOutput {
@@ -145,6 +151,15 @@ fn run_antigravity_executor(directory: &Path, request: &Value, agy: &str) -> Exe
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
+}
+
+fn antigravity_stream_script(records: &[Value]) -> String {
+    let jsonl = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize Antigravity fixture"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("#!/bin/sh\ncat >/dev/null\ncat <<'TINES_AGY_STREAM'\n{jsonl}\nTINES_AGY_STREAM\n")
 }
 
 fn result(output: &ExecutorOutput) -> &Value {
@@ -383,6 +398,133 @@ printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{}}' '{
         1,
         "streamed response must not repeat from result.response"
     );
+}
+
+#[test]
+fn antigravity_redacts_split_responses_and_clipped_fields_through_retention() {
+    let directory = TestDirectory::new();
+    let secret = "SYNTHETIC_REVIEW_SECRET_VALUE";
+
+    let streamed_workspace = directory.0.join("streamed-workspaces");
+    let mut streamed_request = request(&streamed_workspace, "always", 1);
+    streamed_request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    streamed_request["assignment"]["env"] = json!([
+        { "name": "SYNTHETIC_SECRET", "value": secret, "secret": true }
+    ]);
+    let streamed_output = run_antigravity_executor(
+        &directory.0,
+        &streamed_request,
+        &antigravity_stream_script(&[
+            json!({
+                "event": "step_update",
+                "step_update": { "step_type": "agent_response", "text_delta": "before SYNTHETIC_REVIEW_" }
+            }),
+            json!({
+                "event": "step_update",
+                "step_update": { "step_type": "agent_response", "text_delta": "SECRET_VALUE after" }
+            }),
+            json!({ "event": "result", "result": { "status": "SUCCESS" } }),
+        ]),
+    );
+    assert!(streamed_output.success, "{}", streamed_output.stderr);
+    assert!(!streamed_output.stdout.contains("SYNTHETIC_REVIEW_SECRET"));
+    let streamed_logs = streamed_output
+        .events
+        .iter()
+        .filter_map(|event| {
+            (event["type"] == "log" && event["stream"] == "stdout")
+                .then(|| event["message"].as_str())
+                .flatten()
+        })
+        .collect::<String>();
+    assert!(streamed_logs.contains("***"));
+    assert!(!streamed_logs.contains(secret));
+
+    let fallback_workspace = directory.0.join("fallback-workspaces");
+    let mut fallback_request = request(&fallback_workspace, "always", 1);
+    fallback_request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    fallback_request["assignment"]["env"] = json!([
+        { "name": "SYNTHETIC_SECRET", "value": secret, "secret": true }
+    ]);
+    let prefix = "x".repeat(32 * 1024 - 8);
+    let fallback_output = run_antigravity_executor(
+        &directory.0,
+        &fallback_request,
+        &antigravity_stream_script(&[json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": format!("{prefix}{secret}tail") }
+        })]),
+    );
+    assert!(fallback_output.success, "{}", fallback_output.stderr);
+    assert!(!fallback_output.stdout.contains(&secret[..8]));
+    let fallback_logs = fallback_output
+        .events
+        .iter()
+        .filter_map(|event| {
+            (event["type"] == "log" && event["stream"] == "stdout")
+                .then(|| event["message"].as_str())
+                .flatten()
+        })
+        .collect::<String>();
+    assert!(fallback_logs.contains("***"));
+    assert!(!fallback_logs.contains(secret));
+    assert!(!fallback_logs.contains(&secret[..8]));
+
+    let failed_workspace = directory.0.join("failed-workspaces");
+    let tool_secret = "TOOL_REDACTION_SECRET_VALUE";
+    let mut failed_request = request(&failed_workspace, "failed", 1);
+    failed_request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    failed_request["assignment"]["env"] = json!([
+        { "name": "SYNTHETIC_SECRET", "value": secret, "secret": true },
+        { "name": "TOOL_SECRET", "value": tool_secret, "secret": true }
+    ]);
+    let failed_output = run_antigravity_executor(
+        &directory.0,
+        &failed_request,
+        &antigravity_stream_script(&[
+            json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "tool_name": format!("{}{}", "x".repeat(152), tool_secret),
+                    "state": format!("{}{}", "y".repeat(24), tool_secret)
+                }
+            }),
+            json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": format!("{}{}", "f".repeat(1_990), secret)
+                }
+            }),
+        ]),
+    );
+    assert!(!failed_output.success);
+    assert!(!failed_output.stdout.contains(&secret[..10]));
+    assert!(!failed_output.stdout.contains(&tool_secret[..8]));
+    let rendered_events = serde_json::to_string(&failed_output.events).expect("events serialize");
+    assert!(!rendered_events.contains(&secret[..10]));
+    assert!(!rendered_events.contains(&tool_secret[..8]));
+    assert!(
+        !result(&failed_output)["error"]
+            .as_str()
+            .expect("terminal diagnostic")
+            .contains(&secret[..10])
+    );
+    let retained_workspace = fs::read_dir(&failed_workspace)
+        .expect("failed workspace parent remains")
+        .next()
+        .expect("failed workspace retained")
+        .expect("workspace entry")
+        .path();
+    let marker: Value = serde_json::from_slice(
+        &fs::read(retained_workspace.join(".tines-runner-retained.json"))
+            .expect("retention marker"),
+    )
+    .expect("valid retention marker");
+    let retained_error = marker["error"].as_str().expect("retained error");
+    assert!(retained_error.contains("***"));
+    assert!(!retained_error.contains(&secret[..10]));
 }
 
 #[test]

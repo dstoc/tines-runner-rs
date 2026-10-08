@@ -61,9 +61,10 @@ struct AntigravityEventParser {
     usage: Option<ExecutionUsage>,
     malformed: bool,
     response_streamed: bool,
+    response_redactor: StreamingSecretRedactor,
     stderr_pending: String,
     stderr_diagnostic: String,
-    stderr_secrets: Vec<String>,
+    secret_patterns: Vec<String>,
     stderr_redaction_window: usize,
 }
 
@@ -76,14 +77,16 @@ struct AntigravityTerminal {
 
 impl AntigravityEventParser {
     fn with_secrets(stderr_secrets: Vec<String>) -> Self {
-        let stderr_redaction_window = stderr_secrets
+        let secret_patterns = ordered_patterns(stderr_secrets);
+        let stderr_redaction_window = secret_patterns
             .iter()
             .map(|secret| secret.chars().count())
             .max()
             .unwrap_or_default()
             .saturating_sub(1);
         Self {
-            stderr_secrets,
+            response_redactor: StreamingSecretRedactor::new(secret_patterns.clone()),
+            secret_patterns,
             stderr_redaction_window,
             ..Self::default()
         }
@@ -112,7 +115,8 @@ impl AntigravityEventParser {
                             && !delta.is_empty()
                         {
                             self.response_streamed = true;
-                            events.extend(log_text(LogStream::Stdout, delta));
+                            let safe_delta = self.response_redactor.push(delta);
+                            events.extend(log_text(LogStream::Stdout, &safe_delta));
                         }
                     }
                     Some("tool") => {
@@ -121,10 +125,14 @@ impl AntigravityEventParser {
                             .and_then(Value::as_str)
                             .or_else(|| step.pointer("/tool_info/name").and_then(Value::as_str));
                         if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+                            let name = redact_complete(name, &self.secret_patterns);
                             let state = step.get("state").and_then(Value::as_str);
                             let message = state.map_or_else(
-                                || format!("[tool] {}", clip(name, 160)),
-                                |state| format!("[tool] {} ({})", clip(name, 160), clip(state, 32)),
+                                || format!("[tool] {}", clip(&name, 160)),
+                                |state| {
+                                    let state = redact_complete(state, &self.secret_patterns);
+                                    format!("[tool] {} ({})", clip(&name, 160), clip(&state, 32))
+                                },
                             );
                             events.push(log_event(LogStream::Stdout, message));
                         }
@@ -153,7 +161,7 @@ impl AntigravityEventParser {
                     .get("error")
                     .and_then(Value::as_str)
                     .filter(|error| !error.trim().is_empty())
-                    .map(|error| clip(error, 2_000));
+                    .map(|error| clip(&redact_complete(error, &self.secret_patterns), 2_000));
                 let denied_actions = result.get("denied_actions").is_some_and(is_nonempty_value);
                 if let Some(usage) = result.get("usage").and_then(parse_usage) {
                     events.push(ExecutionEvent::new(ExecutionEventKind::Usage {
@@ -171,7 +179,8 @@ impl AntigravityEventParser {
                 if !self.response_streamed
                     && let Some(response) = result.get("response").and_then(Value::as_str)
                 {
-                    events.extend(log_text(LogStream::Stdout, response));
+                    let response = redact_complete(response, &self.secret_patterns);
+                    events.extend(log_text(LogStream::Stdout, &response));
                 }
                 self.terminal = Some(AntigravityTerminal {
                     status,
@@ -225,7 +234,7 @@ impl AntigravityEventParser {
         while index < safe_starts {
             let byte_index = offsets[index];
             if let Some(secret) = self
-                .stderr_secrets
+                .secret_patterns
                 .iter()
                 .find(|secret| self.stderr_pending[byte_index..].starts_with(secret.as_str()))
             {
@@ -259,11 +268,15 @@ impl HarnessEventParser for AntigravityEventParser {
     }
 
     fn finish(&mut self) -> Vec<ExecutionEvent> {
-        self.parser
+        let mut events = self
+            .parser
             .finish()
             .into_iter()
             .flat_map(|event| self.translate(event))
-            .collect()
+            .collect::<Vec<_>>();
+        let response_tail = self.response_redactor.finish();
+        events.extend(log_text(LogStream::Stdout, &response_tail));
+        events
     }
 
     fn push_stderr(&mut self, chunk: &str) -> Vec<ExecutionEvent> {
@@ -322,9 +335,12 @@ impl HarnessEventParser for AntigravityEventParser {
                     .as_ref()
                     .and_then(|result| result.error.clone())
                     .or_else(|| {
-                        terminal
-                            .as_ref()
-                            .map(|result| format!("Antigravity returned status {}", result.status))
+                        terminal.as_ref().map(|result| {
+                            format!(
+                                "Antigravity returned status {}",
+                                redact_complete(&result.status, &self.secret_patterns)
+                            )
+                        })
                     })
             } else {
                 exit.error.or_else(|| {
@@ -344,7 +360,13 @@ impl HarnessEventParser for AntigravityEventParser {
         ExecutionEvent::new(ExecutionEventKind::Result {
             result: TerminalResult {
                 status,
-                exit_code: (!interrupted).then_some(exit.exit_code).flatten(),
+                exit_code: if success {
+                    Some(0)
+                } else if interrupted {
+                    None
+                } else {
+                    exit.exit_code.filter(|code| *code != 0)
+                },
                 error,
                 provider_session_id: self.conversation_id.clone(),
                 usage: self.usage.clone(),
@@ -409,6 +431,122 @@ fn log_stderr(message: &str) -> Vec<ExecutionEvent> {
 
 fn clip(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn ordered_patterns(mut patterns: Vec<String>) -> Vec<String> {
+    patterns.retain(|pattern| !pattern.is_empty());
+    patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
+    patterns.dedup();
+    patterns
+}
+
+/// A streaming redactor that keeps any possible secret suffix until the next
+/// chunk can prove that it is safe to emit.
+#[derive(Default)]
+struct StreamingSecretRedactor {
+    patterns: Vec<String>,
+    pending: String,
+}
+
+impl StreamingSecretRedactor {
+    fn new(patterns: Vec<String>) -> Self {
+        let patterns = ordered_patterns(patterns);
+        Self {
+            patterns,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> String {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, finish: bool) -> String {
+        let characters = self.pending.chars().collect::<Vec<_>>();
+        let mut safe_chars = characters.len();
+
+        if !finish {
+            for pattern in &self.patterns {
+                let prefix_bytes = pattern.char_indices().map(|(index, _)| index).skip(1);
+                for prefix_end in prefix_bytes {
+                    if self.pending.ends_with(&pattern[..prefix_end]) {
+                        safe_chars = safe_chars
+                            .min(characters.len() - pattern[..prefix_end].chars().count());
+                    }
+                }
+            }
+        }
+
+        loop {
+            let previous_safe_chars = safe_chars;
+            for (start, (byte_start, _)) in self.pending.char_indices().enumerate() {
+                if start >= safe_chars {
+                    break;
+                }
+                for pattern in &self.patterns {
+                    if self.pending[byte_start..].starts_with(pattern) {
+                        let end = start + pattern.chars().count();
+                        if end > safe_chars {
+                            safe_chars = start;
+                        }
+                    }
+                }
+            }
+            if safe_chars == previous_safe_chars {
+                break;
+            }
+        }
+
+        let safe_bytes = characters
+            .iter()
+            .take(safe_chars)
+            .map(|character| character.len_utf8())
+            .sum::<usize>();
+        let safe = self.pending[..safe_bytes].to_owned();
+        self.pending.drain(..safe_bytes);
+        redact_complete(&safe, &self.patterns)
+    }
+}
+
+/// Replace every matching range, including ranges that overlap another
+/// secret. This prevents either secret from leaving a visible suffix.
+fn redact_complete(text: &str, patterns: &[String]) -> String {
+    let mut ranges = Vec::new();
+    for (start, _) in text.char_indices() {
+        let suffix = &text[start..];
+        for pattern in patterns {
+            if suffix.starts_with(pattern) {
+                ranges.push((start, start + pattern.len()));
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return text.to_owned();
+    }
+    ranges.sort_unstable();
+
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut range = ranges[0];
+    for next in ranges.into_iter().skip(1) {
+        if next.0 <= range.1 {
+            range.1 = range.1.max(next.1);
+            continue;
+        }
+        redacted.push_str(&text[cursor..range.0]);
+        redacted.push_str("***");
+        cursor = range.1;
+        range = next;
+    }
+    redacted.push_str(&text[cursor..range.0]);
+    redacted.push_str("***");
+    redacted.push_str(&text[range.1..]);
+    redacted
 }
 
 #[cfg(test)]
@@ -505,6 +643,107 @@ mod tests {
     }
 
     #[test]
+    fn redacts_split_and_overlapping_response_secrets_before_logging() {
+        let mut parser = AntigravityEventParser::with_secrets(vec![
+            "secret-value".to_owned(),
+            "synthetic-secret-value".to_owned(),
+        ]);
+        let first = parser.push(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"before synthetic-secret-\"}}\n",
+        );
+        let second = parser.push(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"value after\"}}\n",
+        );
+        let mut events = first;
+        events.extend(second);
+        events.extend(parser.finish());
+        let text = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stdout,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "before *** after");
+        assert!(!text.contains("synthetic-secret-value"));
+        assert!(!text.contains("secret-value"));
+    }
+
+    #[test]
+    fn redacts_terminal_fallback_before_splitting_log_chunks() {
+        const CHUNK_CHARS: usize = 32 * 1024;
+        let secret = "synthetic-secret-value";
+        let prefix = "x".repeat(CHUNK_CHARS - 8);
+        let response = format!("{prefix}{secret}tail");
+        let raw = serde_json::json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": response }
+        });
+        let stream = format!("{}\n", raw);
+        let mut parser = AntigravityEventParser::with_secrets(vec![secret.to_owned()]);
+        let mut events = parser.push(&stream);
+        events.extend(parser.finish());
+        let logs = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stdout,
+                    message,
+                } => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logs.iter().map(|log| log.chars().count()).sum::<usize>(),
+            prefix.len() + 3 + 4
+        );
+        assert!(logs.iter().all(|log| !log.contains(secret)));
+        assert!(logs.iter().all(|log| !log.contains("syntheti")));
+        assert!(logs.iter().any(|log| log.contains("***")));
+    }
+
+    #[test]
+    fn redacts_provider_and_clipped_tool_fields_before_truncation() {
+        let secret = "SYNTHETIC_REVIEW_SECRET_VALUE";
+        let tool_secret = "TOOL_REDACTION_SECRET_VALUE";
+        let raw = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": format!("{}{}", "x".repeat(152), tool_secret),
+                "state": format!("{}{}", "y".repeat(24), tool_secret)
+            }
+        });
+        let result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "status": "ERROR",
+                "error": format!("{}{}", "f".repeat(1_990), secret)
+            }
+        });
+        let stream = format!("{}\n{}\n", raw, result);
+        let mut parser =
+            AntigravityEventParser::with_secrets(vec![secret.to_owned(), tool_secret.to_owned()]);
+        let mut events = parser.push(&stream);
+        events.extend(parser.finish());
+        let rendered = serde_json::to_string(&events).expect("events serialize");
+        assert!(rendered.contains("***"));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("SYNTHETIC"));
+        assert!(!rendered.contains("TOOL_RED"));
+        let terminal = terminal(&mut parser, 0);
+        let ExecutionEventKind::Result { result } = terminal.kind else {
+            panic!("terminal result event expected");
+        };
+        let error = result.error.expect("provider failure includes error");
+        assert!(!error.contains(secret));
+        assert!(!error.contains("SYNTHETIC"));
+    }
+
+    #[test]
     fn every_non_success_status_and_denied_actions_fail() {
         for status in [
             "ERROR",
@@ -520,6 +759,7 @@ mod tests {
                 format!("{{\"event\":\"result\",\"result\":{{\"status\":\"{status}\"}}}}\n");
             feed(&mut parser, &stream);
             let result = terminal(&mut parser, 0);
+            result.validate().expect("failed status is a valid result");
             assert!(
                 matches!(result.kind, ExecutionEventKind::Result { result } if result.status == TerminalStatus::Failed)
             );
