@@ -128,7 +128,7 @@ pub fn discover(daemon_version: &str) -> AntigravityDiscovery {
     discover_with_program("agy", daemon_version)
 }
 
-fn discover_with_program(program: &str, daemon_version: &str) -> AntigravityDiscovery {
+pub(crate) fn discover_with_program(program: &str, daemon_version: &str) -> AntigravityDiscovery {
     discover_with_program_and_timeout(program, daemon_version, DISCOVERY_COMMAND_TIMEOUT)
 }
 

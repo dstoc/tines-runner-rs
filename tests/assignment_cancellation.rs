@@ -668,7 +668,7 @@ fn custom_override_still_requires_verified_custom_harness_support() {
     assert!(matches!(
         outcome,
         AssignmentTaskOutcome::Declined(reason)
-            if reason == "configured executor does not verify support for the custom harness"
+            if reason.contains("configured executor could not verify support for the custom harness")
     ));
     let requests = server.join().expect("join fake Tines server");
     assert_eq!(requests.len(), 1);

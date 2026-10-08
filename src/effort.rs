@@ -47,7 +47,7 @@ impl EffortCapabilities {
         Self::discover_with_program("codex", daemon_version)
     }
 
-    fn discover_with_program(program: &str, daemon_version: &str) -> Self {
+    pub(crate) fn discover_with_program(program: &str, daemon_version: &str) -> Self {
         Self::discover_with_prefix(program, &[], daemon_version)
     }
 
