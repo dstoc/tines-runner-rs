@@ -23,6 +23,9 @@ use crate::protocol::FinishStatus;
 use crate::retention;
 use crate::shutdown::ShutdownSignal;
 
+pub mod antigravity;
+pub mod antigravity_adapter;
+pub mod antigravity_stream;
 pub mod codex;
 pub mod codex_adapter;
 pub mod codex_stream;
@@ -122,6 +125,16 @@ pub fn execute_request(
         return ExitCode::FAILURE;
     }
 
+    if request.execution.harness == "antigravity" && request.assignment.effort.is_some() {
+        return emit_failure(
+            request,
+            output,
+            diagnostics,
+            "Antigravity explicit effort delivery is not supported by this runner version"
+                .to_owned(),
+        );
+    }
+
     // Environment delivery keeps the run key out of stdin. Resolve it once
     // before workspace preparation so all executor redaction paths can use
     // the same effective secret context as the harness environment.
@@ -189,22 +202,23 @@ pub fn execute_request(
     };
 
     if output_error.is_none() {
-        let capabilities = if request.assignment.effort.is_some() {
-            EffortCapabilities::discover(crate::VERSION)
-        } else {
-            EffortCapabilities {
-                version: 1,
-                daemon_version: crate::VERSION.to_owned(),
-                harness: request.execution.harness.clone(),
-                harness_version: "not required".to_owned(),
-                catalog_digest: String::new(),
-                models: Vec::new(),
-                accepts_asserted_effort: None,
-                discovery_error: None,
-            }
-        };
+        let capabilities =
+            if request.assignment.effort.is_some() && request.execution.harness == "codex" {
+                EffortCapabilities::discover(crate::VERSION)
+            } else {
+                EffortCapabilities {
+                    version: 1,
+                    daemon_version: crate::VERSION.to_owned(),
+                    harness: request.execution.harness.clone(),
+                    harness_version: "not required".to_owned(),
+                    catalog_digest: String::new(),
+                    models: Vec::new(),
+                    accepts_asserted_effort: None,
+                    discovery_error: None,
+                }
+            };
         match events.launch(request, &workspace, &capabilities) {
-            Ok(mut launch) => {
+            Ok(launch) => {
                 let diagnostic = launch.diagnostics().to_owned();
                 output_error = write_event(
                     request,
@@ -217,8 +231,14 @@ pub fn execute_request(
                 .err()
                 .map(|error| error.to_string());
                 if output_error.is_none() {
-                    let command = launch.command();
-                    match SupervisedProcess::spawn_with_output(command) {
+                    let (mut command, stdin) = launch.into_parts();
+                    let process = match stdin {
+                        Some(input) => {
+                            SupervisedProcess::spawn_with_stdin_and_output(&mut command, input)
+                        }
+                        None => SupervisedProcess::spawn_with_output(&mut command),
+                    };
+                    match process {
                         Ok(process) => {
                             let stdout = Utf8StreamDecoder::default();
                             let stderr = Utf8StreamDecoder::default();

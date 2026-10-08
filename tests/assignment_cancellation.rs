@@ -186,6 +186,7 @@ fn executor_capabilities(accepts_asserted_effort: bool) -> ExecutorCapabilities 
             ExecutorHarnessCapabilities {
                 version: effort.harness_version.clone(),
                 effort: Some(effort),
+                discovery_error: None,
             },
         )]),
         discovery_error: None,
@@ -597,6 +598,7 @@ fn codex_to_custom_override_accepts_effort_without_codex_effort_capabilities() {
             ExecutorHarnessCapabilities {
                 version: "custom-command 1.0".to_owned(),
                 effort: None,
+                discovery_error: None,
             },
         )]),
         discovery_error: None,
@@ -672,6 +674,74 @@ fn custom_override_still_requires_verified_custom_harness_support() {
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
     assert!(!directory.0.join("workspaces").exists());
+}
+
+#[test]
+fn antigravity_effort_is_declined_before_capability_or_harness_launch() {
+    let directory = TestDirectory::new();
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let executor = successful_executor(&directory, "antigravity-override-executor");
+    let capability_marker = directory.0.join("agy-capabilities-started");
+    let capability_probe = directory.0.join("agy-capability-probe");
+    fs::write(
+        &capability_probe,
+        format!(
+            "#!/bin/sh\nprintf started > {:?}\nprintf '%s\\n' '{{\"version\":1,\"harnesses\":{{\"antigravity\":{{\"version\":\"agy 1.3.1\"}}}}}}'\n",
+            capability_marker
+        ),
+    )
+    .expect("write Antigravity capability probe");
+    fs::set_permissions(&capability_probe, fs::Permissions::from_mode(0o755))
+        .expect("make capability probe executable");
+    let override_config = format!(
+        "[[override]]\nproject = \"Tines\"\nworkflow = \"Implementation\"\nstate = \"Implement\"\nrunner_type = \"antigravity\"\ncapabilities_executor = {}\n",
+        serde_json::to_string(&vec![capability_probe.to_string_lossy().into_owned()])
+            .expect("encode capability probe argv")
+    );
+    let (config, client, connection) =
+        configured_with_overrides(&directory, &server_url, Some(&executor), &override_config);
+    let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
+        config.executor.clone(),
+        config.executor_cwd.clone(),
+    );
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+    let mut assignment = assignment(None);
+    assignment.effort = Some(RunnerAssignmentEffort {
+        version: 1,
+        value: "high".to_owned(),
+        capability_digest: Some("pi-catalog".to_owned()),
+        verification: None,
+    });
+
+    let outcome = run_assignment(
+        &config,
+        &connection,
+        &client,
+        assignment,
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &default_executor,
+        &executor_capabilities(true),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("decline explicit Antigravity effort");
+
+    assert!(matches!(
+        outcome,
+        AssignmentTaskOutcome::Declined(reason)
+            if reason == "Antigravity explicit effort delivery is not supported by this runner version"
+    ));
+    assert!(
+        !capability_marker.exists(),
+        "effort rejection must precede agy probing"
+    );
+    assert!(!directory.0.join("workspaces").exists());
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
 }
 
 #[test]

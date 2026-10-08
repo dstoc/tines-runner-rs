@@ -19,14 +19,43 @@ use url::Url;
 #[serde(rename_all = "lowercase")]
 pub enum RunnerType {
     Codex,
+    Antigravity,
     Custom,
 }
 
 impl RunnerType {
-    /// The Tines effort-capability harness ID, when this runner type opts in.
+    /// The semantic harness identifier used inside the executor.
+    pub const fn executor_harness(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// The harness identifier supported by the current Tines registration API.
+    pub const fn tines_harness(self) -> crate::protocol::RunnerHarness {
+        match self {
+            Self::Codex => crate::protocol::RunnerHarness::Codex,
+            Self::Antigravity => crate::protocol::RunnerHarness::Pi,
+            Self::Custom => crate::protocol::RunnerHarness::Custom,
+        }
+    }
+
+    /// The semantic harness identifier to look up in executor capabilities.
     pub const fn effort_capability_harness(self) -> Option<&'static str> {
         match self {
             Self::Codex => Some("codex"),
+            Self::Antigravity => Some("antigravity"),
+            Self::Custom => None,
+        }
+    }
+
+    /// The harness identifier to advertise in Tines capability reports.
+    pub const fn tines_capability_harness(self) -> Option<&'static str> {
+        match self {
+            Self::Codex => Some("codex"),
+            Self::Antigravity => Some("pi"),
             Self::Custom => None,
         }
     }
@@ -1121,6 +1150,15 @@ fn expand_path(path: &Path, home: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn antigravity_maps_to_its_internal_identity_and_tines_pi_alias() {
+        let runner = RunnerType::Antigravity;
+        assert_eq!(runner.executor_harness(), "antigravity");
+        assert_eq!(runner.tines_harness(), crate::protocol::RunnerHarness::Pi);
+        assert_eq!(runner.effort_capability_harness(), Some("antigravity"));
+        assert_eq!(runner.tines_capability_harness(), Some("pi"));
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -1189,8 +1227,7 @@ executor = ["payments-executor"]
 [runners.antigravity]
 name = "workstation-antigravity"
 credentials_file = "/var/lib/tines/antigravity-credentials.toml"
-runner_type = "custom"
-custom_command = ["antigravity"]
+runner_type = "antigravity"
 executor = ["antigravity-executor"]
 capabilities_executor = ["antigravity-probe"]
 executor_cwd = "/srv/antigravity"
@@ -1241,7 +1278,7 @@ state_dir = "/var/lib/tines/state"
         .unwrap();
         assert_eq!(antigravity.local_id, "antigravity");
         assert_eq!(antigravity.runner_name, "workstation-antigravity");
-        assert_eq!(antigravity.runner_type, RunnerType::Custom);
+        assert_eq!(antigravity.runner_type, RunnerType::Antigravity);
         assert_eq!(
             antigravity.credentials_file,
             PathBuf::from("/var/lib/tines/antigravity-credentials.toml")

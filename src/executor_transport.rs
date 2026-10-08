@@ -15,7 +15,7 @@ use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 
 use crate::assignment::ResolvedAssignment;
-use crate::config::{Config, ResolvedRunConfig, RunKeyDelivery, RunnerType, WorkspaceRetention};
+use crate::config::{Config, ResolvedRunConfig, RunKeyDelivery, WorkspaceRetention};
 use crate::execution_protocol::{
     EXECUTION_PROTOCOL_VERSION, ExecutionRequest, ExecutionRetentionPolicy, LocalExecutionPolicy,
     TinesExecutionContext, WorkspacePolicy,
@@ -76,10 +76,7 @@ pub fn execution_request(
             api_url: api_url.to_owned(),
         },
         execution: LocalExecutionPolicy {
-            harness: match policy.runner_type {
-                RunnerType::Codex => "codex".to_owned(),
-                RunnerType::Custom => "custom".to_owned(),
-            },
+            harness: policy.runner_type.executor_harness().to_owned(),
             custom_command: policy.custom_command.clone(),
             repository_checkout: policy.repository_checkout,
             workspace: WorkspacePolicy {

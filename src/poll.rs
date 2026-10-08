@@ -42,6 +42,7 @@ pub struct PollState {
     draining_poll_reported: bool,
     capabilities_transport: ExecutorTransport,
     effort_capability_harness: Option<&'static str>,
+    tines_capability_harness: Option<&'static str>,
     executor_capabilities: Option<ExecutorCapabilities>,
     executor_capabilities_refreshed_at: Option<Instant>,
     failure_reporter: FailureReporter,
@@ -76,6 +77,7 @@ impl PollState {
             draining_poll_reported: false,
             capabilities_transport: ExecutorTransport::for_capabilities(config),
             effort_capability_harness: config.runner_type.effort_capability_harness(),
+            tines_capability_harness: config.runner_type.tines_capability_harness(),
             executor_capabilities: None,
             executor_capabilities_refreshed_at: None,
             failure_reporter: FailureReporter::default(),
@@ -270,9 +272,13 @@ impl PollState {
             draining: Some(self.draining),
             env_delivery: Some(1),
             effort_capabilities: self.effort_capability_harness.and_then(|harness| {
-                self.executor_capabilities
-                    .as_ref()
-                    .map(|capabilities| capabilities.effort_report(harness, crate::VERSION))
+                self.executor_capabilities.as_ref().map(|capabilities| {
+                    let mut report = capabilities.effort_report(harness, crate::VERSION);
+                    if let Some(tines_harness) = self.tines_capability_harness {
+                        report.harness = tines_harness.to_owned();
+                    }
+                    report
+                })
             }),
         }
     }
@@ -609,7 +615,7 @@ mod tests {
     use super::{PollLoop, PollState, retry_delay};
     use crate::config::{Config, RunnerType};
     use crate::credentials::{CredentialStore, RunnerCredentials};
-    use crate::effort::{EffortCapabilities, EffortModelCapability};
+    use crate::effort::{EffortCapabilities, EffortModelCapability, catalog_digest};
     use crate::executor_capabilities::{ExecutorCapabilities, ExecutorHarnessCapabilities};
     use crate::logging::test_support::capture_events;
     use crate::protocol::client::RunLogBuffer;
@@ -895,6 +901,7 @@ mod tests {
                 ExecutorHarnessCapabilities {
                     version: "codex-cli 0.153.4".to_owned(),
                     effort: Some(effort),
+                    discovery_error: None,
                 },
             )]),
             discovery_error: None,
@@ -926,6 +933,81 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_capabilities_use_pi_on_the_poll_wire() {
+        let directory = TestDirectory::new();
+        let (url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
+        let store = CredentialStore::at(directory.credentials_path());
+        store
+            .save(&RunnerCredentials::new("rnr_poll", "poll-token"))
+            .expect("store runner credentials");
+        let mut config = config(&url, store.path(), false);
+        config.runner_type = RunnerType::Antigravity;
+        let connection = RunnerConnection::connect(&config).expect("load runner connection");
+        let mut poller = PollLoop::new(connection, &config);
+        let models = vec![EffortModelCapability {
+            model: "gemini-3.8-flash-high".to_owned(),
+            efforts: Vec::new(),
+        }];
+        let effort = EffortCapabilities {
+            version: 1,
+            daemon_version: "0.1.0".to_owned(),
+            harness: "antigravity".to_owned(),
+            harness_version: "agy 1.3.1".to_owned(),
+            catalog_digest: catalog_digest(&models),
+            models,
+            accepts_asserted_effort: None,
+            discovery_error: None,
+        };
+        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
+            version: 1,
+            harnesses: BTreeMap::from([(
+                "antigravity".to_owned(),
+                ExecutorHarnessCapabilities {
+                    version: "agy 1.3.1".to_owned(),
+                    effort: Some(effort),
+                    discovery_error: None,
+                },
+            )]),
+            discovery_error: None,
+        });
+        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
+        let polls = Cell::new(0);
+
+        poller
+            .run_with(
+                |_, _| polls.set(polls.get() + 1),
+                || polls.get() == 0,
+                |_| panic!("one poll should finish without sleeping"),
+            )
+            .expect("poll with Antigravity capabilities");
+
+        let requests = server.join().expect("fake server request");
+        assert_eq!(
+            poller
+                .state()
+                .executor_capabilities
+                .as_ref()
+                .unwrap()
+                .harnesses["antigravity"]
+                .effort
+                .as_ref()
+                .unwrap()
+                .harness,
+            "antigravity"
+        );
+        assert_eq!(requests[0]["effort_capabilities"]["harness"], "pi");
+        assert_eq!(
+            requests[0]["effort_capabilities"]["models"],
+            serde_json::json!([{ "model": "gemini-3.8-flash-high", "efforts": [] }])
+        );
+        assert!(
+            requests[0]["effort_capabilities"]
+                .get("accepts_asserted_effort")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn custom_poll_omits_effort_report_and_keeps_custom_discovery() {
         let directory = TestDirectory::new();
         let (url, server) = mock_server(vec![(200, r#"{"assignments":[],"cancels":[]}"#)]);
@@ -944,6 +1026,7 @@ mod tests {
                 ExecutorHarnessCapabilities {
                     version: "custom-agent 1.0".to_owned(),
                     effort: None,
+                    discovery_error: None,
                 },
             )]),
             discovery_error: None,

@@ -7,10 +7,10 @@ status to Tines. The executor creates the workspace, checks out assigned Git
 repositories, and runs the selected harness. The executor can run on the
 daemon host or inside a container.
 
-The runner supports Codex and a generic custom command harness. It makes
-outbound connections to Tines and Git remotes; it does not need an inbound
-connection. It does not install or update harness tools, manage a service, or
-update itself.
+The runner supports Codex, Antigravity, and a generic custom command harness.
+It makes outbound connections to Tines and Git remotes; it does not need an
+inbound connection. It does not install or update harness tools, manage a
+service, or update itself.
 
 ## Install
 
@@ -193,19 +193,18 @@ max_concurrent = 2
 [runners.antigravity]
 name = "review-antigravity"
 credentials_file = "/var/lib/tines-runner-rs/antigravity/credentials.toml"
-runner_type = "custom"
-custom_command = ["antigravity", "{prompt_file}"]
+runner_type = "antigravity"
 
 [storage]
 state_dir = "/var/lib/tines-runner-rs/state"
 ```
 
 The IDs `codex` and `antigravity` are local selectors. The example uses the
-custom harness for `antigravity` until a dedicated harness type is available.
-Both runners inherit the executor transport, working directory, workspace
-parent, run-key delivery, and repository policy. The Codex runner replaces
-the inherited concurrency limit with `2`. The custom runner keeps the
-inherited limit and sets its harness command.
+dedicated Antigravity harness. Tines receives the compatible `pi` identity for
+its model catalog and tier routing. Both runners inherit the executor
+transport, working directory, workspace parent, run-key delivery, and
+repository policy. The Codex runner replaces the inherited concurrency limit
+with `2`. The Antigravity runner keeps the inherited limit.
 
 Each named runner must set its own `name`, `runner_type`, and
 `credentials_file`. Omitted transport and execution settings inherit from
@@ -260,7 +259,7 @@ lists remain local to each named runner.
 | `[runners.<id>].credentials_file` | Required credentials path. Every runner in the file must use a distinct path. |
 | `[runners.default]` | Optional, non-selectable template for shared runner settings. Named runners must still set their own `name`, `runner_type`, and `credentials_file`. |
 | `[storage].state_dir` | Shared writable root for active-run crash-recovery state. Defaults to the platform state directory. The daemon separates runners into local-ID subdirectories. |
-| `[runners.<id>].runner_type` | Harness type: `codex` or `custom`. Required with `[runners.default]`; otherwise defaults to `codex`. |
+| `[runners.<id>].runner_type` | Harness type: `codex`, `antigravity`, or `custom`. Required with `[runners.default]`; otherwise defaults to `codex`. |
 | `[runners.<id>].custom_command` | Optional argv array for the custom harness. Required for each assignment resolved to `custom`. |
 | `[runners.<id>].repository_checkout` | Repository materialization mode: `enabled` (default) clones working trees; `metadata_only` writes `repos.json` without cloning. |
 | `[runners.<id>].workspace_parent` | Optional workspace parent inside the executor environment. If omitted, the executor uses its platform default. |
@@ -285,7 +284,9 @@ implicit default, and is the daemon-side working directory for the transport
 process. It does not set the workspace path inside the executor.
 
 For native execution, keep the default executor and install
-`tines-runner-rs`, Codex CLI, and Git for the daemon account. Codex and Git
+`tines-runner-rs`, the selected harness CLI, and Git for the daemon account.
+Codex CLI is required for `runner_type = "codex"`; Antigravity CLI 1.3.1 or
+newer is required for `runner_type = "antigravity"`. The selected CLI and Git
 credentials must also be available to that account:
 
 ```toml
@@ -297,8 +298,15 @@ executor_cwd = "~"
 workspace_parent = "~/.local/share/tines-runner-rs/workspaces"
 ```
 
-For Docker execution, install Codex CLI, Git, and repository credentials
-inside the image or executor environment. The image must also contain
+For Antigravity, set `runner_type = "antigravity"` and install `agy` 1.3.1 or
+newer in the same executor environment. The adapter launches `agy` directly,
+passes the selected model slug unchanged, enables sandbox mode, and sends the
+prompt as a stream-JSON input event over stdin. Its internal harness identity
+is `antigravity`; registration and model capabilities use Tines' current `pi`
+identity. Tines assignments with explicit effort are declined.
+
+For Docker execution, install the selected harness CLI, Git, and repository
+credentials inside the image or executor environment. The image must also contain
 `tines-runner-rs`. If you retain executor workspaces, mount persistent storage
 at the configured workspace parent. This Linux example does that:
 
@@ -347,12 +355,14 @@ Capability discovery also crosses the executor boundary. The daemon invokes
 `capabilities_executor` when it is set and otherwise uses the resolved
 `executor` command. It appends `capabilities` and runs the command from the same
 required `executor_cwd` used for assignments. The daemon caches the versioned
-report for ten minutes. The report includes the built-in custom harness. The
-native executor discovers Codex on the daemon account's `PATH`; a container
-executor discovers Codex inside the container. Custom commands do not support
-Codex model effort settings. The daemon refreshes the report before it accepts
-assignments with enforced effort. An invalid report or unsupported harness or
-effort causes the daemon to decline the incompatible assignment.
+report for ten minutes. The report includes the built-in custom harness and
+discovers Codex and Antigravity inside the executor environment. Antigravity
+uses `agy --version` and `agy models`; its discovered model slugs are sent to
+Tines under the `pi` capability identity with no selectable effort values.
+Assignments with explicit Antigravity effort are declined. The daemon refreshes
+the report before it accepts assignments with enforced effort. An invalid
+report or unsupported harness or effort causes the daemon to decline the
+incompatible assignment.
 
 Use `capabilities_executor` when the normal transport needs per-run credentials
 that a capability probe does not need. For example, with

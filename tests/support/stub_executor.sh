@@ -8,7 +8,7 @@ control_dir=$4
 
 if [ "${5:-}" = "capabilities" ]; then
     : > "$control_dir/capabilities.$label"
-    printf '%s\n' '{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}'
+    printf '%s\n' '{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}},"antigravity":{"version":"agy 1.3.1","effort":{"version":1,"daemon_version":"0.1.0","harness":"antigravity","harness_version":"agy 1.3.1","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[]}}}}'
     exit 0
 fi
 
