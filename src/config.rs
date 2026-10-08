@@ -34,6 +34,14 @@ impl RunnerType {
     }
 
     /// The harness identifier supported by the current Tines registration API.
+    ///
+    /// Tines does not expose a native Antigravity identity yet, so this maps
+    /// Antigravity to the protocol compatibility alias `pi`. This alias does
+    /// not mean that the runner implements Pi CLI behavior. Do not infer
+    /// Antigravity continuation support from it. Any future resume support
+    /// must define Antigravity semantics and opt in explicitly. Change this
+    /// registration mapping and `tines_capability_harness` when Tines adds a
+    /// native Antigravity identity.
     pub const fn tines_harness(self) -> crate::protocol::RunnerHarness {
         match self {
             Self::Codex => crate::protocol::RunnerHarness::Codex,
@@ -52,6 +60,10 @@ impl RunnerType {
     }
 
     /// The harness identifier to advertise in Tines capability reports.
+    ///
+    /// For Antigravity, `pi` is only a Tines protocol alias. Keep execution
+    /// and any future continuation decisions tied to the internal harness
+    /// identity, with an explicit Antigravity opt-in for resume semantics.
     pub const fn tines_capability_harness(self) -> Option<&'static str> {
         match self {
             Self::Codex => Some("codex"),
@@ -1151,7 +1163,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn antigravity_maps_to_its_internal_identity_and_tines_pi_alias() {
+    fn antigravity_pi_alias_stays_at_the_protocol_boundary() {
         let runner = RunnerType::Antigravity;
         assert_eq!(runner.executor_harness(), "antigravity");
         assert_eq!(runner.tines_harness(), crate::protocol::RunnerHarness::Pi);
