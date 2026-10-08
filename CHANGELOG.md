@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.0](https://github.com/dstoc/tines-runner-rs/compare/v0.7.0...v0.8.0) (2026-10-08)
+
+
+### Features
+
+* **antigravity:** classify structured provider errors ([#74](https://github.com/dstoc/tines-runner-rs/issues/74)) ([844eef4](https://github.com/dstoc/tines-runner-rs/commit/844eef4a8efb101bb3e267adc6f0de068cb02e9f))
+* **harness:** add first-class Antigravity support ([#72](https://github.com/dstoc/tines-runner-rs/issues/72)) ([7d446d9](https://github.com/dstoc/tines-runner-rs/commit/7d446d97d40cdfb0d734a5953053ae25b34db458))
+
+
+### Bug Fixes
+
+* **antigravity:** harden capability discovery ([#73](https://github.com/dstoc/tines-runner-rs/issues/73)) ([3a06fe4](https://github.com/dstoc/tines-runner-rs/commit/3a06fe41ace1ff8960246e3714986678ab004ccd))
+* **config:** resolve daemon paths relative to config directory ([#70](https://github.com/dstoc/tines-runner-rs/issues/70)) ([ce748c2](https://github.com/dstoc/tines-runner-rs/commit/ce748c20650a1fb8ad10f9d95ff36dab84d567bc))
+* **executor:** fail on harness stdin write errors ([#77](https://github.com/dstoc/tines-runner-rs/issues/77)) ([791af37](https://github.com/dstoc/tines-runner-rs/commit/791af37a337bf867a3f27dcd380fae532f26ba26))
+* **executor:** scope capability health to configured harness ([#75](https://github.com/dstoc/tines-runner-rs/issues/75)) ([ed9a96b](https://github.com/dstoc/tines-runner-rs/commit/ed9a96b3b7958a6165a98eccd216a348df8e9e75))
+
 ## [0.7.0](https://github.com/dstoc/tines-runner-rs/compare/v0.6.0...v0.7.0) (2026-10-07)
 
 
