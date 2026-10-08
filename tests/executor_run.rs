@@ -434,6 +434,41 @@ exit 3
 }
 
 #[test]
+fn antigravity_stdin_failure_overrides_provider_success() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("antigravity-stdin-failure-workspaces");
+    let mut request = request(&workspace_parent, "always", 1);
+    request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    request["assignment"]["prompt"] = Value::String("x".repeat(4 * 1024 * 1024));
+    request["assignment"]["env"] = json!([
+        { "name": "FIXTURE_SECRET", "value": "Broken pipe", "secret": true }
+    ]);
+    let script = r##"#!/bin/sh
+head -c 1 >/dev/null
+exec 0<&-
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS"}}'
+"##;
+
+    let output = run_antigravity_executor(&directory.0, &request, script);
+
+    assert!(
+        !output.success,
+        "stderr: {}\nevents: {:#?}",
+        output.stderr, output.events
+    );
+    let terminal = result(&output);
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["exit_code"], 1);
+    let error = terminal["error"]
+        .as_str()
+        .expect("stdin failure diagnostic");
+    assert!(error.contains("harness stdin write failed"));
+    assert!(error.contains("***"));
+    assert!(!error.contains("Broken pipe"));
+    assert!(error.chars().count() <= 500);
+}
+
+#[test]
 fn antigravity_redacts_split_responses_and_clipped_fields_through_retention() {
     let directory = TestDirectory::new();
     let secret = "SYNTHETIC_REVIEW_SECRET_VALUE";
