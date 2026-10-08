@@ -303,7 +303,15 @@ newer in the same executor environment. The adapter launches `agy` directly,
 passes the selected model slug unchanged, enables sandbox mode, and sends the
 prompt as a stream-JSON input event over stdin. Its internal harness identity
 is `antigravity`; registration and model capabilities use Tines' current `pi`
-identity. Tines assignments with explicit effort are declined.
+identity as a compatibility alias. The alias is only a protocol mapping. It
+does not mean that this runner implements Pi CLI semantics. Tines associates
+`pi` with continuation behavior, but the runner does not implement the retained
+workspace and session contract, and resume is disabled by default. Do not infer
+Antigravity continuation support from the wire identity. Any future resume
+support must define Antigravity continuation semantics and opt in explicitly.
+When Tines adds a native Antigravity identity, registration and capability
+reporting should migrate to it. Tines assignments with explicit effort are
+declined.
 
 For Docker execution, install the selected harness CLI, Git, and repository
 credentials inside the image or executor environment. The image must also contain
