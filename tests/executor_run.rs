@@ -401,6 +401,39 @@ printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{}}' '{
 }
 
 #[test]
+fn antigravity_structured_quota_error_reaches_executor_protocol_as_rate_limited() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("agy-structured-error-workspaces");
+    let mut request = request(&workspace_parent, "never", 1);
+    request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    let script = r##"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"event":"result","result":{"status":"ERROR","error":"provider request failed"}}'
+printf '%s\n' 'AGY_ERROR: {"canonical_status":"RESOURCE_EXHAUSTED","http_code":429,"retryable":false,"error_id":"quota-17","message":"provider quota reached"}' >&2
+exit 3
+"##;
+
+    let output = run_antigravity_executor(&directory.0, &request, script);
+
+    let terminal = result(&output);
+    assert_eq!(terminal["status"], "rate_limited");
+    assert_eq!(
+        terminal["rate_limit"]["message"],
+        "AGY_ERROR status=RESOURCE_EXHAUSTED http_code=429 retryable=false error_id=quota-17 provider quota reached"
+    );
+    assert!(terminal["error"].as_str().is_some_and(|error| {
+        error.contains("RESOURCE_EXHAUSTED") && error.contains("provider quota reached")
+    }));
+    assert!(output.events.iter().any(|event| {
+        event["type"] == "log"
+            && event["stream"] == "stderr"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("AGY_ERROR:"))
+    }));
+}
+
+#[test]
 fn antigravity_redacts_split_responses_and_clipped_fields_through_retention() {
     let directory = TestDirectory::new();
     let secret = "SYNTHETIC_REVIEW_SECRET_VALUE";
