@@ -12,8 +12,8 @@ use crate::credentials::{
 };
 use crate::protocol::client::{Client, ClientError, ErrorCategory, RunLogBuffer};
 use crate::protocol::{
-    FinishRunRequest, FinishRunResponse, FinishStatus, RegisterRunnerRequest, RunnerHarness,
-    RunnerPollRequest, RunnerPollResponse,
+    FinishRunRequest, FinishRunResponse, FinishStatus, RegisterRunnerRequest, RunnerPollRequest,
+    RunnerPollResponse,
 };
 
 const MAX_REGISTERED_CONCURRENCY: usize = 100;
@@ -234,12 +234,9 @@ impl RunnerConnection {
 }
 
 fn registration_request(config: &Config) -> Result<RegisterRunnerRequest, RunnerError> {
-    let harness = match config.runner_type {
-        RunnerType::Codex => RunnerHarness::Codex,
-        RunnerType::Custom => RunnerHarness::Custom,
-    };
+    let harness = config.runner_type.tines_harness();
     let command = match config.runner_type {
-        RunnerType::Codex => None,
+        RunnerType::Codex | RunnerType::Antigravity => None,
         RunnerType::Custom => Some(render_registered_command(
             config
                 .custom_command
@@ -582,6 +579,22 @@ mod tests {
         assert_eq!(request["harness"], "custom");
         assert_eq!(request["name"], "checks-runner");
         assert_eq!(request["command"], "checks");
+    }
+
+    #[test]
+    fn antigravity_registers_as_pi_without_a_custom_command() {
+        let directory = TestDirectory::new();
+        let config = Config::from_toml_str(&format!(
+            "[server]\nurl = \"https://tines.example.test\"\n[runner]\nname = \"agy-runner\"\nrunner_type = \"antigravity\"\nexecutor_cwd = \"~\"\n[storage]\ncredentials_file = {:?}\n",
+            directory.credentials_path()
+        ))
+        .expect("Antigravity runner config");
+
+        let request =
+            serde_json::to_value(registration_request(&config).expect("registration request"))
+                .expect("serialize registration request");
+        assert_eq!(request["harness"], "pi");
+        assert!(request.get("command").is_none());
     }
 
     #[test]

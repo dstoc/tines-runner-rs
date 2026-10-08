@@ -329,6 +329,34 @@ custom_command = ["project-checks", "{workspace}"]
 }
 
 #[test]
+fn execution_request_keeps_antigravity_identity_after_a_runner_type_override() {
+    let (server_url, server) = issue_server(1);
+    let config = Config::from_toml_str(
+        r#"[server]
+url = "http://127.0.0.1:1"
+[runner]
+name = "antigravity-execution-request-test"
+runner_type = "codex"
+executor_cwd = "/host/daemon"
+[[override]]
+project = "Tines"
+runner_type = "antigravity"
+"#,
+    )
+    .expect("parse Antigravity override configuration");
+    let client =
+        Client::with_timeout(&server_url, Duration::from_secs(5)).expect("create issue client");
+    let resolved =
+        resolve_assignment(&config, &client, &assignment()).expect("resolve assignment metadata");
+    let request = execution_request(&resolved, &server_url, &config.workspace_retention);
+    server.join().expect("issue detail request");
+
+    assert_eq!(request.execution.harness, "antigravity");
+    let serialized = serde_json::to_value(request).expect("serialize executor request");
+    assert_eq!(serialized["execution"]["harness"], "antigravity");
+}
+
+#[test]
 fn execution_request_preserves_executor_tilde_paths_and_omits_its_default() {
     let (server_url, server) = issue_server(3);
     let cases = [

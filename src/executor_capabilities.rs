@@ -25,10 +25,12 @@ pub struct ExecutorHarnessCapabilities {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
 }
 
 impl ExecutorCapabilities {
-    /// Probe Codex in the current environment and return a versioned document.
+    /// Probe the native harnesses in the current executor environment.
     pub fn discover(daemon_version: &str) -> Self {
         let mut harnesses = BTreeMap::from([(
             "custom".to_owned(),
@@ -38,45 +40,70 @@ impl ExecutorCapabilities {
                     .take(MAX_IDENTIFIER_LENGTH)
                     .collect(),
                 effort: None,
+                discovery_error: None,
             },
         )]);
-        let effort = EffortCapabilities::discover(daemon_version);
+        let mut discovery_error = None;
+        let codex_daemon_version = daemon_version.to_owned();
+        let codex_discovery = std::thread::Builder::new()
+            .name("codex-capability-discovery".to_owned())
+            .spawn(move || EffortCapabilities::discover(&codex_daemon_version));
+        let antigravity = crate::executor::antigravity::discover(daemon_version);
+        let effort = match codex_discovery {
+            Ok(discovery) => discovery.join().unwrap_or_else(|_| {
+                EffortCapabilities::unavailable(
+                    daemon_version,
+                    "codex",
+                    "Codex capability probe failed",
+                )
+            }),
+            Err(_) => EffortCapabilities::unavailable(
+                daemon_version,
+                "codex",
+                "Codex capability probe could not start",
+            ),
+        };
         if effort.validate_for_harness("codex").is_err() {
-            return Self {
-                version: EXECUTOR_CAPABILITIES_VERSION,
-                harnesses,
-                discovery_error: Some("Codex capabilities could not be verified".to_owned()),
-            };
-        }
-
-        let version = effort.harness_version.clone();
-        if let Some(error) = effort.discovery_error.clone() {
-            if version != "unknown" {
+            discovery_error = Some("Codex capabilities could not be verified".to_owned());
+        } else {
+            let version = effort.harness_version.clone();
+            if let Some(error) = effort.discovery_error.clone() {
                 harnesses.insert(
                     "codex".to_owned(),
                     ExecutorHarnessCapabilities {
                         version,
                         effort: None,
+                        discovery_error: Some(error.clone()),
+                    },
+                );
+                discovery_error = Some(error);
+            } else {
+                harnesses.insert(
+                    "codex".to_owned(),
+                    ExecutorHarnessCapabilities {
+                        version,
+                        effort: Some(effort),
+                        discovery_error: None,
                     },
                 );
             }
-            return Self {
-                version: EXECUTOR_CAPABILITIES_VERSION,
-                harnesses,
-                discovery_error: Some(error),
-            };
         }
+
         harnesses.insert(
-            "codex".to_owned(),
+            "antigravity".to_owned(),
             ExecutorHarnessCapabilities {
-                version,
-                effort: Some(effort),
+                version: antigravity.version.unwrap_or_else(|| "unknown".to_owned()),
+                effort: antigravity.effort,
+                discovery_error: antigravity.error.clone(),
             },
         );
+        if discovery_error.is_none() {
+            discovery_error = antigravity.error;
+        }
         Self {
             version: EXECUTOR_CAPABILITIES_VERSION,
             harnesses,
-            discovery_error: None,
+            discovery_error,
         }
     }
 
@@ -114,9 +141,19 @@ impl ExecutorCapabilities {
             }
             if let Some(effort) = &harness.effort {
                 effort.validate_for_harness(identifier)?;
-                if effort.harness_version != harness.version || effort.discovery_error.is_some() {
+                if effort.harness_version != harness.version
+                    || effort.discovery_error.is_some()
+                    || harness.discovery_error.is_some()
+                {
                     return Err("inconsistent executor effort capability report".to_owned());
                 }
+            }
+            if harness
+                .discovery_error
+                .as_ref()
+                .is_some_and(|error| error.len() > 200)
+            {
+                return Err("executor harness discovery error is too long".to_owned());
             }
         }
         Ok(())
@@ -133,12 +170,13 @@ impl ExecutorCapabilities {
 
     /// Return the existing Tines effort report for a harness.
     pub fn effort_report(&self, identifier: &str, daemon_version: &str) -> EffortCapabilities {
-        if let Some(report) = self
-            .harnesses
-            .get(identifier)
-            .and_then(|capability| capability.effort.as_ref())
-        {
-            return report.clone();
+        if let Some(capability) = self.harnesses.get(identifier) {
+            if let Some(report) = capability.effort.as_ref() {
+                return report.clone();
+            }
+            if let Some(error) = capability.discovery_error.as_deref() {
+                return EffortCapabilities::unavailable(daemon_version, identifier, error);
+            }
         }
         EffortCapabilities::unavailable(
             daemon_version,

@@ -482,7 +482,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn current_tines_contract_rejects_custom_v1_but_accepts_codex_and_omission() {
+    fn current_tines_contract_rejects_custom_v1_but_accepts_codex_pi_and_omission() {
         let request = |harness: &str| {
             json!({
                 "instance_id": "boot-1",
@@ -504,6 +504,7 @@ mod tests {
             "malformed V1 effort capability report"
         );
         assert!(effort_capabilities_validation_error(&request("codex")).is_none());
+        assert!(effort_capabilities_validation_error(&request("pi")).is_none());
         assert!(effort_capabilities_validation_error(&json!({"instance_id": "boot-1"})).is_none());
     }
 }

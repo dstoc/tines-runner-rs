@@ -103,6 +103,50 @@ fn run_executor_with_env(
     }
 }
 
+fn run_antigravity_executor(directory: &Path, request: &Value, agy: &str) -> ExecutorOutput {
+    let bin_directory = directory.join("antigravity-bin");
+    fs::create_dir_all(&bin_directory).expect("create Antigravity stub directory");
+    let stub = bin_directory.join("agy");
+    fs::write(&stub, agy).expect("write Antigravity stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+        .expect("make Antigravity stub executable");
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin_directory).chain(std::env::split_paths(&current_path)),
+    )
+    .expect("compose executor PATH");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"));
+    command
+        .arg("execute")
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("start executor");
+    serde_json::to_writer(
+        child.stdin.take().expect("executor stdin is piped"),
+        request,
+    )
+    .expect("write executor request");
+    let output = child.wait_with_output().expect("wait for executor");
+    let mut parser = ExecutionEventParser::default();
+    let mut events = parser
+        .push(&output.stdout)
+        .expect("executor output is valid JSONL");
+    if let Some(terminal) = parser.finish().expect("executor emits one result") {
+        events.push(terminal);
+    }
+    ExecutorOutput {
+        success: output.status.success(),
+        events: events
+            .into_iter()
+            .map(|event| serde_json::to_value(event).expect("event is serializable"))
+            .collect(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
 fn result(output: &ExecutorOutput) -> &Value {
     let results = output
         .events
@@ -264,6 +308,110 @@ fn custom_github_checks_style_command_runs_with_placeholders_environment_and_gen
     ] {
         assert!(!rendered.contains(secret), "secret {secret} reached logs");
     }
+}
+
+#[test]
+fn antigravity_launches_with_exact_model_stream_prompt_and_eof() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("antigravity-workspaces");
+    let control = directory.0.join("agy-control");
+    fs::create_dir_all(&control).expect("create Antigravity control directory");
+    let mut request = request(&workspace_parent, "never", 1);
+    request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    request["assignment"]["effort"] = Value::Null;
+    request["assignment"]["run"]["model"] = Value::String("gemini-custom.v2".to_owned());
+    request["assignment"]["prompt"] = Value::String("Use stdin exactly.".to_owned());
+    request["assignment"]["env"] = serde_json::json!([
+        { "name": "AGY_CONTROL", "value": control, "secret": false }
+    ]);
+    let script = r##"#!/bin/sh
+printf '%s\n' "$@" > "$AGY_CONTROL/args"
+pwd > "$AGY_CONTROL/cwd"
+cat > "$AGY_CONTROL/input"
+printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{}}' '{"event":"step_update","step_update":{"conversation_id":"agy-session-42","step_type":"agent_response","text_delta":"Antigravity answer"}}' '{"event":"result","result":{"conversation_id":"agy-session-42","status":"SUCCESS","response":"Antigravity answer","usage":{"input_tokens":12,"output_tokens":4,"cache_read_tokens":3,"thinking_tokens":99}}}'
+"##;
+
+    let output = run_antigravity_executor(&directory.0, &request, script);
+
+    assert!(
+        output.success,
+        "stderr: {}\nevents: {:#?}",
+        output.stderr, output.events
+    );
+    assert_eq!(result(&output)["status"], "completed");
+    assert_eq!(result(&output)["provider_session_id"], "agy-session-42");
+    assert_eq!(result(&output)["usage"]["input_tokens"], 12);
+    assert_eq!(result(&output)["usage"]["output_tokens"], 4);
+    assert_eq!(result(&output)["usage"]["cache_read_tokens"], 3);
+    let args = fs::read_to_string(control.join("args")).expect("captured agy arguments");
+    let args = args.lines().collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        [
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--sandbox",
+            "--print-timeout",
+            "2m",
+            "--model",
+            "gemini-custom.v2",
+        ]
+    );
+    let prompt: Value = serde_json::from_slice(
+        &fs::read(control.join("input")).expect("captured agy stream input"),
+    )
+    .expect("valid stream input JSON");
+    assert_eq!(prompt["event"], "user");
+    assert_eq!(prompt["message"]["content"], "Use stdin exactly.");
+    assert!(
+        fs::read_to_string(control.join("cwd"))
+            .expect("captured agy working directory")
+            .trim()
+            .contains("antigravity-workspaces"),
+        "agy must run in the materialized workspace"
+    );
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|event| event["type"] == "log" && event["stream"] == "stdout")
+            .filter_map(|event| event["message"].as_str())
+            .filter(|message| *message == "Antigravity answer")
+            .count(),
+        1,
+        "streamed response must not repeat from result.response"
+    );
+}
+
+#[test]
+fn antigravity_effort_is_rejected_before_the_harness_starts() {
+    let directory = TestDirectory::new();
+    let workspace_parent = directory.0.join("antigravity-effort-workspaces");
+    let marker = directory.0.join("agy-started");
+    let mut request = request(&workspace_parent, "never", 1);
+    request["execution"]["harness"] = Value::String("antigravity".to_owned());
+    request["assignment"]["effort"] = serde_json::json!({
+        "version": 1,
+        "value": "high",
+        "capability_digest": "catalog",
+    });
+    let script = format!("#!/bin/sh\nprintf started > {:?}\n", marker);
+
+    let output = run_antigravity_executor(&directory.0, &request, &script);
+
+    assert!(!output.success);
+    assert!(
+        !marker.exists(),
+        "explicit effort must be rejected before agy starts"
+    );
+    assert!(
+        result(&output)["error"]
+            .as_str()
+            .expect("deterministic rejection")
+            .contains("Antigravity explicit effort delivery is not supported")
+    );
 }
 
 #[test]

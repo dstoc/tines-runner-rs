@@ -201,7 +201,7 @@ fn verify_effort(
     ))
 }
 
-fn catalog_digest(models: &[EffortModelCapability]) -> String {
+pub(crate) fn catalog_digest(models: &[EffortModelCapability]) -> String {
     let encoded = serde_json::to_vec(models).expect("effort catalog is serializable");
     let digest = Sha256::digest(encoded);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()

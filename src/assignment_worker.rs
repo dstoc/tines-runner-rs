@@ -149,6 +149,14 @@ fn run_assignment_inner(
         );
     }
 
+    let runner_type = resolved.resolution().config.runner_type;
+    if runner_type == RunnerType::Antigravity && assignment.effort.is_some() {
+        return Ok(AssignmentTaskOutcome::Declined(
+            "Antigravity explicit effort delivery is not supported by this runner version"
+                .to_owned(),
+        ));
+    }
+
     let capabilities_transport =
         ExecutorTransport::for_resolved_capabilities(&resolved.resolution().config);
     let capabilities = if &capabilities_transport == default_capabilities_transport {
@@ -168,11 +176,7 @@ fn run_assignment_inner(
             context,
         );
     }
-    let runner_type = resolved.resolution().config.runner_type;
-    let harness = match runner_type {
-        RunnerType::Codex => "codex",
-        RunnerType::Custom => "custom",
-    };
+    let harness = runner_type.executor_harness();
     if !capabilities.supports(harness) {
         return Ok(AssignmentTaskOutcome::Declined(format!(
             "configured executor does not verify support for the {harness} harness"
@@ -183,6 +187,7 @@ fn run_assignment_inner(
             let effort_capabilities = capabilities.effort_report("codex", crate::VERSION);
             assignment_effort_rejection(&assignment, &effort_capabilities)
         }
+        RunnerType::Antigravity => None,
         // Custom commands do not consume Codex effort metadata. Keep this
         // branch harness-specific so future harnesses can define their own
         // effort semantics without using Codex validation.

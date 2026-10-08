@@ -1821,7 +1821,7 @@ fn distinct_named_runner_registrations_can_poll_concurrently() {
     let codex_executor = executor(&stub, "codex", &events, &captures, &control);
     let antigravity_executor = executor(&stub, "antigravity", &events, &captures, &control);
     let config = format!(
-        "[server]\nurl = {:?}\n\n[runners.codex]\nname = \"shared-codex\"\ncredentials_file = {:?}\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 2\npoll_interval_seconds = 1\n\n[runners.antigravity]\nname = \"shared-antigravity\"\ncredentials_file = {:?}\nrunner_type = \"custom\"\ncustom_command = [\"antigravity\"]\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 4\npoll_interval_seconds = 1\n\n[storage]\nstate_dir = {:?}\n",
+        "[server]\nurl = {:?}\n\n[runners.codex]\nname = \"shared-codex\"\ncredentials_file = {:?}\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 2\npoll_interval_seconds = 1\n\n[runners.antigravity]\nname = \"shared-antigravity\"\ncredentials_file = {:?}\nrunner_type = \"antigravity\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\nmax_concurrent = 4\npoll_interval_seconds = 1\n\n[storage]\nstate_dir = {:?}\n",
         fake.url(),
         credentials_codex,
         codex_executor,
@@ -1889,11 +1889,12 @@ fn distinct_named_runner_registrations_can_poll_concurrently() {
             .iter()
             .any(|body| { body["name"] == "shared-codex" && body["max_concurrent"] == 2 })
     );
-    assert!(
-        registrations
-            .iter()
-            .any(|body| { body["name"] == "shared-antigravity" && body["max_concurrent"] == 4 })
-    );
+    assert!(registrations.iter().any(|body| {
+        body["name"] == "shared-antigravity"
+            && body["harness"] == "pi"
+            && body["command"].is_null()
+            && body["max_concurrent"] == 4
+    }));
     let requests = fake.requests();
     let poll_targets = poll_requests(&requests)
         .iter()
@@ -1903,6 +1904,11 @@ fn distinct_named_runner_registrations_can_poll_concurrently() {
         poll_targets.len(),
         2,
         "each registration polls independently"
+    );
+    assert!(
+        poll_requests(&requests)
+            .iter()
+            .any(|request| request.json()["effort_capabilities"]["harness"] == "pi")
     );
 
     stop_gracefully(&fake, &mut codex);

@@ -12,6 +12,9 @@ use crate::executor::workspace::MaterializedWorkspace;
 pub fn adapter_for(identifier: &str) -> Result<Box<dyn HarnessAdapter>, UnsupportedHarness> {
     match identifier {
         "codex" => Ok(Box::new(crate::executor::codex_adapter::CodexAdapter)),
+        "antigravity" => Ok(Box::new(
+            crate::executor::antigravity_adapter::AntigravityAdapter,
+        )),
         "custom" => Ok(Box::new(crate::executor::custom_adapter::CustomAdapter)),
         _ => Err(UnsupportedHarness),
     }
@@ -41,6 +44,7 @@ pub trait HarnessAdapter: Send + Sync {
 /// A directly spawned process and safe diagnostic text for the launch.
 pub struct HarnessLaunch {
     command: Command,
+    stdin: Option<Vec<u8>>,
     diagnostics: String,
 }
 
@@ -48,6 +52,15 @@ impl HarnessLaunch {
     pub(crate) fn new(command: Command, diagnostics: String) -> Self {
         Self {
             command,
+            stdin: None,
+            diagnostics,
+        }
+    }
+
+    pub(crate) fn new_with_stdin(command: Command, stdin: Vec<u8>, diagnostics: String) -> Self {
+        Self {
+            command,
+            stdin: Some(stdin),
             diagnostics,
         }
     }
@@ -58,6 +71,10 @@ impl HarnessLaunch {
 
     pub fn into_command(self) -> Command {
         self.command
+    }
+
+    pub(crate) fn into_parts(self) -> (Command, Option<Vec<u8>>) {
+        (self.command, self.stdin)
     }
 
     pub fn diagnostics(&self) -> &str {

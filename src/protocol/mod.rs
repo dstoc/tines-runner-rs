@@ -7,11 +7,12 @@ use serde_json::Value;
 
 use crate::effort::EffortCapabilities;
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerHarness {
     ClaudeCode,
     Codex,
+    Pi,
     Custom,
 }
 
