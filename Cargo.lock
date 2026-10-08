@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "tines-runner-rs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "clap",

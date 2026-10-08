@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/dstoc/tines-runner-rs/compare/v0.8.0...v0.8.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **executor:** allow slower capability transports ([#79](https://github.com/dstoc/tines-runner-rs/issues/79)) ([14e8f26](https://github.com/dstoc/tines-runner-rs/commit/14e8f26ffdb2f444c7589aba46c673545afa623a))
+
 ## [0.8.0](https://github.com/dstoc/tines-runner-rs/compare/v0.7.0...v0.8.0) (2026-10-08)
 
 
