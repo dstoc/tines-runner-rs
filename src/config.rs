@@ -71,6 +71,19 @@ impl RunnerType {
             Self::Custom => None,
         }
     }
+
+    /// Whether this runner has defined semantics for continuing a prior run.
+    ///
+    /// Generic resume behavior must use this internal-harness gate, not the
+    /// Tines protocol identity returned by `tines_harness` or
+    /// `tines_capability_harness`. In particular, the `pi` compatibility alias
+    /// does not opt Antigravity into Pi continuation semantics. Enable a
+    /// runner only after defining its continuation contract and adding tests.
+    pub const fn supports_continuation(self) -> bool {
+        match self {
+            Self::Codex | Self::Antigravity | Self::Custom => false,
+        }
+    }
 }
 
 /// Whether a completed assignment's workspace should be retained.
@@ -1169,6 +1182,7 @@ mod tests {
         assert_eq!(runner.tines_harness(), crate::protocol::RunnerHarness::Pi);
         assert_eq!(runner.effort_capability_harness(), Some("antigravity"));
         assert_eq!(runner.tines_capability_harness(), Some("pi"));
+        assert!(!runner.supports_continuation());
     }
 
     struct TestDirectory(PathBuf);
