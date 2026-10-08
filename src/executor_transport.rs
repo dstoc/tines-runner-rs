@@ -27,7 +27,7 @@ use crate::process::{ProcessExit as ChildExit, ProcessIdentity, ProcessStream, S
 const EXECUTOR_MODE: &str = "execute";
 const CAPABILITIES_MODE: &str = "capabilities";
 const MAX_CAPABILITIES_OUTPUT_BYTES: usize = 64 * 1024;
-const CAPABILITIES_DEADLINE: Duration = Duration::from_secs(10);
+const CAPABILITIES_DEADLINE: Duration = Duration::from_secs(30);
 const CAPABILITIES_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 const STDERR_TRUNCATION_MARKER: &str = "\n[executor stderr truncated]";

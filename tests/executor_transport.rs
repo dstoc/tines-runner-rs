@@ -351,6 +351,47 @@ fn discovers_capabilities_through_the_configured_executor_command() {
 }
 
 #[test]
+fn capability_discovery_allows_commands_longer_than_ten_seconds() {
+    let directory = TestDirectory::new();
+    let stub = directory.0.join("slow-capability-executor");
+    write_executable(
+        &stub,
+        &format!(
+            "#!/bin/sh\nsleep 11\nprintf '%s\\n' '{}'\n",
+            codex_capabilities_document()
+        ),
+    );
+    let transport =
+        configured_capabilities_transport(vec![stub.to_string_lossy().into_owned()], &directory.0);
+    let started = std::time::Instant::now();
+
+    let capabilities = transport
+        .discover_capabilities()
+        .expect("capability discovery should allow the slower transport startup");
+
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    assert!(capabilities.supports("codex"));
+}
+
+#[test]
+fn capability_discovery_terminates_commands_after_thirty_seconds() {
+    let directory = TestDirectory::new();
+    let stub = directory.0.join("hung-capability-executor");
+    write_executable(&stub, "#!/bin/sh\nsleep 60\n");
+    let transport =
+        configured_capabilities_transport(vec![stub.to_string_lossy().into_owned()], &directory.0);
+    let started = std::time::Instant::now();
+
+    let error = transport
+        .discover_capabilities()
+        .expect_err("capability discovery should stop a command after its deadline");
+
+    assert!(error.to_string().contains("capability discovery timed out"));
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(45));
+}
+
+#[test]
 fn capabilities_executor_probes_without_run_key_while_executor_receives_it() {
     let directory = TestDirectory::new();
     let working_directory = directory.0.join("executor-cwd");
