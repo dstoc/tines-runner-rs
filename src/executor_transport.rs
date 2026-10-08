@@ -245,12 +245,47 @@ impl ExecutorTransport {
         &self,
         failures: &FailureReporter,
     ) -> ExecutorCapabilities {
+        self.discover_capabilities_reported_for_harness_inner(failures, None)
+    }
+
+    /// Discover capabilities and report failures for the configured harness.
+    /// Errors from unrelated native harness probes do not affect this runner's
+    /// operational health.
+    pub fn discover_capabilities_reported_for_harness(
+        &self,
+        failures: &FailureReporter,
+        harness: &str,
+    ) -> ExecutorCapabilities {
+        self.discover_capabilities_reported_for_harness_inner(failures, Some(harness))
+    }
+
+    fn discover_capabilities_reported_for_harness_inner(
+        &self,
+        failures: &FailureReporter,
+        configured_harness: Option<&str>,
+    ) -> ExecutorCapabilities {
         let path = self.diagnostic_identity();
         match self.discover_capabilities_with_stderr() {
             Ok((capabilities, stderr)) => {
-                if let Some(reason) = capabilities.discovery_error.as_deref() {
+                let scoped_path =
+                    configured_harness.map(|harness| format!("{path}:harness:{harness}"));
+                let failure = capabilities
+                    .discovery_error
+                    .as_deref()
+                    .map(|reason| (path.clone(), reason.to_owned()))
+                    .or_else(|| {
+                        configured_harness.and_then(|harness| {
+                            capabilities.support_error(harness).map(|reason| {
+                                (
+                                    scoped_path.clone().expect("configured harness path"),
+                                    reason,
+                                )
+                            })
+                        })
+                    });
+                if let Some((failure_path, reason)) = failure {
                     let secret_forms = capability_redaction_forms(&self.argv);
-                    let reason = redact_with_forms(reason, &secret_forms);
+                    let reason = redact_with_forms(&reason, &secret_forms);
                     let reason = crate::diagnostic::format_bounded_diagnostic(
                         &reason,
                         crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT,
@@ -263,13 +298,16 @@ impl ExecutorTransport {
                     );
                     self.log_capability_failure(
                         failures,
-                        &path,
+                        &failure_path,
                         &signature,
                         &reason,
                         stderr.as_deref(),
                     );
                 } else {
                     self.log_capability_recovery(failures, &path);
+                    if let Some(scoped_path) = scoped_path.as_deref() {
+                        self.log_capability_recovery(failures, scoped_path);
+                    }
                     tracing::debug!(
                         transport = self.config_source(),
                         harnesses = ?capabilities.harnesses.keys().collect::<Vec<_>>(),
@@ -939,6 +977,89 @@ mod tests {
         capture_events(|| {
             transport.discover_capabilities_reported(failures);
         })
+    }
+
+    fn reported_probe_events_for_harness(
+        transport: &ExecutorTransport,
+        failures: &FailureReporter,
+        harness: &str,
+    ) -> Vec<CapturedEvent> {
+        capture_events(|| {
+            transport.discover_capabilities_reported_for_harness(failures, harness);
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_probe_logs_only_the_configured_harness_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-capability-harness-health-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary directory");
+        let command = directory.join("capability-command");
+        let transport =
+            ExecutorTransport::new(vec![command.to_string_lossy().into_owned()], &directory);
+        let documents = [
+            (
+                "codex",
+                "{\"version\":1,\"harnesses\":{\"codex\":{\"version\":\"codex-cli 1.0\"},\"antigravity\":{\"version\":\"unknown\",\"discovery_error\":\"agy is missing\"}}}",
+                "antigravity",
+                "agy is missing",
+            ),
+            (
+                "antigravity",
+                "{\"version\":1,\"harnesses\":{\"codex\":{\"version\":\"unknown\",\"discovery_error\":\"Codex is missing\"},\"antigravity\":{\"version\":\"agy 1.3.1\"}}}",
+                "codex",
+                "Codex is missing",
+            ),
+        ];
+
+        for (healthy_harness, document, failed_harness, error) in documents {
+            std::fs::write(
+                &command,
+                format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", document),
+            )
+            .expect("write capability command");
+            let mut permissions = std::fs::metadata(&command)
+                .expect("stat capability command")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&command, permissions)
+                .expect("make capability command executable");
+
+            let healthy_events = reported_probe_events_for_harness(
+                &transport,
+                &FailureReporter::default(),
+                healthy_harness,
+            );
+            assert_eq!(healthy_events.len(), 1);
+            assert_eq!(healthy_events[0].level, tracing::Level::DEBUG);
+            assert!(
+                healthy_events[0]
+                    .fields
+                    .contains("executor capabilities discovered")
+            );
+            assert!(!healthy_events[0].fields.contains(error));
+
+            let failed_events = reported_probe_events_for_harness(
+                &transport,
+                &FailureReporter::default(),
+                failed_harness,
+            );
+            assert_eq!(failed_events.len(), 1);
+            assert_eq!(failed_events[0].level, tracing::Level::WARN);
+            assert!(failed_events[0].fields.contains(error));
+            assert!(
+                failed_events[0]
+                    .fields
+                    .contains("executor capability discovery failed")
+            );
+        }
+
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
     }
 
     #[cfg(unix)]

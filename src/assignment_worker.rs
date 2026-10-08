@@ -162,7 +162,10 @@ fn run_assignment_inner(
     let capabilities = if &capabilities_transport == default_capabilities_transport {
         advertised_capabilities.clone()
     } else {
-        capabilities_transport.discover_capabilities_reported(failure_reporter)
+        capabilities_transport.discover_capabilities_reported_for_harness(
+            failure_reporter,
+            runner_type.executor_harness(),
+        )
     };
     if cancellation.is_cancelled() {
         return Ok(AssignmentTaskOutcome::Cancelled);
@@ -178,9 +181,15 @@ fn run_assignment_inner(
     }
     let harness = runner_type.executor_harness();
     if !capabilities.supports(harness) {
-        return Ok(AssignmentTaskOutcome::Declined(format!(
-            "configured executor does not verify support for the {harness} harness"
-        )));
+        let reason = capabilities.support_error(harness).map_or_else(
+            || format!("configured executor does not verify support for the {harness} harness"),
+            |reason| {
+                format!(
+                    "configured executor could not verify support for the {harness} harness: {reason}"
+                )
+            },
+        );
+        return Ok(AssignmentTaskOutcome::Declined(reason));
     }
     let effort_rejection = match runner_type {
         RunnerType::Codex => {

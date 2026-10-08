@@ -32,6 +32,14 @@ pub struct ExecutorHarnessCapabilities {
 impl ExecutorCapabilities {
     /// Probe the native harnesses in the current executor environment.
     pub fn discover(daemon_version: &str) -> Self {
+        Self::discover_with_programs(daemon_version, "codex", "agy")
+    }
+
+    fn discover_with_programs(
+        daemon_version: &str,
+        codex_program: &str,
+        antigravity_program: &str,
+    ) -> Self {
         let mut harnesses = BTreeMap::from([(
             "custom".to_owned(),
             ExecutorHarnessCapabilities {
@@ -43,12 +51,17 @@ impl ExecutorCapabilities {
                 discovery_error: None,
             },
         )]);
-        let mut discovery_error = None;
         let codex_daemon_version = daemon_version.to_owned();
+        let codex_program = codex_program.to_owned();
         let codex_discovery = std::thread::Builder::new()
             .name("codex-capability-discovery".to_owned())
-            .spawn(move || EffortCapabilities::discover(&codex_daemon_version));
-        let antigravity = crate::executor::antigravity::discover(daemon_version);
+            .spawn(move || {
+                EffortCapabilities::discover_with_program(&codex_program, &codex_daemon_version)
+            });
+        let antigravity = crate::executor::antigravity::discover_with_program(
+            antigravity_program,
+            daemon_version,
+        );
         let effort = match codex_discovery {
             Ok(discovery) => discovery.join().unwrap_or_else(|_| {
                 EffortCapabilities::unavailable(
@@ -63,8 +76,15 @@ impl ExecutorCapabilities {
                 "Codex capability probe could not start",
             ),
         };
-        if effort.validate_for_harness("codex").is_err() {
-            discovery_error = Some("Codex capabilities could not be verified".to_owned());
+        if let Err(error) = effort.validate_for_harness("codex") {
+            harnesses.insert(
+                "codex".to_owned(),
+                ExecutorHarnessCapabilities {
+                    version: "unknown".to_owned(),
+                    effort: None,
+                    discovery_error: Some(error),
+                },
+            );
         } else {
             let version = effort.harness_version.clone();
             if let Some(error) = effort.discovery_error.clone() {
@@ -76,7 +96,6 @@ impl ExecutorCapabilities {
                         discovery_error: Some(error.clone()),
                     },
                 );
-                discovery_error = Some(error);
             } else {
                 harnesses.insert(
                     "codex".to_owned(),
@@ -97,13 +116,10 @@ impl ExecutorCapabilities {
                 discovery_error: antigravity.error.clone(),
             },
         );
-        if discovery_error.is_none() {
-            discovery_error = antigravity.error;
-        }
         Self {
             version: EXECUTOR_CAPABILITIES_VERSION,
             harnesses,
-            discovery_error,
+            discovery_error: None,
         }
     }
 
@@ -162,14 +178,32 @@ impl ExecutorCapabilities {
     /// Whether this document verifies the requested semantic harness.
     pub fn supports(&self, identifier: &str) -> bool {
         self.validate().is_ok_and(|()| {
-            self.harnesses
-                .get(identifier)
-                .is_some_and(|capability| capability.version != "unknown")
+            self.discovery_error.is_none()
+                && self.harnesses.get(identifier).is_some_and(|capability| {
+                    capability.version != "unknown" && capability.discovery_error.is_none()
+                })
         })
+    }
+
+    /// Explain why a harness is not verified by this capability document.
+    pub fn support_error(&self, identifier: &str) -> Option<String> {
+        if let Some(error) = self.discovery_error.as_deref() {
+            return Some(error.to_owned());
+        }
+        match self.harnesses.get(identifier) {
+            Some(capability) => capability.discovery_error.clone().or_else(|| {
+                (capability.version == "unknown")
+                    .then(|| format!("{identifier} version could not be determined"))
+            }),
+            None => Some(format!("executor does not report the {identifier} harness")),
+        }
     }
 
     /// Return the existing Tines effort report for a harness.
     pub fn effort_report(&self, identifier: &str, daemon_version: &str) -> EffortCapabilities {
+        if let Some(error) = self.discovery_error.as_deref() {
+            return EffortCapabilities::unavailable(daemon_version, identifier, error);
+        }
         if let Some(capability) = self.harnesses.get(identifier) {
             if let Some(report) = capability.effort.as_ref() {
                 return report.clone();
@@ -181,9 +215,7 @@ impl ExecutorCapabilities {
         EffortCapabilities::unavailable(
             daemon_version,
             identifier,
-            self.discovery_error
-                .as_deref()
-                .unwrap_or("executor does not report this harness"),
+            "executor does not report this harness",
         )
     }
 
@@ -233,6 +265,17 @@ pub fn discover_for_cli(daemon_version: &str) -> Result<(), std::io::Error> {
 mod tests {
     use super::ExecutorCapabilities;
 
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path)
+            .expect("stat fake executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fake executable");
+    }
+
     #[test]
     fn generic_executor_capability_document_supports_custom_without_effort() {
         let report = ExecutorCapabilities::parse(
@@ -242,5 +285,84 @@ mod tests {
 
         assert!(report.supports("custom"));
         assert!(report.harnesses["custom"].effort.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_harness_discovery_errors_are_scoped_to_each_harness() {
+        use std::fs;
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-executor-capabilities-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("create fake harness directory");
+        let codex = directory.join("codex");
+        fs::write(
+            &codex,
+            r##"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.153.4\n'
+  exit 0
+fi
+if [ "$1" = "app-server" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+      *'"method":"model/list"'*)
+        printf '%s\n' '{"id":3,"result":{"data":[{"model":"gpt-5.6","supportedReasoningEfforts":[{"reasoningEffort":"medium"}]}]}}'
+        exit 0
+        ;;
+    esac
+  done
+fi
+exit 2
+"##,
+        )
+        .expect("write fake Codex executable");
+        make_executable(&codex);
+        let antigravity = directory.join("agy");
+        fs::write(
+            &antigravity,
+            r##"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'agy v1.3.1\n'; exit 0; fi
+if [ "$1" = "models" ]; then printf 'gemini-3.8-flash model\n'; exit 0; fi
+exit 2
+"##,
+        )
+        .expect("write fake Antigravity executable");
+        make_executable(&antigravity);
+        let missing = directory.join("missing-harness");
+
+        for (codex_available, antigravity_available) in
+            [(true, false), (false, true), (true, true), (false, false)]
+        {
+            let report = ExecutorCapabilities::discover_with_programs(
+                "0.1.0",
+                if codex_available {
+                    codex.to_str().expect("Codex path is UTF-8")
+                } else {
+                    missing.to_str().expect("missing path is UTF-8")
+                },
+                if antigravity_available {
+                    antigravity.to_str().expect("Antigravity path is UTF-8")
+                } else {
+                    missing.to_str().expect("missing path is UTF-8")
+                },
+            );
+
+            assert_eq!(report.discovery_error, None);
+            assert_eq!(report.supports("codex"), codex_available);
+            assert_eq!(report.supports("antigravity"), antigravity_available);
+            assert_eq!(
+                report.harnesses["codex"].discovery_error.is_some(),
+                !codex_available
+            );
+            assert_eq!(
+                report.harnesses["antigravity"].discovery_error.is_some(),
+                !antigravity_available
+            );
+        }
+
+        fs::remove_dir_all(directory).expect("remove fake harness directory");
     }
 }

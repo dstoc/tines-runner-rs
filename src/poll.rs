@@ -41,6 +41,7 @@ pub struct PollState {
     draining: bool,
     draining_poll_reported: bool,
     capabilities_transport: ExecutorTransport,
+    executor_harness: &'static str,
     effort_capability_harness: Option<&'static str>,
     tines_capability_harness: Option<&'static str>,
     executor_capabilities: Option<ExecutorCapabilities>,
@@ -76,6 +77,7 @@ impl PollState {
             draining: false,
             draining_poll_reported: false,
             capabilities_transport: ExecutorTransport::for_capabilities(config),
+            executor_harness: config.runner_type.executor_harness(),
             effort_capability_harness: config.runner_type.effort_capability_harness(),
             tines_capability_harness: config.runner_type.tines_capability_harness(),
             executor_capabilities: None,
@@ -191,7 +193,10 @@ impl PollState {
         if force || expired {
             self.executor_capabilities = Some(
                 self.capabilities_transport
-                    .discover_capabilities_reported(&self.failure_reporter),
+                    .discover_capabilities_reported_for_harness(
+                        &self.failure_reporter,
+                        self.executor_harness,
+                    ),
             );
             self.executor_capabilities_refreshed_at = Some(now);
         }
@@ -1548,7 +1553,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nif [ -f '{}' ]; then printf 'capability permission denied: %s\\n' \"$1\" >&2; exit 9; fi\nprintf '%s\\n' '{{\"version\":1,\"harnesses\":{{}}}}'\n",
+                "#!/bin/sh\nif [ -f '{}' ]; then printf 'capability permission denied: %s\\n' \"$1\" >&2; exit 9; fi\nprintf '%s\\n' '{{\"version\":1,\"harnesses\":{{\"codex\":{{\"version\":\"codex-cli 1.0\"}}}}}}'\n",
                 fail_flag.display()
             ),
         )

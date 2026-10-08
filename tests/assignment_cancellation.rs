@@ -503,9 +503,12 @@ fn unsupported_executor_declines_before_workspace_materialization() {
     )
     .expect("decline an assignment without harness support");
 
-    assert!(
-        matches!(outcome, AssignmentTaskOutcome::Declined(reason) if reason.contains("does not verify support"))
-    );
+    assert!(matches!(
+        outcome,
+        AssignmentTaskOutcome::Declined(reason)
+            if reason.contains("could not verify support for the codex harness")
+                && reason.contains("Codex is not installed in the executor")
+    ));
     let requests = server.join().expect("join fake Tines server");
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
@@ -668,7 +671,7 @@ fn custom_override_still_requires_verified_custom_harness_support() {
     assert!(matches!(
         outcome,
         AssignmentTaskOutcome::Declined(reason)
-            if reason == "configured executor does not verify support for the custom harness"
+            if reason.contains("configured executor could not verify support for the custom harness")
     ));
     let requests = server.join().expect("join fake Tines server");
     assert_eq!(requests.len(), 1);
