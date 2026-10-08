@@ -9,6 +9,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::config::{self, ConfigError, WorkspaceRetention};
+use crate::diagnostic::{DIAGNOSTIC_EVENT_LIMIT, KeepPart, format_bounded_diagnostic};
 use crate::effort::EffortCapabilities;
 use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionRequest, LogStream, ProtocolError, TerminalResult,
@@ -17,7 +18,7 @@ use crate::execution_protocol::{
 use crate::executor::harness::{HarnessExit, adapter_for};
 use crate::executor::workspace::{MaterializedWorkspace, WorkspaceError};
 use crate::process::{
-    PROCESS_TREE_TERMINATION_GRACE, ProcessExit, ProcessStream, SupervisedProcess,
+    PROCESS_TREE_TERMINATION_GRACE, ProcessExit, ProcessOutput, ProcessStream, SupervisedProcess,
 };
 use crate::protocol::FinishStatus;
 use crate::retention;
@@ -337,27 +338,13 @@ pub fn execute_request(
                                         return ExitCode::FAILURE;
                                     }
 
-                                    let output_failed = streamed_error.is_some();
-                                    let error =
-                                        streamed_error.or_else(|| {
-                                            output_status.timed_out.then(|| format!(
-                                            "harness exceeded the {}-minute assignment timeout",
-                                            request.assignment.timeout_minutes
-                                        ))
-                                        });
-                                    let exit_code = if output_status.timed_out || output_failed {
-                                        Some(1)
-                                    } else {
-                                        match output_status.exit {
-                                            ProcessExit::Code(code) => Some(code),
-                                            ProcessExit::Signal(_) | ProcessExit::Unknown => None,
-                                        }
-                                    };
-                                    let terminal = parser.terminal_result(HarnessExit {
-                                        exit_code,
-                                        error,
-                                        interrupted: false,
-                                    });
+                                    let exit = harness_exit(
+                                        request,
+                                        &output_status,
+                                        streamed_error,
+                                        request.assignment.timeout_minutes,
+                                    );
+                                    let terminal = parser.terminal_result(exit);
                                     return emit_terminal(
                                         request,
                                         output,
@@ -396,6 +383,46 @@ pub fn execute_request(
         Some(&workspace),
         &retention,
     )
+}
+
+fn harness_exit(
+    request: &ExecutionRequest,
+    output: &ProcessOutput,
+    streamed_error: Option<String>,
+    timeout_minutes: u64,
+) -> HarnessExit {
+    let stdin_error = if output.timed_out || output.cancelled || output.interrupted {
+        None
+    } else {
+        output.stdin_error.as_deref().map(|error| {
+            let mut message = format!("harness stdin write failed: {error}");
+            request.redact_sensitive_text(&mut message);
+            format_bounded_diagnostic(&message, DIAGNOSTIC_EVENT_LIMIT, KeepPart::Prefix)
+        })
+    };
+    let stdin_failed = stdin_error.is_some();
+    let output_failed = streamed_error.is_some();
+    let error = streamed_error
+        .or_else(|| {
+            output.timed_out.then(|| {
+                format!("harness exceeded the {timeout_minutes}-minute assignment timeout")
+            })
+        })
+        .or(stdin_error);
+    let exit_code = if output.timed_out || output_failed || stdin_failed {
+        Some(1)
+    } else {
+        match output.exit {
+            ProcessExit::Code(code) => Some(code),
+            ProcessExit::Signal(_) | ProcessExit::Unknown => None,
+        }
+    };
+
+    HarnessExit {
+        exit_code,
+        error,
+        interrupted: output.interrupted,
+    }
 }
 
 fn retention_policy(request: &ExecutionRequest) -> WorkspaceRetention {
@@ -566,5 +593,108 @@ impl Utf8StreamDecoder {
         let decoded = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
         decoded
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness_exit;
+    use crate::execution_protocol::ExecutionRequest;
+    use crate::process::{ProcessExit, ProcessOutput};
+
+    fn request() -> ExecutionRequest {
+        serde_json::from_str(include_str!("../tests/fixtures/execution-request-v1.json"))
+            .expect("valid execution request fixture")
+    }
+
+    fn output(
+        exit: ProcessExit,
+        timed_out: bool,
+        cancelled: bool,
+        stdin_error: Option<String>,
+    ) -> ProcessOutput {
+        ProcessOutput {
+            exit,
+            timed_out,
+            cancelled,
+            interrupted: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdin_error,
+        }
+    }
+
+    #[test]
+    fn stdin_write_failure_is_bounded_redacted_and_forces_failure() {
+        let mut request = request();
+        request.assignment.run_key = Some("fixture-secret".to_owned());
+        let raw_error = format!("Broken pipe for fixture-secret\n{}", "x".repeat(2_000));
+
+        let exit = harness_exit(
+            &request,
+            &output(ProcessExit::Code(0), false, false, Some(raw_error)),
+            None,
+            1,
+        );
+
+        assert_eq!(exit.exit_code, Some(1));
+        let error = exit.error.expect("stdin delivery diagnostic");
+        assert!(error.starts_with("harness stdin write failed:"));
+        assert!(error.contains("***"));
+        assert!(!error.contains("fixture-secret"));
+        assert!(!error.contains('\n'));
+        assert!(error.chars().count() <= crate::diagnostic::DIAGNOSTIC_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn timeout_takes_precedence_over_stdin_write_failure() {
+        let exit = harness_exit(
+            &request(),
+            &output(
+                ProcessExit::Signal(9),
+                true,
+                false,
+                Some("Broken pipe".to_owned()),
+            ),
+            None,
+            3,
+        );
+
+        assert_eq!(exit.exit_code, Some(1));
+        assert_eq!(
+            exit.error.as_deref(),
+            Some("harness exceeded the 3-minute assignment timeout")
+        );
+    }
+
+    #[test]
+    fn cancellation_does_not_report_a_concurrent_stdin_write_failure() {
+        let exit = harness_exit(
+            &request(),
+            &output(
+                ProcessExit::Signal(15),
+                false,
+                true,
+                Some("Broken pipe".to_owned()),
+            ),
+            None,
+            3,
+        );
+
+        assert_eq!(exit.exit_code, None);
+        assert_eq!(exit.error, None);
+    }
+
+    #[test]
+    fn process_without_stdin_keeps_its_success_status() {
+        let exit = harness_exit(
+            &request(),
+            &output(ProcessExit::Code(0), false, false, None),
+            None,
+            3,
+        );
+
+        assert_eq!(exit.exit_code, Some(0));
+        assert_eq!(exit.error, None);
     }
 }
