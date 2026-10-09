@@ -15,7 +15,7 @@ use crate::execution_protocol::{
     ExecutionEvent, ExecutionEventKind, ExecutionRequest, LogStream, ProtocolError, TerminalResult,
     TerminalStatus, render_event_jsonl,
 };
-use crate::executor::harness::{HarnessExit, adapter_for};
+use crate::executor::harness::{HarnessEventParser, HarnessExit, adapter_for};
 use crate::executor::workspace::{MaterializedWorkspace, WorkspaceError};
 use crate::process::{
     PROCESS_TREE_TERMINATION_GRACE, ProcessExit, ProcessOutput, ProcessStream, SupervisedProcess,
@@ -329,6 +329,15 @@ pub fn execute_request(
                                     }
 
                                     if output_status.interrupted {
+                                        let exit = harness_exit(
+                                            request,
+                                            &output_status,
+                                            streamed_error,
+                                            request.assignment.timeout_minutes,
+                                        );
+                                        if let Some(event) = parser.exit_diagnostic(&exit) {
+                                            let _ = write_event(request, output, &event);
+                                        }
                                         if workspace.cleanup().is_err() {
                                             let _ = writeln!(
                                                 diagnostics,
@@ -344,12 +353,12 @@ pub fn execute_request(
                                         streamed_error,
                                         request.assignment.timeout_minutes,
                                     );
-                                    let terminal = parser.terminal_result(exit);
-                                    return emit_terminal(
+                                    return emit_parser_terminal(
                                         request,
                                         output,
                                         diagnostics,
-                                        terminal,
+                                        parser.as_mut(),
+                                        exit,
                                         Some(&workspace),
                                         &retention,
                                     );
@@ -539,6 +548,28 @@ fn emit_terminal(
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn emit_parser_terminal(
+    request: &ExecutionRequest,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+    parser: &mut dyn HarnessEventParser,
+    exit: HarnessExit,
+    workspace: Option<&MaterializedWorkspace>,
+    retention: &WorkspaceRetention,
+) -> ExitCode {
+    if let Some(event) = parser.exit_diagnostic(&exit)
+        && let Err(error) = write_event(request, output, &event)
+    {
+        let _ = writeln!(
+            diagnostics,
+            "executor could not write its process exit diagnostic: {error}"
+        );
+        return ExitCode::FAILURE;
+    }
+    let terminal = parser.terminal_result(exit);
+    emit_terminal(request, output, diagnostics, terminal, workspace, retention)
 }
 
 fn write_event(

@@ -17,6 +17,9 @@ use serde_json::Value;
 const STDERR_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
 const AGY_ERROR_RECORD_LIMIT: usize = STDERR_DIAGNOSTIC_LIMIT;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_RESPONSE_BUFFER_CHARS: usize = 32 * 1024;
+const STREAM_INTERRUPTED_ERROR: &str =
+    "The stream was interrupted. Please continue the task you were working on.";
 
 /// Dedicated adapter for Google's Antigravity CLI.
 #[derive(Clone, Copy, Debug, Default)]
@@ -63,7 +66,11 @@ struct AntigravityEventParser {
     usage: Option<ExecutionUsage>,
     malformed: bool,
     response_streamed: bool,
+    response_buffer: String,
     response_redactor: StreamingSecretRedactor,
+    next_step_order: u64,
+    interruption_step: Option<u64>,
+    recovery_step: Option<u64>,
     stderr_pending: String,
     stderr_diagnostic: String,
     stderr_record_pending: String,
@@ -171,6 +178,8 @@ impl AntigravityEventParser {
                 if let Some(id) = step.get("conversation_id").and_then(Value::as_str) {
                     self.record_session(id, &mut events);
                 }
+                let order = self.step_order(step);
+                self.observe_interruption_and_recovery(step, order);
                 match step.get("step_type").and_then(Value::as_str) {
                     Some("agent_response") => {
                         if let Some(delta) = step.get("text_delta").and_then(Value::as_str)
@@ -178,24 +187,18 @@ impl AntigravityEventParser {
                         {
                             self.response_streamed = true;
                             let safe_delta = self.response_redactor.push(delta);
-                            events.extend(log_text(LogStream::Stdout, &safe_delta));
+                            events.extend(self.append_response(&safe_delta, false));
                         }
                     }
                     Some("tool") => {
+                        events.extend(self.flush_response_boundary());
                         let name = step
                             .get("tool_name")
                             .and_then(Value::as_str)
                             .or_else(|| step.pointer("/tool_info/name").and_then(Value::as_str));
                         if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
-                            let name = redact_complete(name, &self.secret_patterns);
                             let state = step.get("state").and_then(Value::as_str);
-                            let message = state.map_or_else(
-                                || format!("[tool] {}", clip(&name, 160)),
-                                |state| {
-                                    let state = redact_complete(state, &self.secret_patterns);
-                                    format!("[tool] {} ({})", clip(&name, 160), clip(&state, 32))
-                                },
-                            );
+                            let message = summarize_tool(step, name, state, &self.secret_patterns);
                             events.push(log_event(LogStream::Stdout, message));
                         }
                     }
@@ -225,13 +228,17 @@ impl AntigravityEventParser {
                     .filter(|error| !error.trim().is_empty())
                     .map(|error| clip(&redact_complete(error, &self.secret_patterns), 2_000));
                 let denied_actions = result.get("denied_actions").is_some_and(is_nonempty_value);
+                events.extend(self.flush_response_boundary());
                 if let Some(usage) = result.get("usage").and_then(parse_usage) {
                     events.push(ExecutionEvent::new(ExecutionEventKind::Usage {
                         usage: usage.clone(),
                     }));
                     self.usage = Some(usage);
                 }
-                if let Some(error) = error.as_deref() {
+                if let Some(error) = error
+                    .as_deref()
+                    .filter(|error| !(status == "ERROR" && is_stream_interruption(error)))
+                {
                     events.push(ExecutionEvent::new(ExecutionEventKind::ProviderError {
                         provider: "antigravity".to_owned(),
                         code: None,
@@ -244,6 +251,15 @@ impl AntigravityEventParser {
                     let response = redact_complete(response, &self.secret_patterns);
                     events.extend(log_text(LogStream::Stdout, &response));
                 }
+                events.push(log_event(
+                    LogStream::System,
+                    result_diagnostic(
+                        &status,
+                        denied_actions,
+                        error.as_deref(),
+                        &self.secret_patterns,
+                    ),
+                ));
                 self.terminal = Some(AntigravityTerminal {
                     status,
                     error,
@@ -269,10 +285,92 @@ impl AntigravityEventParser {
 
     fn malformed_event(&mut self) -> Vec<ExecutionEvent> {
         self.malformed = true;
-        vec![log_event(
+        let mut events = self.flush_response_boundary();
+        events.push(log_event(
             LogStream::System,
             "Antigravity emitted malformed stream JSON".to_owned(),
-        )]
+        ));
+        events
+    }
+
+    fn step_order(&mut self, step: &Value) -> u64 {
+        if let Some(index) = step.get("step_index").and_then(Value::as_u64) {
+            self.next_step_order = self.next_step_order.max(index.saturating_add(1));
+            index
+        } else {
+            let order = self.next_step_order;
+            self.next_step_order = self.next_step_order.saturating_add(1);
+            order
+        }
+    }
+
+    fn observe_interruption_and_recovery(&mut self, step: &Value, order: u64) {
+        if step_error_message(step).is_some_and(is_stream_interruption) {
+            self.interruption_step = Some(order);
+        }
+        let later_than_interruption = self
+            .interruption_step
+            .is_some_and(|interruption| order > interruption);
+        if !later_than_interruption || step.get("state").and_then(Value::as_str) != Some("DONE") {
+            return;
+        }
+        let step_succeeded = step_error_message(step).is_none()
+            && step
+                .pointer("/tool_info/error")
+                .is_none_or(|error| !is_nonempty_value(error));
+        let completed_tool =
+            step.get("step_type").and_then(Value::as_str) == Some("tool") && step_succeeded;
+        let completed_response = step.get("step_type").and_then(Value::as_str)
+            == Some("agent_response")
+            && step_succeeded
+            && step
+                .get("text_delta")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+        if completed_tool || completed_response {
+            self.recovery_step = Some(
+                self.recovery_step
+                    .map_or(order, |previous| previous.max(order)),
+            );
+        }
+    }
+
+    fn append_response(&mut self, text: &str, flush_all: bool) -> Vec<ExecutionEvent> {
+        self.response_buffer.push_str(text);
+        let mut events = Vec::new();
+        loop {
+            if flush_all {
+                if self.response_buffer.is_empty() {
+                    break;
+                }
+                let ready = std::mem::take(&mut self.response_buffer);
+                events.extend(log_text(LogStream::Stdout, &ready));
+                break;
+            }
+            if let Some(newline) = self.response_buffer.find('\n') {
+                let ready = self.response_buffer.drain(..=newline).collect::<String>();
+                events.extend(log_text(LogStream::Stdout, &ready));
+                continue;
+            }
+            let count = self.response_buffer.chars().count();
+            if count >= MAX_RESPONSE_BUFFER_CHARS {
+                let byte_end = self
+                    .response_buffer
+                    .char_indices()
+                    .nth(MAX_RESPONSE_BUFFER_CHARS)
+                    .map_or(self.response_buffer.len(), |(index, _)| index);
+                let ready = self.response_buffer.drain(..byte_end).collect::<String>();
+                events.extend(log_text(LogStream::Stdout, &ready));
+                continue;
+            }
+            break;
+        }
+        events
+    }
+
+    fn flush_response_boundary(&mut self) -> Vec<ExecutionEvent> {
+        let safe_tail = self.response_redactor.finish();
+        self.append_response(&safe_tail, true)
     }
 
     fn take_safe_stderr_prefix(&mut self, chunk: &str, finish: bool) -> String {
@@ -389,8 +487,7 @@ impl HarnessEventParser for AntigravityEventParser {
             .into_iter()
             .flat_map(|event| self.translate(event))
             .collect::<Vec<_>>();
-        let response_tail = self.response_redactor.finish();
-        events.extend(log_text(LogStream::Stdout, &response_tail));
+        events.extend(self.flush_response_boundary());
         events
     }
 
@@ -410,6 +507,24 @@ impl HarnessEventParser for AntigravityEventParser {
         events
     }
 
+    fn exit_diagnostic(&self, exit: &HarnessExit) -> Option<ExecutionEvent> {
+        let outcome = exit
+            .exit_code
+            .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+        let mut message = format!("Antigravity process exited: code={outcome}");
+        if exit.interrupted {
+            message.push_str(" interrupted=true");
+        }
+        if let Some(error) = exit.error.as_deref() {
+            let safe = safe_one_line(error, &self.secret_patterns, 1_000);
+            if !safe.is_empty() {
+                message.push_str(" error=");
+                message.push_str(&format!("{safe:?}"));
+            }
+        }
+        Some(log_event(LogStream::System, clip(&message, 1_200)))
+    }
+
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent {
         let stderr_tail = self.take_safe_stderr_prefix("", true);
         self.retain_stderr(&stderr_tail);
@@ -418,15 +533,35 @@ impl HarnessEventParser for AntigravityEventParser {
         let provider_interrupted = terminal
             .as_ref()
             .is_some_and(|result| matches!(result.status.as_str(), "CANCELED" | "INTERRUPTED"));
-        let interrupted = exit.interrupted || provider_interrupted;
+        let terminal_stream_interruption = terminal.as_ref().is_some_and(|result| {
+            result.status == "ERROR" && result.error.as_deref().is_some_and(is_stream_interruption)
+        });
+        let recovered_stream_interruption = terminal_stream_interruption
+            && self.interruption_step.is_some_and(|interruption| {
+                self.recovery_step
+                    .is_some_and(|recovery| recovery > interruption)
+            })
+            && exit.exit_code == Some(0)
+            && exit.error.is_none()
+            && !exit.interrupted
+            && !self.malformed
+            && self.provider_error.is_none()
+            && terminal
+                .as_ref()
+                .is_some_and(|result| !result.denied_actions);
+        let interrupted = exit.interrupted
+            || provider_interrupted
+            || (terminal_stream_interruption && !recovered_stream_interruption);
         let success = !interrupted
             && !self.malformed
             && self.provider_error.is_none()
             && exit.exit_code == Some(0)
             && exit.error.is_none()
-            && terminal
-                .as_ref()
-                .is_some_and(|result| result.status == "SUCCESS" && !result.denied_actions);
+            && terminal.as_ref().is_some_and(|result| {
+                ((result.status == "SUCCESS" && result.error.is_none())
+                    || recovered_stream_interruption)
+                    && !result.denied_actions
+            });
         let rate_limit = (!interrupted).then(|| self.rate_limit.clone()).flatten();
         let status = if rate_limit.is_some() {
             TerminalStatus::RateLimited
@@ -446,7 +581,11 @@ impl HarnessEventParser for AntigravityEventParser {
             Some(message)
         } else {
             let base = if interrupted {
-                Some("Antigravity execution was interrupted".to_owned())
+                terminal
+                    .as_ref()
+                    .filter(|result| terminal_stream_interruption && result.error.is_some())
+                    .and_then(|result| result.error.clone())
+                    .or_else(|| Some("Antigravity execution was interrupted".to_owned()))
             } else if self.malformed {
                 Some("Antigravity emitted malformed stream JSON".to_owned())
             } else if terminal.is_none() {
@@ -460,7 +599,7 @@ impl HarnessEventParser for AntigravityEventParser {
                 Some("Antigravity reported denied actions".to_owned())
             } else if terminal
                 .as_ref()
-                .is_some_and(|result| result.status != "SUCCESS")
+                .is_some_and(|result| result.status != "SUCCESS" || result.error.is_some())
             {
                 terminal
                     .as_ref()
@@ -493,10 +632,11 @@ impl HarnessEventParser for AntigravityEventParser {
                 status,
                 exit_code: if success {
                     Some(0)
-                } else if interrupted {
+                } else if exit.interrupted {
                     None
                 } else {
-                    exit.exit_code.filter(|code| *code != 0)
+                    exit.exit_code
+                        .filter(|code| *code != 0 || terminal_stream_interruption)
                 },
                 error,
                 provider_session_id: self.conversation_id.clone(),
@@ -699,6 +839,122 @@ fn log_text(stream: LogStream, text: &str) -> Vec<ExecutionEvent> {
         .collect()
 }
 
+fn step_error_message(step: &Value) -> Option<&str> {
+    step.get("error")
+        .and_then(Value::as_str)
+        .or_else(|| step.pointer("/error/message").and_then(Value::as_str))
+        .or_else(|| {
+            step.pointer("/tool_info/error/message")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            (step.get("state").and_then(Value::as_str) == Some("ERROR"))
+                .then(|| step.get("text_delta").and_then(Value::as_str))
+                .flatten()
+        })
+}
+
+fn is_stream_interruption(message: &str) -> bool {
+    message.trim() == STREAM_INTERRUPTED_ERROR
+}
+
+fn result_diagnostic(
+    status: &str,
+    denied_actions: bool,
+    error: Option<&str>,
+    secrets: &[String],
+) -> String {
+    let status = safe_one_line(status, secrets, 80);
+    let mut diagnostic = format!(
+        "Antigravity result: status={} denied_actions={denied_actions}",
+        if status.is_empty() {
+            "<missing>"
+        } else {
+            &status
+        }
+    );
+    if let Some(error) = error {
+        let error = safe_one_line(error, secrets, 1_000);
+        if !error.is_empty() {
+            diagnostic.push_str(" error=");
+            diagnostic.push_str(&format!("{error:?}"));
+        }
+    }
+    clip(&diagnostic, 1_200)
+}
+
+fn summarize_tool(step: &Value, name: &str, state: Option<&str>, secrets: &[String]) -> String {
+    let name = safe_one_line(name, secrets, 160);
+    let state = state.map(|state| safe_one_line(state, secrets, 32));
+    let parameters = step.pointer("/tool_info/parameters");
+    let parameter = |keys: &[&str]| -> Option<&str> {
+        keys.iter().find_map(|key| {
+            parameters
+                .and_then(|parameters| parameters.get(*key))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+    };
+
+    let summary = match name.as_str() {
+        "run_command" => {
+            if state.as_deref() == Some("DONE") {
+                Some("completed".to_owned())
+            } else {
+                parameter(&[
+                    "CommandLine",
+                    "command_line",
+                    "commandLine",
+                    "command",
+                    "cmd",
+                ])
+                .map(|command| safe_one_line(command, secrets, 512))
+            }
+        }
+        "view_file" => {
+            if state.as_deref() == Some("DONE") {
+                Some("completed".to_owned())
+            } else {
+                parameter(&["FilePath", "file_path", "filePath", "path", "Path"])
+                    .map(|path| safe_one_line(path, secrets, 512))
+            }
+        }
+        _ => None,
+    }
+    .filter(|summary| !summary.is_empty());
+
+    if let Some(summary) = summary {
+        return format!("[tool] {name}: {summary}");
+    }
+    state.map_or_else(
+        || format!("[tool] {name}"),
+        |state| {
+            format!(
+                "[tool] {name} ({})",
+                if state.is_empty() { "unknown" } else { &state }
+            )
+        },
+    )
+}
+
+fn safe_one_line(value: &str, secrets: &[String], max_chars: usize) -> String {
+    let redacted = redact_complete(value, secrets);
+    let normalized = redacted
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    clip(&normalized, max_chars)
+}
+
 fn log_event(stream: LogStream, message: String) -> ExecutionEvent {
     ExecutionEvent::new(ExecutionEventKind::Log { stream, message })
 }
@@ -835,7 +1091,7 @@ fn redact_complete(text: &str, patterns: &[String]) -> String {
 mod tests {
     use super::{
         AGY_ERROR_RECORD_LIMIT, AntigravityEventParser, HarnessEventParser, HarnessExit,
-        STDERR_DIAGNOSTIC_LIMIT,
+        STDERR_DIAGNOSTIC_LIMIT, STREAM_INTERRUPTED_ERROR,
     };
     use crate::execution_protocol::{ExecutionEventKind, LogStream, TerminalStatus};
 
@@ -921,7 +1177,10 @@ mod tests {
         let logs = events
             .iter()
             .filter_map(|event| match &event.kind {
-                ExecutionEventKind::Log { message, .. } => Some(message.as_str()),
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stdout,
+                    message,
+                } => Some(message.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -934,6 +1193,94 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.error.is_none());
         assert!(result.provider_session_id.is_none());
+    }
+
+    #[test]
+    fn coalesces_fragmented_response_deltas_into_one_log_record() {
+        let mut parser = AntigravityEventParser::default();
+        let events = feed(
+            &mut parser,
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"previou\"}}\n{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"s report\"}}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\"}}\n",
+        );
+        let logs = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stdout,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(logs, ["previous report"]);
+    }
+
+    #[test]
+    fn renders_redacted_bounded_known_tool_summaries_and_safe_fallbacks() {
+        let secret = "TOOL_SUMMARY_SECRET";
+        let mut parser = AntigravityEventParser::with_secrets(vec![secret.to_owned()]);
+        let stream = format!(
+            "{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":1,\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"state\":\"ACTIVE\",\"tool_info\":{{\"parameters\":{{\"CommandLine\":\"cargo\\n test --workspace {secret}\",\"unrelated_secret\":\"{secret}\"}}}}}}}}\n{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":1,\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"state\":\"DONE\",\"tool_info\":{{\"parameters\":{{\"CommandLine\":\"cargo test --workspace {secret}\"}}}}}}}}\n{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":2,\"step_type\":\"tool\",\"tool_name\":\"view_file\",\"state\":\"ACTIVE\",\"tool_info\":{{\"parameters\":{{\"FilePath\":\"src/executor/antigravity.rs\"}}}}}}}}\n{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":3,\"step_type\":\"tool\",\"tool_name\":\"future_tool\",\"state\":\"ACTIVE\",\"tool_info\":{{\"parameters\":{{\"secret\":\"{secret}\"}}}}}}}}\n{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\"}}}}\n"
+        );
+        let events = feed(&mut parser, &stream);
+        let logs = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stdout,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logs,
+            [
+                "[tool] run_command: cargo test --workspace ***",
+                "[tool] run_command: completed",
+                "[tool] view_file: src/executor/antigravity.rs",
+                "[tool] future_tool (ACTIVE)",
+            ]
+        );
+        let rendered = serde_json::to_string(&events).expect("serialize safe tool summaries");
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("unrelated_secret"));
+    }
+
+    #[test]
+    fn logs_structured_result_and_eventual_process_exit_diagnostics() {
+        let secret = "RESULT_DIAGNOSTIC_SECRET";
+        let mut parser = AntigravityEventParser::with_secrets(vec![secret.to_owned()]);
+        let events = feed(
+            &mut parser,
+            &format!(
+                "{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"denied_actions\":false,\"error\":\"bad {secret}\\nvalue\"}}}}\n"
+            ),
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::Log {
+                stream: LogStream::System,
+                message,
+            } if message.contains("status=ERROR")
+                && message.contains("denied_actions=false")
+                && message.contains("bad *** value")
+        )));
+        let exit = HarnessExit {
+            exit_code: Some(0),
+            error: Some(format!("safe diagnostic {secret}")),
+            interrupted: false,
+        };
+        let diagnostic = parser.exit_diagnostic(&exit).expect("exit diagnostic");
+        assert!(matches!(
+            diagnostic.kind,
+            ExecutionEventKind::Log {
+                stream: LogStream::System,
+                ref message,
+            } if message.contains("code=0") && message.contains("safe diagnostic ***")
+        ));
+        assert!(!serde_json::to_string(&events).unwrap().contains(secret));
+        assert!(!serde_json::to_string(&diagnostic).unwrap().contains(secret));
     }
 
     #[test]
@@ -1110,6 +1457,134 @@ mod tests {
         assert!(
             matches!(event.kind, ExecutionEventKind::Result { result } if result.status == TerminalStatus::Failed && result.interrupted)
         );
+    }
+
+    #[test]
+    fn unrecovered_known_stream_interruption_fails_as_interrupted() {
+        let mut parser = AntigravityEventParser::default();
+        let stream = format!(
+            "{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":5,\"state\":\"ERROR\",\"step_type\":\"agent_response\",\"error\":{}}}}}\n{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"error\":{}}}}}\n",
+            serde_json::to_string(STREAM_INTERRUPTED_ERROR).unwrap(),
+            serde_json::to_string(STREAM_INTERRUPTED_ERROR).unwrap(),
+        );
+        feed(&mut parser, &stream);
+        let event = terminal(&mut parser, 0);
+        assert!(matches!(
+            event.kind,
+            ExecutionEventKind::Result { result }
+                if result.status == TerminalStatus::Failed
+                    && result.interrupted
+                    && result.error.as_deref() == Some(STREAM_INTERRUPTED_ERROR)
+        ));
+    }
+
+    #[test]
+    fn later_completed_work_reconciles_only_the_known_stream_interruption() {
+        for activity in [
+            serde_json::json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_index": 7,
+                    "state": "DONE",
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": { "parameters": { "CommandLine": "cargo test" } }
+                }
+            }),
+            serde_json::json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_index": 7,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": "The work is complete."
+                }
+            }),
+        ] {
+            let records = [
+                serde_json::json!({
+                    "event": "step_update",
+                    "step_update": {
+                        "step_index": 5,
+                        "state": "ERROR",
+                        "step_type": "agent_response",
+                        "error": STREAM_INTERRUPTED_ERROR
+                    }
+                }),
+                activity,
+                serde_json::json!({
+                    "event": "result",
+                    "result": { "status": "ERROR", "error": STREAM_INTERRUPTED_ERROR }
+                }),
+            ];
+            let stream = records
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut parser = AntigravityEventParser::default();
+            feed(&mut parser, &format!("{stream}\n"));
+            let event = terminal(&mut parser, 0);
+            assert!(matches!(
+                event.kind,
+                ExecutionEventKind::Result { result }
+                    if result.status == TerminalStatus::Completed
+                        && !result.interrupted
+                        && result.exit_code == Some(0)
+                        && result.error.is_none()
+            ));
+        }
+    }
+
+    #[test]
+    fn other_terminal_errors_and_nonzero_exit_are_never_reconciled() {
+        let mut parser = AntigravityEventParser::default();
+        feed(
+            &mut parser,
+            "{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"model failed\"}}\n",
+        );
+        assert!(matches!(
+            terminal(&mut parser, 0).kind,
+            ExecutionEventKind::Result { result }
+                if result.status == TerminalStatus::Failed
+                    && !result.interrupted
+                    && result.error.as_deref() == Some("model failed")
+        ));
+
+        let marker = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "step_index": 5,
+                "state": "ERROR",
+                "step_type": "agent_response",
+                "error": STREAM_INTERRUPTED_ERROR
+            }
+        });
+        let recovery = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "step_index": 7,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "run_command"
+            }
+        });
+        let result = serde_json::json!({
+            "event": "result",
+            "result": { "status": "ERROR", "error": STREAM_INTERRUPTED_ERROR }
+        });
+        let stream = [marker, recovery, result]
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut parser = AntigravityEventParser::default();
+        feed(&mut parser, &format!("{stream}\n"));
+        assert!(matches!(
+            terminal(&mut parser, 1).kind,
+            ExecutionEventKind::Result { result }
+                if result.status == TerminalStatus::Failed && result.exit_code == Some(1)
+        ));
     }
 
     #[test]
