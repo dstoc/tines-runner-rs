@@ -220,6 +220,7 @@ impl HarnessEventParser for CustomEventParser {
                 exit_code: exit.exit_code,
                 error,
                 provider_session_id: None,
+                observed_model: None,
                 usage: None,
                 pricing_evidence: None,
                 interrupted: exit.interrupted,

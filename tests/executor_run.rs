@@ -343,7 +343,7 @@ fn antigravity_launches_with_exact_model_stream_prompt_and_eof() {
 printf '%s\n' "$@" > "$AGY_CONTROL/args"
 pwd > "$AGY_CONTROL/cwd"
 cat > "$AGY_CONTROL/input"
-printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{}}' '{"event":"step_update","step_update":{"conversation_id":"agy-session-42","step_type":"agent_response","text_delta":"Antigravity answer"}}' '{"event":"result","result":{"conversation_id":"agy-session-42","status":"SUCCESS","response":"Antigravity answer","usage":{"input_tokens":12,"output_tokens":4,"cache_read_tokens":3,"thinking_tokens":99}}}'
+printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{"model":"gemini-3.8-flash-high"}}' '{"event":"step_update","step_update":{"conversation_id":"agy-session-42","step_type":"agent_response","text_delta":"Antigravity answer"}}' '{"event":"result","result":{"conversation_id":"agy-session-42","status":"SUCCESS","response":"Antigravity answer","usage":{"input_tokens":12,"output_tokens":4,"cache_read_tokens":3,"thinking_tokens":99}}}'
 "##;
 
     let output = run_antigravity_executor(&directory.0, &request, script);
@@ -355,6 +355,7 @@ printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{}}' '{
     );
     assert_eq!(result(&output)["status"], "completed");
     assert_eq!(result(&output)["provider_session_id"], "agy-session-42");
+    assert_eq!(result(&output)["observed_model"], "gemini-3.8-flash-high");
     assert_eq!(result(&output)["usage"]["input_tokens"], 12);
     assert_eq!(result(&output)["usage"]["output_tokens"], 4);
     assert_eq!(result(&output)["usage"]["cache_read_tokens"], 3);

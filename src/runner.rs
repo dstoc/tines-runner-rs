@@ -157,6 +157,7 @@ impl RunnerConnection {
             &FinishRunRequest {
                 status: FinishStatus::Failed,
                 error: Some(error.to_owned()),
+                effort_application: None,
                 provider_session_id: None,
                 usage: None,
                 pricing_evidence: None,
@@ -194,6 +195,7 @@ impl RunnerConnection {
             &FinishRunRequest {
                 status,
                 error: error.map(str::to_owned),
+                effort_application: None,
                 provider_session_id: None,
                 usage: None,
                 pricing_evidence: None,

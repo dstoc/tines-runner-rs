@@ -8,7 +8,8 @@ use crate::execution_protocol::{
     ExecutionRateLimit, ExecutionUsage, LogStream, ProtocolError, TerminalResult, TerminalStatus,
 };
 use crate::protocol::{
-    CodexPricingEvidenceV1, FinishJudgment, FinishRunRequest, FinishStatus, RunUsage,
+    CodexPricingEvidenceV1, EffortApplication, FinishJudgment, FinishRunRequest, FinishStatus,
+    RunUsage,
 };
 
 /// Incremental executor protocol state and the latest reportable run metadata.
@@ -232,6 +233,9 @@ impl ExecutorRunReport {
                 if let Some(session) = &mut result.provider_session_id {
                     self.redact_string(session);
                 }
+                if let Some(model) = &mut result.observed_model {
+                    self.redact_string(model);
+                }
                 if let Some(rate_limit) = &mut result.rate_limit
                     && let Some(message) = &mut rate_limit.message
                 {
@@ -339,6 +343,11 @@ impl ExecutorRunReport {
         FinishRunRequest {
             status,
             error,
+            effort_application: result
+                .and_then(|result| result.observed_model.as_ref())
+                .map(|observed_model| EffortApplication {
+                    observed_model: observed_model.clone(),
+                }),
             provider_session_id: result
                 .and_then(|result| result.provider_session_id.clone())
                 .or_else(|| self.latest_session.clone()),
@@ -533,6 +542,51 @@ mod tests {
         assert_eq!(
             pricing.request_context.as_ref().unwrap()["reason"],
             "not_applicable"
+        );
+    }
+
+    #[test]
+    fn maps_an_observed_provider_model_to_model_only_finish_evidence() {
+        let mut stream = ExecutorEventStream::new(&request());
+        stream
+            .push(&line(json!({
+                "version": 1,
+                "type": "result",
+                "status": "completed",
+                "exit_code": 0,
+                "interrupted": false,
+                "observed_model": "gemini-3.8-flash-high"
+            })))
+            .expect("parse provider result");
+        stream.finish().expect("terminal result");
+
+        let finish = stream.finish_request(None, "", false);
+        assert_eq!(finish.status, FinishStatus::Completed);
+        assert_eq!(
+            serde_json::to_value(finish).expect("serialize finish request")["effort_application"],
+            json!({"observed_model": "gemini-3.8-flash-high"})
+        );
+    }
+
+    #[test]
+    fn redacts_observed_model_before_finish_mapping() {
+        let mut request = request();
+        request.assignment.run_key = Some("model-secret".to_owned());
+        let mut stream = ExecutorEventStream::new(&request);
+        stream
+            .push(&line(json!({
+                "version": 1,
+                "type": "result",
+                "status": "completed",
+                "exit_code": 0,
+                "interrupted": false,
+                "observed_model": "model-secret"
+            })))
+            .expect("parse provider result");
+        let finish = stream.finish_request(None, "", false);
+        assert_eq!(
+            finish.effort_application.unwrap().observed_model,
+            "[REDACTED]"
         );
     }
 

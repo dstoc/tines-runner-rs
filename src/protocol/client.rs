@@ -1586,6 +1586,7 @@ mod tests {
                 &FinishRunRequest {
                     status: FinishStatus::Completed,
                     error: None,
+                    effort_application: None,
                     provider_session_id: None,
                     usage: None,
                     pricing_evidence: None,

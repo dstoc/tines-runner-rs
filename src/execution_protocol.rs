@@ -413,6 +413,9 @@ pub struct TerminalResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
+    /// Model selected by the provider at runtime, when the harness reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ExecutionUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

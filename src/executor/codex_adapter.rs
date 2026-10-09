@@ -244,6 +244,7 @@ impl HarnessEventParser for CodexEventParser {
                 provider_session_id: (self.thread_ids.len() == 1)
                     .then(|| self.thread_ids.iter().next().cloned())
                     .flatten(),
+                observed_model: None,
                 usage: self.usage.clone(),
                 pricing_evidence: Some(ExecutionPricingEvidence {
                     provider: "codex".to_owned(),

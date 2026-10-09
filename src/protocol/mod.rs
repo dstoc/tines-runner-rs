@@ -213,6 +213,12 @@ pub struct RunUsage {
     pub cache_write_tokens: Option<u64>,
 }
 
+/// Provider model evidence accepted through the existing effort-evidence field.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffortApplication {
+    pub observed_model: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexRawUsageV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,18 +269,20 @@ pub struct CodexPricingEvidenceV1 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinishRunRequest {
     pub status: FinishStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_application: Option<EffortApplication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RunUsage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_evidence: Option<CodexPricingEvidenceV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judgment: Option<FinishJudgment>,
     /// Provider reset instant as epoch milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<u64>,
 }
 

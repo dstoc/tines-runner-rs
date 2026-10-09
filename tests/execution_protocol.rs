@@ -382,6 +382,7 @@ fn request_debug_and_rendered_events_redact_the_run_key_and_secret_environment_v
             exit_code: Some(1),
             error: Some("fixture-run-key".into()),
             provider_session_id: None,
+            observed_model: None,
             usage: None,
             pricing_evidence: Some(ExecutionPricingEvidence {
                 provider: "example-provider".into(),
@@ -469,6 +470,7 @@ fn rendered_events_redact_rust_escaped_secret_values() {
                 exit_code: Some(1),
                 error: Some(format!("git clone failed for directory {rust_escaped}")),
                 provider_session_id: None,
+                observed_model: None,
                 usage: None,
                 pricing_evidence: None,
                 interrupted: false,
@@ -496,6 +498,7 @@ fn terminal_result_invariants_reject_success_with_failure_details() {
         exit_code: Some(0),
         error: Some("unexpected error".into()),
         provider_session_id: None,
+        observed_model: None,
         usage: Some(ExecutionUsage {
             output_tokens: Some(4),
             ..ExecutionUsage::default()
@@ -516,6 +519,7 @@ fn interrupted_terminal_result_round_trips() {
             exit_code: None,
             error: None,
             provider_session_id: Some("session-interrupted".into()),
+            observed_model: None,
             usage: None,
             pricing_evidence: None,
             interrupted: true,

@@ -407,6 +407,7 @@ pub fn report_preparation_failure(
     let request = FinishRunRequest {
         status: FinishStatus::Failed,
         error: Some(error.to_owned()),
+        effort_application: None,
         provider_session_id: None,
         usage: None,
         pricing_evidence: None,

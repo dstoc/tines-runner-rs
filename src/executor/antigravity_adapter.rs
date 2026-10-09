@@ -62,6 +62,7 @@ impl HarnessAdapter for AntigravityAdapter {
 struct AntigravityEventParser {
     parser: AntigravityStreamParser,
     conversation_id: Option<String>,
+    observed_model: Option<String>,
     terminal: Option<AntigravityTerminal>,
     usage: Option<ExecutionUsage>,
     malformed: bool,
@@ -167,6 +168,18 @@ impl AntigravityEventParser {
                 let mut events = Vec::new();
                 if let Some(id) = raw.get("conversation_id").and_then(Value::as_str) {
                     self.record_session(id, &mut events);
+                }
+                if self.observed_model.is_none() {
+                    self.observed_model = raw
+                        .pointer("/init/model")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|model| {
+                            !model.is_empty()
+                                && model.encode_utf16().count() <= 100
+                                && !model.chars().any(char::is_control)
+                        })
+                        .map(str::to_owned);
                 }
                 events
             }
@@ -643,6 +656,7 @@ impl HarnessEventParser for AntigravityEventParser {
                 },
                 error,
                 provider_session_id: self.conversation_id.clone(),
+                observed_model: self.observed_model.clone(),
                 usage: self.usage.clone(),
                 pricing_evidence: None,
                 interrupted,
@@ -1156,6 +1170,55 @@ mod tests {
         assert_eq!(rendered["interrupted"], true);
         assert_eq!(rendered["error"], STREAM_INTERRUPTED_ERROR);
         assert!(rendered.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn captures_a_usable_model_from_init_without_changing_the_terminal_outcome() {
+        let mut parser = AntigravityEventParser::default();
+        feed(
+            &mut parser,
+            "{\"event\":\"init\",\"init\":{\"model\":\"gemini-3.8-flash-high\"}}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\"}}\n",
+        );
+
+        let event = terminal(&mut parser, 0);
+        let ExecutionEventKind::Result { result } = event.kind else {
+            panic!("expected result");
+        };
+        assert_eq!(result.status, TerminalStatus::Completed);
+        assert_eq!(
+            result.observed_model.as_deref(),
+            Some("gemini-3.8-flash-high")
+        );
+    }
+
+    #[test]
+    fn missing_or_unusable_init_models_are_ignored_without_failing_the_run() {
+        for init in [
+            serde_json::json!({}),
+            serde_json::json!({"model": null}),
+            serde_json::json!({"model": 3}),
+            serde_json::json!({"model": {"name": "gemini"}}),
+            serde_json::json!({"model": ""}),
+            serde_json::json!({"model": "  "}),
+            serde_json::json!({"model": "bad\nmodel"}),
+            serde_json::json!({"model": "x".repeat(101)}),
+        ] {
+            let init = serde_json::json!({"event": "init", "init": init});
+            let result = serde_json::json!({
+                "event": "result",
+                "result": {"status": "SUCCESS"}
+            });
+            let stream = format!("{init}\n{result}\n");
+            let mut parser = AntigravityEventParser::default();
+            feed(&mut parser, &stream);
+            let event = terminal(&mut parser, 0);
+            assert!(matches!(
+                event.kind,
+                ExecutionEventKind::Result { result }
+                    if result.status == TerminalStatus::Completed
+                        && result.observed_model.is_none()
+            ));
+        }
     }
 
     #[test]
