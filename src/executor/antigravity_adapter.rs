@@ -191,7 +191,7 @@ impl AntigravityEventParser {
                         }
                     }
                     Some("tool") => {
-                        events.extend(self.flush_response_boundary());
+                        events.extend(self.flush_safe_response_boundary());
                         let name = step
                             .get("tool_name")
                             .and_then(Value::as_str)
@@ -228,7 +228,7 @@ impl AntigravityEventParser {
                     .filter(|error| !error.trim().is_empty())
                     .map(|error| clip(&redact_complete(error, &self.secret_patterns), 2_000));
                 let denied_actions = result.get("denied_actions").is_some_and(is_nonempty_value);
-                events.extend(self.flush_response_boundary());
+                events.extend(self.finish_response());
                 if let Some(usage) = result.get("usage").and_then(parse_usage) {
                     events.push(ExecutionEvent::new(ExecutionEventKind::Usage {
                         usage: usage.clone(),
@@ -285,7 +285,7 @@ impl AntigravityEventParser {
 
     fn malformed_event(&mut self) -> Vec<ExecutionEvent> {
         self.malformed = true;
-        let mut events = self.flush_response_boundary();
+        let mut events = self.flush_safe_response_boundary();
         events.push(log_event(
             LogStream::System,
             "Antigravity emitted malformed stream JSON".to_owned(),
@@ -368,7 +368,11 @@ impl AntigravityEventParser {
         events
     }
 
-    fn flush_response_boundary(&mut self) -> Vec<ExecutionEvent> {
+    fn flush_safe_response_boundary(&mut self) -> Vec<ExecutionEvent> {
+        self.append_response("", true)
+    }
+
+    fn finish_response(&mut self) -> Vec<ExecutionEvent> {
         let safe_tail = self.response_redactor.finish();
         self.append_response(&safe_tail, true)
     }
@@ -487,7 +491,7 @@ impl HarnessEventParser for AntigravityEventParser {
             .into_iter()
             .flat_map(|event| self.translate(event))
             .collect::<Vec<_>>();
-        events.extend(self.flush_response_boundary());
+        events.extend(self.finish_response());
         events
     }
 
@@ -635,8 +639,7 @@ impl HarnessEventParser for AntigravityEventParser {
                 } else if exit.interrupted {
                     None
                 } else {
-                    exit.exit_code
-                        .filter(|code| *code != 0 || terminal_stream_interruption)
+                    exit.exit_code.filter(|code| *code != 0)
                 },
                 error,
                 provider_session_id: self.conversation_id.clone(),
@@ -1093,7 +1096,10 @@ mod tests {
         AGY_ERROR_RECORD_LIMIT, AntigravityEventParser, HarnessEventParser, HarnessExit,
         STDERR_DIAGNOSTIC_LIMIT, STREAM_INTERRUPTED_ERROR,
     };
-    use crate::execution_protocol::{ExecutionEventKind, LogStream, TerminalStatus};
+    use crate::execution_protocol::{
+        ExecutionEventKind, ExecutionRequest, LogStream, TerminalStatus, render_event_jsonl,
+    };
+    use serde_json::Value;
 
     fn feed(
         parser: &mut AntigravityEventParser,
@@ -1122,6 +1128,61 @@ mod tests {
         let mut events = parser.push_stderr(text);
         events.extend(parser.finish_stderr());
         events
+    }
+
+    #[test]
+    fn review_unrecovered_interruption_obeys_terminal_protocol() {
+        let mut parser = AntigravityEventParser::default();
+        let stream = serde_json::json!({"event":"result","result":{"status":"ERROR","error":STREAM_INTERRUPTED_ERROR}}).to_string();
+        feed(&mut parser, &format!("{stream}\n"));
+        let event = terminal(&mut parser, 0);
+        let ExecutionEventKind::Result { result } = &event.kind else {
+            panic!("expected result");
+        };
+        assert_eq!(result.status, TerminalStatus::Failed);
+        assert!(result.interrupted);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.error.as_deref(), Some(STREAM_INTERRUPTED_ERROR));
+        assert!(result.validate().is_ok());
+
+        let request: ExecutionRequest = serde_json::from_str(include_str!(
+            "../../tests/fixtures/execution-request-v1.json"
+        ))
+        .expect("valid execution request fixture");
+        let rendered = render_event_jsonl(&event, &request)
+            .expect("unrecovered interruption should render through protocol v1");
+        let rendered: Value = serde_json::from_str(&rendered).expect("valid rendered event");
+        assert_eq!(rendered["status"], "failed");
+        assert_eq!(rendered["interrupted"], true);
+        assert_eq!(rendered["error"], STREAM_INTERRUPTED_ERROR);
+        assert!(rendered.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn review_response_redaction_survives_tool_boundary() {
+        let mut parser = AntigravityEventParser::with_secrets(vec!["secret-value".to_owned()]);
+        let records = [
+            serde_json::json!({"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"before secret-"}}),
+            serde_json::json!({"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command","state":"ACTIVE"}}),
+            serde_json::json!({"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"value after"}}),
+        ];
+        let stream = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let events = feed(&mut parser, &format!("{stream}\n"));
+        let text = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Log {
+                    stream: LogStream::Stdout,
+                    message,
+                } if !message.starts_with("[tool]") => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "before *** after");
     }
 
     #[test]
