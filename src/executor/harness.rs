@@ -117,6 +117,10 @@ pub trait HarnessEventParser: Send {
     fn finish_stderr(&mut self) -> Vec<ExecutionEvent> {
         Vec::new()
     }
+    /// Return an optional safe diagnostic once the harness process has exited.
+    fn exit_diagnostic(&self, _exit: &HarnessExit) -> Option<ExecutionEvent> {
+        None
+    }
     fn terminal_result(&mut self, exit: HarnessExit) -> ExecutionEvent;
 }
 

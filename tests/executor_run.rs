@@ -358,6 +358,20 @@ printf '%s\n' '{"event":"init","conversation_id":"agy-session-42","init":{}}' '{
     assert_eq!(result(&output)["usage"]["input_tokens"], 12);
     assert_eq!(result(&output)["usage"]["output_tokens"], 4);
     assert_eq!(result(&output)["usage"]["cache_read_tokens"], 3);
+    assert!(output.events.iter().any(|event| {
+        event["type"] == "log"
+            && event["stream"] == "system"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Antigravity result: status=SUCCESS"))
+    }));
+    assert!(output.events.iter().any(|event| {
+        event["type"] == "log"
+            && event["stream"] == "system"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Antigravity process exited: code=0"))
+    }));
     let args = fs::read_to_string(control.join("args")).expect("captured agy arguments");
     let args = args.lines().collect::<Vec<_>>();
     assert_eq!(
