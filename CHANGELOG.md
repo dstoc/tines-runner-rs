@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/dstoc/tines-runner-rs/compare/v0.8.1...v0.8.2) (2026-10-09)
+
+
+### Bug Fixes
+
+* **antigravity:** reconcile recovered stream interruptions ([#81](https://github.com/dstoc/tines-runner-rs/issues/81)) ([83e501c](https://github.com/dstoc/tines-runner-rs/commit/83e501cf884b4f42ecc46bf6b37711f5241e9953))
+
 ## [0.8.1](https://github.com/dstoc/tines-runner-rs/compare/v0.8.0...v0.8.1) (2026-10-08)
 
 
