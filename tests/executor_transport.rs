@@ -113,6 +113,7 @@ fn request(prompt: String) -> ExecutionRequest {
             ]
         }))
         .expect("decode assignment fixture"),
+        effort_capabilities: None,
     }
 }
 

@@ -247,6 +247,9 @@ fn run_assignment_inner(
             RunnerType::Antigravity | RunnerType::Custom => None,
         };
     }
+    let verified_effort_capabilities = (runner_type == RunnerType::Codex
+        && assignment.effort.is_some())
+    .then(|| capabilities.effort_report("codex", crate::VERSION));
     if let Some(reason) = effort_rejection {
         if context.shutdown.is_requested() {
             return report_interrupted_before_execution(
@@ -269,8 +272,9 @@ fn run_assignment_inner(
         resolved.context().state(),
         &resolved.resolution().matching_overrides(),
     );
-    let prepared =
-        crate::assignment::PreparedAssignment::new(resolved).with_run_log_buffer(run_logs);
+    let prepared = crate::assignment::PreparedAssignment::new(resolved)
+        .with_run_log_buffer(run_logs)
+        .with_effort_capabilities(verified_effort_capabilities);
     let report = execution::execute_assignment_cancellable_report(
         prepared,
         connection,

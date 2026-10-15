@@ -199,7 +199,8 @@ fn run_executor(
 ) -> ExecutorExecution {
     let resolved = assignment.resolved();
     let config = &resolved.resolution().config;
-    let request = execution_request(resolved, assignment.api_url(), retention);
+    let mut request = execution_request(resolved, assignment.api_url(), retention);
+    request.effort_capabilities = assignment.effort_capabilities().cloned();
     let environment_run_key = match config.run_key_delivery {
         RunKeyDelivery::Request => None,
         RunKeyDelivery::Environment => assignment.assignment().run_key.as_deref(),

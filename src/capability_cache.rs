@@ -1,7 +1,7 @@
 //! Shared, event-driven capability reports for one runner.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::executor_capabilities::ExecutorCapabilities;
 use crate::executor_transport::{CapabilityTransportIdentity, ExecutorTransport};
@@ -13,8 +13,13 @@ struct CapabilityKey {
     harness: String,
 }
 
-type CapabilityEntry = Arc<Mutex<Option<CapabilitySnapshot>>>;
-type CapabilityEntries = Arc<Mutex<HashMap<CapabilityKey, CapabilityEntry>>>;
+#[derive(Default)]
+struct CapabilityEntry {
+    snapshot: RwLock<Option<CapabilitySnapshot>>,
+    refresh: Mutex<()>,
+}
+
+type CapabilityEntries = Arc<Mutex<HashMap<CapabilityKey, Arc<CapabilityEntry>>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilitySnapshot {
@@ -43,10 +48,25 @@ impl ExecutorCapabilityCache {
         }
 
         let entry = self.entry(transport, harness);
-        let mut snapshot = entry
+        if let Some(snapshot) = entry
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            return snapshot.clone();
+        }
+
+        let _refresh = entry
+            .refresh
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(snapshot) = snapshot.as_ref() {
+        if let Some(snapshot) = entry
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
             return snapshot.clone();
         }
 
@@ -55,7 +75,10 @@ impl ExecutorCapabilityCache {
             capabilities: discovered,
             revision: 1,
         };
-        *snapshot = Some(discovered.clone());
+        *entry
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(discovered.clone());
         discovered
     }
 
@@ -73,9 +96,15 @@ impl ExecutorCapabilityCache {
         }
 
         let entry = self.entry(transport, harness);
-        let mut snapshot = entry
+        let _refresh = entry
+            .refresh
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = entry
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         if let Some(current) = snapshot.as_ref()
             && current.revision != expected_revision
         {
@@ -89,7 +118,10 @@ impl ExecutorCapabilityCache {
             capabilities: transport.discover_capabilities_reported_for_harness(failures, harness),
             revision,
         };
-        *snapshot = Some(refreshed.clone());
+        *entry
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(refreshed.clone());
         refreshed
     }
 
@@ -101,8 +133,13 @@ impl ExecutorCapabilityCache {
         capabilities: ExecutorCapabilities,
     ) -> CapabilitySnapshot {
         let entry = self.entry(transport, harness);
-        let mut snapshot = entry
+        let _refresh = entry
+            .refresh
             .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshot = entry
+            .snapshot
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let next_revision = snapshot
             .as_ref()
@@ -115,7 +152,7 @@ impl ExecutorCapabilityCache {
         inserted
     }
 
-    fn entry(&self, transport: &ExecutorTransport, harness: &str) -> CapabilityEntry {
+    fn entry(&self, transport: &ExecutorTransport, harness: &str) -> Arc<CapabilityEntry> {
         let key = CapabilityKey {
             transport: transport.capability_cache_identity(),
             harness: harness.to_owned(),
@@ -127,7 +164,7 @@ impl ExecutorCapabilityCache {
         Arc::clone(
             entries
                 .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(None))),
+                .or_insert_with(|| Arc::new(CapabilityEntry::default())),
         )
     }
 }
@@ -141,8 +178,10 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn custom_capabilities_are_synthesized_without_an_executor_probe() {
@@ -234,6 +273,77 @@ mod tests {
         assert_eq!(fs::read(&counter).expect("read probe count").len(), 2);
         assert_eq!(snapshots[0], snapshots[1]);
         assert_eq!(snapshots[0].revision, initial.revision + 1);
+        fs::remove_dir_all(directory).expect("remove capability-cache directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_snapshot_reads_do_not_wait_for_an_open_refresh_probe() {
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-capability-refresh-read-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("create capability-cache directory");
+        let enable_block = directory.join("block-refresh");
+        let refresh_started = directory.join("refresh-started");
+        let release_refresh = directory.join("release-refresh");
+        let script = directory.join("capability-executor");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then : > '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; fi\nprintf '%s\\n' '{{\"version\":1,\"harnesses\":{{\"codex\":{{\"version\":\"codex-test\"}}}}}}'\n",
+                enable_block.display(),
+                refresh_started.display(),
+                release_refresh.display()
+            ),
+        )
+        .expect("write blocking capability executor");
+        let mut permissions = fs::metadata(&script)
+            .expect("stat fake capability executor")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make fake executor executable");
+        let transport =
+            ExecutorTransport::new(vec![script.to_string_lossy().into_owned()], &directory);
+        let cache = ExecutorCapabilityCache::default();
+        let failures = FailureReporter::default();
+        let initial = cache.get_or_discover(&transport, "codex", &failures);
+        fs::write(&enable_block, "").expect("enable refresh barrier");
+
+        let refresh_cache = cache.clone();
+        let refresh_transport = transport.clone();
+        let refresh_failures = failures.clone();
+        let initial_revision = initial.revision;
+        let refresh = thread::spawn(move || {
+            refresh_cache.refresh_if_unchanged(
+                &refresh_transport,
+                "codex",
+                initial_revision,
+                &refresh_failures,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !refresh_started.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(refresh_started.exists(), "refresh probe did not start");
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let read_cache = cache.clone();
+        let read_transport = transport.clone();
+        let read_failures = failures.clone();
+        let read = thread::spawn(move || {
+            let snapshot = read_cache.get_or_discover(&read_transport, "codex", &read_failures);
+            read_tx.send(snapshot).expect("send cached snapshot");
+        });
+        let cached = read_rx.recv_timeout(Duration::from_millis(250)).ok();
+
+        fs::write(&release_refresh, "").expect("release refresh probe");
+        let refreshed = refresh.join().expect("join refresh");
+        read.join().expect("join cached snapshot reader");
+
+        assert_eq!(cached, Some(initial.clone()));
+        assert_eq!(refreshed.revision, initial.revision + 1);
         fs::remove_dir_all(directory).expect("remove capability-cache directory");
     }
 

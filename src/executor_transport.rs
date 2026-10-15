@@ -95,6 +95,7 @@ pub fn execution_request(
             }
             assignment
         },
+        effort_capabilities: None,
     }
 }
 

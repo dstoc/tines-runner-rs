@@ -533,6 +533,62 @@ fn execute_runs_harness_and_emits_one_terminal_protocol_result() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn execute_uses_daemon_verified_effort_capabilities_without_codex_probes() {
+    let directory = TestDirectory::new();
+    let probe_log = directory.0.join("codex-probes");
+    let workspace_parent = directory.0.join("executor-workspaces");
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/execution-request-v1.json"))
+            .expect("valid execution request fixture");
+    fixture["execution"]["workspace"]["parent"] =
+        serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
+    fixture["assignment"]["effort"]["capability_digest"] = serde_json::Value::String(
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945".to_owned(),
+    );
+    fixture["assignment"]["effort"]["verification"] =
+        serde_json::Value::String("asserted".to_owned());
+    fixture["effort_capabilities"] = serde_json::json!({
+        "version": 1,
+        "daemon_version": "0.1.0",
+        "harness": "codex",
+        "harness_version": "codex-fake 0.1.0",
+        "catalog_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "models": [],
+        "accepts_asserted_effort": true
+    });
+
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then printf 'version\\n' >> '{}'; printf '%s\\n' 'codex-fake 0.1.0'; exit 0; fi\nif [ \"${{1:-}}\" = \"app-server\" ]; then printf 'models\\n' >> '{}'; while IFS= read -r message; do case \"$message\" in *'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"id\":1,\"result\":{{}}}}' ;; *'\"method\":\"model/list\"'*) printf '%s\\n' '{{\"id\":3,\"result\":{{\"data\":[],\"nextCursor\":null}}}}' ;; esac; done; exit 0; fi\nprintf 'execution\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"verified-capabilities\"}}' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+        probe_log.display(),
+        probe_log.display(),
+        probe_log.display()
+    );
+    let output = run_executor_with_codex(fixture.to_string().as_bytes(), &directory, &script);
+
+    assert!(
+        output.status.success(),
+        "execute rejected daemon-verified effort evidence: {}; events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(probe_log).expect("read Codex invocation counter"),
+        "execution\n",
+        "the actual executor must validate the passed report without version or model probes"
+    );
+    let mut parser = ExecutionEventParser::default();
+    let events = parser
+        .push(&output.stdout)
+        .expect("executor output should be JSONL");
+    assert!(parser.finish().unwrap().is_none());
+    assert!(matches!(
+        events.last().map(|event| &event.kind),
+        Some(ExecutionEventKind::Result { result }) if result.status == TerminalStatus::Completed
+    ));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn execute_sigterm_stops_harness_descendants_and_cleans_workspace() {
