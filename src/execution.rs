@@ -70,6 +70,27 @@ pub fn execute_assignment_cancellable(
     cancellation: &CancellationToken,
     context: &ExecutionContext<'_>,
 ) -> Result<ExecutionOutcome, ExecutionError> {
+    execute_assignment_cancellable_report(
+        assignment,
+        connection,
+        client,
+        retention,
+        cancellation,
+        context,
+    )
+    .map(|report| report.outcome)
+}
+
+/// Execute an assignment and report whether the provider classified its
+/// failure as a model or effort incompatibility.
+pub fn execute_assignment_cancellable_report(
+    assignment: PreparedAssignment,
+    connection: &RunnerConnection,
+    client: &Client,
+    retention: &WorkspaceRetention,
+    cancellation: &CancellationToken,
+    context: &ExecutionContext<'_>,
+) -> Result<ExecutionReport, ExecutionError> {
     execute_assignment_cancellable_inner(
         assignment,
         connection,
@@ -87,9 +108,14 @@ fn execute_assignment_cancellable_inner(
     retention: &WorkspaceRetention,
     cancellation: &CancellationToken,
     context: &ExecutionContext<'_>,
-) -> Result<ExecutionOutcome, ExecutionError> {
+) -> Result<ExecutionReport, ExecutionError> {
     if cancellation.is_cancelled() {
-        return settle_canceled_assignment(&assignment, context.active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs).map(|outcome| {
+            ExecutionReport {
+                outcome,
+                model_effort_incompatibility: false,
+            }
+        });
     }
     let run_id = assignment.assignment().run.id.clone();
     let timeout = Duration::from_secs(assignment.assignment().timeout_minutes.saturating_mul(60));
@@ -105,11 +131,22 @@ fn execute_assignment_cancellable_inner(
     );
 
     if cancellation.is_cancelled() || assignment.log_delivery_cancelled() || output.cancelled {
-        return settle_canceled_assignment(&assignment, context.active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs).map(|outcome| {
+            ExecutionReport {
+                outcome,
+                model_effort_incompatibility: false,
+            }
+        });
     }
     if cancellation.is_cancelled() {
-        return settle_canceled_assignment(&assignment, context.active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs).map(|outcome| {
+            ExecutionReport {
+                outcome,
+                model_effort_incompatibility: false,
+            }
+        });
     }
+    let model_effort_incompatibility = output.stream.model_effort_incompatibility();
     let finish_request = finish_executor_result(
         &run_id,
         &output.stream,
@@ -124,13 +161,21 @@ fn execute_assignment_cancellable_inner(
         &finish_request,
         cancellation,
     )? {
-        return settle_canceled_assignment(&assignment, context.active_runs);
+        return settle_canceled_assignment(&assignment, context.active_runs).map(|outcome| {
+            ExecutionReport {
+                outcome,
+                model_effort_incompatibility: false,
+            }
+        });
     }
     context
         .active_runs
         .remove(&run_id)
         .map_err(ExecutionError::ActiveStateCleanup)?;
-    Ok(ExecutionOutcome::Finished)
+    Ok(ExecutionReport {
+        outcome: ExecutionOutcome::Finished,
+        model_effort_incompatibility,
+    })
 }
 
 struct ExecutorExecution {
@@ -393,6 +438,13 @@ fn settle_canceled_assignment(
 pub enum ExecutionOutcome {
     Finished,
     Cancelled,
+}
+
+/// Additional execution evidence used to refresh future capability routing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionReport {
+    pub outcome: ExecutionOutcome,
+    pub model_effort_incompatibility: bool,
 }
 
 /// Report a pre-execution interruption unless cancellation has settled the run.

@@ -2,6 +2,7 @@
 
 use crate::assignment::resolve_assignment;
 use crate::cancellation::CancellationToken;
+use crate::capability_cache::ExecutorCapabilityCache;
 use crate::config::Config;
 use crate::config::RunnerType;
 use crate::effort::assignment_effort_rejection;
@@ -64,13 +65,45 @@ pub fn run_assignment_with_reporter(
     cancellation: &CancellationToken,
     context: &execution::ExecutionContext<'_>,
 ) -> Result<AssignmentTaskOutcome, String> {
+    let capability_cache = ExecutorCapabilityCache::default();
+    capability_cache.insert(
+        default_capabilities_transport,
+        config.runner_type.executor_harness(),
+        advertised_capabilities.clone(),
+    );
+    run_assignment_with_cache_reporter(
+        config,
+        connection,
+        issue_client,
+        assignment,
+        run_logs,
+        &capability_cache,
+        failure_reporter,
+        cancellation,
+        context,
+    )
+}
+
+/// Run an assignment with a capability cache shared by this runner's poll
+/// loop and assignment workers.
+#[allow(clippy::too_many_arguments)]
+pub fn run_assignment_with_cache_reporter(
+    config: &Config,
+    connection: &RunnerConnection,
+    issue_client: &Client,
+    assignment: RunnerAssignment,
+    run_logs: crate::protocol::client::RunLogBuffer,
+    capability_cache: &ExecutorCapabilityCache,
+    failure_reporter: &FailureReporter,
+    cancellation: &CancellationToken,
+    context: &execution::ExecutionContext<'_>,
+) -> Result<AssignmentTaskOutcome, String> {
     run_assignment_inner(
         AssignmentContext {
             config,
             connection,
             issue_client,
-            default_capabilities_transport,
-            advertised_capabilities,
+            capability_cache,
             failure_reporter,
             cancellation,
             context,
@@ -84,8 +117,7 @@ struct AssignmentContext<'a> {
     config: &'a Config,
     connection: &'a RunnerConnection,
     issue_client: &'a Client,
-    default_capabilities_transport: &'a ExecutorTransport,
-    advertised_capabilities: &'a ExecutorCapabilities,
+    capability_cache: &'a ExecutorCapabilityCache,
     failure_reporter: &'a FailureReporter,
     cancellation: &'a CancellationToken,
     context: &'a execution::ExecutionContext<'a>,
@@ -100,8 +132,7 @@ fn run_assignment_inner(
         config,
         connection,
         issue_client,
-        default_capabilities_transport,
-        advertised_capabilities,
+        capability_cache,
         failure_reporter,
         cancellation,
         context,
@@ -159,14 +190,10 @@ fn run_assignment_inner(
 
     let capabilities_transport =
         ExecutorTransport::for_resolved_capabilities(&resolved.resolution().config);
-    let capabilities = if &capabilities_transport == default_capabilities_transport {
-        advertised_capabilities.clone()
-    } else {
-        capabilities_transport.discover_capabilities_reported_for_harness(
-            failure_reporter,
-            runner_type.executor_harness(),
-        )
-    };
+    let harness = runner_type.executor_harness();
+    let mut capability_snapshot =
+        capability_cache.get_or_discover(&capabilities_transport, harness, failure_reporter);
+    let mut capabilities = capability_snapshot.capabilities.clone();
     if cancellation.is_cancelled() {
         return Ok(AssignmentTaskOutcome::Cancelled);
     }
@@ -179,7 +206,6 @@ fn run_assignment_inner(
             context,
         );
     }
-    let harness = runner_type.executor_harness();
     if !capabilities.supports(harness) {
         let reason = capabilities.support_error(harness).map_or_else(
             || format!("configured executor does not verify support for the {harness} harness"),
@@ -191,7 +217,7 @@ fn run_assignment_inner(
         );
         return Ok(AssignmentTaskOutcome::Declined(reason));
     }
-    let effort_rejection = match runner_type {
+    let mut effort_rejection = match runner_type {
         RunnerType::Codex => {
             let effort_capabilities = capabilities.effort_report("codex", crate::VERSION);
             assignment_effort_rejection(&assignment, &effort_capabilities)
@@ -202,6 +228,25 @@ fn run_assignment_inner(
         // effort semantics without using Codex validation.
         RunnerType::Custom => None,
     };
+    if effort_rejection
+        .as_deref()
+        .is_some_and(effort_rejection_may_be_stale)
+    {
+        capability_snapshot = capability_cache.refresh_if_unchanged(
+            &capabilities_transport,
+            harness,
+            capability_snapshot.revision,
+            failure_reporter,
+        );
+        capabilities.clone_from(&capability_snapshot.capabilities);
+        effort_rejection = match runner_type {
+            RunnerType::Codex => {
+                let effort_capabilities = capabilities.effort_report("codex", crate::VERSION);
+                assignment_effort_rejection(&assignment, &effort_capabilities)
+            }
+            RunnerType::Antigravity | RunnerType::Custom => None,
+        };
+    }
     if let Some(reason) = effort_rejection {
         if context.shutdown.is_requested() {
             return report_interrupted_before_execution(
@@ -226,7 +271,7 @@ fn run_assignment_inner(
     );
     let prepared =
         crate::assignment::PreparedAssignment::new(resolved).with_run_log_buffer(run_logs);
-    execution::execute_assignment_cancellable(
+    let report = execution::execute_assignment_cancellable_report(
         prepared,
         connection,
         issue_client,
@@ -234,11 +279,26 @@ fn run_assignment_inner(
         cancellation,
         context,
     )
-    .map(|outcome| match outcome {
+    .map_err(|error| error.to_string())?;
+    if report.model_effort_incompatibility && runner_type == RunnerType::Codex {
+        let _ = capability_cache.refresh_if_unchanged(
+            &capabilities_transport,
+            harness,
+            capability_snapshot.revision,
+            failure_reporter,
+        );
+    }
+    Ok(match report.outcome {
         ExecutionOutcome::Finished => AssignmentTaskOutcome::Finished,
         ExecutionOutcome::Cancelled => AssignmentTaskOutcome::Cancelled,
     })
-    .map_err(|error| error.to_string())
+}
+
+fn effort_rejection_may_be_stale(reason: &str) -> bool {
+    reason.contains("does not support effort")
+        || reason.contains("effort support could not be verified")
+        || reason.contains("installed Codex effort support could not be verified")
+        || reason.contains("capability catalog changed after assignment delivery")
 }
 
 fn log_assignment_resolution(

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::effort::{EffortCapabilities, MAX_EFFORT_CAPABILITIES_AGE};
+use crate::effort::EffortCapabilities;
 
 pub const EXECUTOR_CAPABILITIES_VERSION: u8 = 1;
 const MAX_HARNESSES: usize = 32;
@@ -35,92 +35,95 @@ impl ExecutorCapabilities {
         Self::discover_with_programs(daemon_version, "codex", "agy")
     }
 
+    /// Return the static support report for a custom command harness.
+    pub fn custom(daemon_version: &str) -> Self {
+        Self {
+            version: EXECUTOR_CAPABILITIES_VERSION,
+            harnesses: BTreeMap::from([(
+                "custom".to_owned(),
+                ExecutorHarnessCapabilities {
+                    version: format!("tines-runner-rs {daemon_version}")
+                        .chars()
+                        .take(MAX_IDENTIFIER_LENGTH)
+                        .collect(),
+                    effort: None,
+                    discovery_error: None,
+                },
+            )]),
+            discovery_error: None,
+        }
+    }
+
+    /// Discover only the requested native harness, plus static custom support.
+    pub fn discover_for_harness(daemon_version: &str, harness: &str) -> Self {
+        match harness {
+            "custom" => Self::custom(daemon_version),
+            "codex" => Self::discover_selected(daemon_version, "codex", "agy", Some("codex")),
+            "antigravity" => {
+                Self::discover_selected(daemon_version, "codex", "agy", Some("antigravity"))
+            }
+            _ => Self::unavailable("unsupported capability harness"),
+        }
+    }
+
     fn discover_with_programs(
         daemon_version: &str,
         codex_program: &str,
         antigravity_program: &str,
     ) -> Self {
-        let mut harnesses = BTreeMap::from([(
-            "custom".to_owned(),
-            ExecutorHarnessCapabilities {
-                version: format!("tines-runner-rs {daemon_version}")
-                    .chars()
-                    .take(MAX_IDENTIFIER_LENGTH)
-                    .collect(),
-                effort: None,
-                discovery_error: None,
-            },
-        )]);
-        let codex_daemon_version = daemon_version.to_owned();
-        let codex_program = codex_program.to_owned();
-        let codex_discovery = std::thread::Builder::new()
-            .name("codex-capability-discovery".to_owned())
-            .spawn(move || {
-                EffortCapabilities::discover_with_program(&codex_program, &codex_daemon_version)
-            });
-        let antigravity = crate::executor::antigravity::discover_with_program(
-            antigravity_program,
-            daemon_version,
-        );
-        let effort = match codex_discovery {
-            Ok(discovery) => discovery.join().unwrap_or_else(|_| {
-                EffortCapabilities::unavailable(
-                    daemon_version,
-                    "codex",
-                    "Codex capability probe failed",
-                )
-            }),
-            Err(_) => EffortCapabilities::unavailable(
-                daemon_version,
-                "codex",
-                "Codex capability probe could not start",
-            ),
-        };
-        if let Err(error) = effort.validate_for_harness("codex") {
-            harnesses.insert(
-                "codex".to_owned(),
+        Self::discover_selected(daemon_version, codex_program, antigravity_program, None)
+    }
+
+    fn discover_selected(
+        daemon_version: &str,
+        codex_program: &str,
+        antigravity_program: &str,
+        selected_harness: Option<&str>,
+    ) -> Self {
+        let mut capabilities = Self::custom(daemon_version);
+        if selected_harness.is_none_or(|harness| harness == "codex") {
+            let effort = EffortCapabilities::discover_with_program(codex_program, daemon_version);
+            let capability = if let Err(error) = effort.validate_for_harness("codex") {
                 ExecutorHarnessCapabilities {
                     version: "unknown".to_owned(),
                     effort: None,
                     discovery_error: Some(error),
-                },
-            );
-        } else {
-            let version = effort.harness_version.clone();
-            if let Some(error) = effort.discovery_error.clone() {
-                harnesses.insert(
-                    "codex".to_owned(),
+                }
+            } else {
+                let version = effort.harness_version.clone();
+                if let Some(error) = effort.discovery_error.clone() {
                     ExecutorHarnessCapabilities {
                         version,
                         effort: None,
-                        discovery_error: Some(error.clone()),
-                    },
-                );
-            } else {
-                harnesses.insert(
-                    "codex".to_owned(),
+                        discovery_error: Some(error),
+                    }
+                } else {
                     ExecutorHarnessCapabilities {
                         version,
                         effort: Some(effort),
                         discovery_error: None,
-                    },
-                );
-            }
+                    }
+                }
+            };
+            capabilities
+                .harnesses
+                .insert("codex".to_owned(), capability);
         }
-
-        harnesses.insert(
-            "antigravity".to_owned(),
-            ExecutorHarnessCapabilities {
-                version: antigravity.version.unwrap_or_else(|| "unknown".to_owned()),
-                effort: antigravity.effort,
-                discovery_error: antigravity.error.clone(),
-            },
-        );
-        Self {
-            version: EXECUTOR_CAPABILITIES_VERSION,
-            harnesses,
-            discovery_error: None,
+        if selected_harness.is_none_or(|harness| harness == "antigravity") {
+            let antigravity = crate::executor::antigravity::discover_with_program(
+                antigravity_program,
+                daemon_version,
+            );
+            capabilities.harnesses.insert(
+                "antigravity".to_owned(),
+                ExecutorHarnessCapabilities {
+                    version: antigravity.version.unwrap_or_else(|| "unknown".to_owned()),
+                    effort: antigravity.effort,
+                    discovery_error: antigravity.error,
+                },
+            );
         }
+        capabilities
     }
 
     /// Build an unsupported report after transport or document validation fails.
@@ -231,16 +234,6 @@ impl ExecutorCapabilities {
         capabilities.validate()?;
         Ok(capabilities)
     }
-
-    /// Whether the cached document has reached the standard ten-minute refresh interval.
-    pub fn refresh_due(
-        &self,
-        refreshed_at: Option<std::time::Instant>,
-        now: std::time::Instant,
-    ) -> bool {
-        refreshed_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= MAX_EFFORT_CAPABILITIES_AGE)
-    }
 }
 
 fn valid_identifier(identifier: &str) -> bool {
@@ -256,8 +249,18 @@ fn valid_identifier(identifier: &str) -> bool {
 /// Discover capabilities in the executor's environment for the CLI command.
 pub fn discover_for_cli(daemon_version: &str) -> Result<(), std::io::Error> {
     let capabilities = ExecutorCapabilities::discover(daemon_version);
+    write_capabilities(&capabilities)
+}
+
+/// Discover one harness in the executor's environment for the daemon CLI.
+pub fn discover_for_cli_harness(daemon_version: &str, harness: &str) -> Result<(), std::io::Error> {
+    let capabilities = ExecutorCapabilities::discover_for_harness(daemon_version, harness);
+    write_capabilities(&capabilities)
+}
+
+fn write_capabilities(capabilities: &ExecutorCapabilities) -> Result<(), std::io::Error> {
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &capabilities).map_err(std::io::Error::other)?;
+    serde_json::to_writer(&mut stdout, capabilities).map_err(std::io::Error::other)?;
     std::io::Write::write_all(&mut stdout, b"\n")
 }
 
@@ -363,6 +366,68 @@ exit 2
             );
         }
 
+        fs::remove_dir_all(directory).expect("remove fake harness directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_discovery_never_runs_an_unrelated_native_harness() {
+        use std::fs;
+        let directory = std::env::temp_dir().join(format!(
+            "tines-runner-selected-capabilities-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("create fake harness directory");
+        let codex_marker = directory.join("codex-ran");
+        let antigravity_marker = directory.join("antigravity-ran");
+        let codex = directory.join("codex");
+        let antigravity = directory.join("agy");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nexit 0\n",
+                codex_marker.display()
+            ),
+        )
+        .expect("write fake Codex command");
+        fs::write(
+            &antigravity,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nexit 0\n",
+                antigravity_marker.display()
+            ),
+        )
+        .expect("write fake Antigravity command");
+        make_executable(&codex);
+        make_executable(&antigravity);
+
+        let report = ExecutorCapabilities::discover_selected(
+            "0.1.0",
+            codex.to_str().expect("Codex path is UTF-8"),
+            antigravity.to_str().expect("Antigravity path is UTF-8"),
+            Some("codex"),
+        );
+        assert!(report.harnesses.contains_key("codex"));
+        assert!(!report.harnesses.contains_key("antigravity"));
+        assert!(codex_marker.exists());
+        assert!(!antigravity_marker.exists());
+
+        fs::remove_file(&codex_marker).expect("clear Codex invocation marker");
+        let report = ExecutorCapabilities::discover_selected(
+            "0.1.0",
+            codex.to_str().expect("Codex path is UTF-8"),
+            antigravity.to_str().expect("Antigravity path is UTF-8"),
+            Some("antigravity"),
+        );
+        assert!(!report.harnesses.contains_key("codex"));
+        assert!(report.harnesses.contains_key("antigravity"));
+        assert!(!codex_marker.exists());
+        assert!(antigravity_marker.exists());
+
+        let report = ExecutorCapabilities::discover_for_harness("0.1.0", "custom");
+        assert!(report.supports("custom"));
+        assert!(!report.harnesses.contains_key("codex"));
+        assert!(!report.harnesses.contains_key("antigravity"));
         fs::remove_dir_all(directory).expect("remove fake harness directory");
     }
 }

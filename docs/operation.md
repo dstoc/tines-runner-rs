@@ -51,11 +51,17 @@ configure repository credentials inside that executor environment as well.
 The executor runs `tines-runner-rs execute`; `runner_type` selects the semantic
 harness, while `executor` selects the local command that starts the executor.
 
-The runner discovers capabilities by invoking the configured executor command
-with `capabilities`. The executor writes one versioned JSON document to stdout.
-The document reports semantic harness support, harness versions, and effort
-catalogs. The runner caches it for ten minutes and refreshes it before it
-processes an assignment with enforced effort.
+For Codex and Antigravity, the runner discovers capabilities by invoking the
+configured executor command with `capabilities --harness <runner_type>`. The
+executor probes only the selected native harness and writes one versioned JSON
+document to stdout. Custom runners use static support and do not invoke a
+capability executor. The runner keeps reports in memory until it detects stale
+data. It refreshes a cached unsupported model or effort once before it declines
+the assignment. A classified model or effort incompatibility during execution
+refreshes that harness and transport report for future assignments. Other
+execution failures do not invalidate the report. The runner does not retry the
+failed assignment. Assignment overrides use a separate cached report for each
+effective transport and harness.
 
 The default executor uses the local runner binary, so Codex must be available
 in the daemon account's `PATH`. A container executor discovers Codex inside the

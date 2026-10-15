@@ -160,6 +160,8 @@ fn capabilities_mode_reports_codex_from_its_executor_environment() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
         .arg("capabilities")
+        .arg("--harness")
+        .arg("codex")
         .env("PATH", search_path)
         .output()
         .expect("run executor capability mode");
@@ -172,6 +174,7 @@ fn capabilities_mode_reports_codex_from_its_executor_environment() {
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("decode capability document");
     assert_eq!(document["version"], 1);
+    assert!(document["harnesses"].get("antigravity").is_none());
     assert_eq!(
         document["harnesses"]["codex"]["version"],
         "codex-fake 0.1.0"
@@ -180,6 +183,56 @@ fn capabilities_mode_reports_codex_from_its_executor_environment() {
         document["harnesses"]["codex"]["effort"]["models"],
         serde_json::json!([])
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_capability_mode_does_not_probe_codex() {
+    let directory = TestDirectory::new();
+    let bin = directory.0.join("bin");
+    fs::create_dir_all(&bin).expect("create fake executor PATH");
+    let codex_marker = directory.0.join("codex-probed");
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexit 19\n",
+            codex_marker.display()
+        ),
+    )
+    .expect("write Codex marker command");
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
+        .expect("make Codex command executable");
+    let antigravity = bin.join("agy");
+    fs::write(
+        &antigravity,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'agy 1.3.1\\n'; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf 'gemini-3.8-flash model\\n'; exit 0; fi\nexit 2\n",
+    )
+    .expect("write Antigravity command");
+    fs::set_permissions(&antigravity, fs::Permissions::from_mode(0o755))
+        .expect("make Antigravity command executable");
+    let mut search_path = vec![bin];
+    search_path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let search_path = std::env::join_paths(search_path).expect("build fake executor PATH");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
+        .args(["capabilities", "--harness", "antigravity"])
+        .env("PATH", search_path)
+        .output()
+        .expect("run selected Antigravity capability mode");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("decode capability document");
+    assert!(document["harnesses"].get("codex").is_none());
+    assert!(document["harnesses"].get("antigravity").is_some());
+    assert!(!codex_marker.exists());
 }
 
 #[cfg(unix)]

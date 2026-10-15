@@ -49,7 +49,11 @@ enum CliCommand {
     /// Read and validate one execution request from stdin.
     Execute,
     /// Report harness and effort capabilities from this executor environment.
-    Capabilities,
+    Capabilities {
+        /// Probe one harness in the executor environment.
+        #[arg(long, value_parser = ["codex", "antigravity", "custom"])]
+        harness: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -58,7 +62,7 @@ fn main() -> ExitCode {
 
     let config_required = !matches!(
         cli.command.as_ref(),
-        Some(CliCommand::Execute | CliCommand::Capabilities)
+        Some(CliCommand::Execute | CliCommand::Capabilities { .. })
     );
     if config_required && cli.config.is_none() {
         let message = if matches!(cli.command.as_ref(), Some(CliCommand::Register { .. })) {
@@ -101,10 +105,17 @@ fn main() -> ExitCode {
             };
         }
         Some(CliCommand::Execute) => return execute_stdin(),
-        Some(CliCommand::Capabilities) => {
-            return match tines_runner_rs::executor_capabilities::discover_for_cli(
-                tines_runner_rs::VERSION,
-            ) {
+        Some(CliCommand::Capabilities { harness }) => {
+            let discovery = match harness.as_deref() {
+                Some(harness) => tines_runner_rs::executor_capabilities::discover_for_cli_harness(
+                    tines_runner_rs::VERSION,
+                    harness,
+                ),
+                None => tines_runner_rs::executor_capabilities::discover_for_cli(
+                    tines_runner_rs::VERSION,
+                ),
+            };
+            return match discovery {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("executor could not write its capability document: {error}");
@@ -171,7 +182,8 @@ fn start_runner(
 ) -> Result<(), Box<dyn Error>> {
     if check {
         let config = tines_runner_rs::config::Config::load_for_runner(config_path, runner_id)?;
-        return run_runner(config, true, None);
+        let mut startup = None;
+        return run_runner(config, true, None, &mut startup);
     }
 
     let configs = tines_runner_rs::config::Config::load_for_daemon(config_path, runner_id)?;
@@ -190,19 +202,39 @@ fn supervise_runners(configs: Vec<tines_runner_rs::config::Config>) -> Result<()
         let runner_shutdown = shutdown.clone();
         let task_completion = completion_tx.clone();
         let span = tracing::info_span!("runner", local_id = %local_id);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(0);
         match thread::Builder::new()
             .name(format!("runner-{local_id}"))
             .spawn(move || {
                 let _entered = span.enter();
                 tracing::info!("runner supervision task started");
+                let mut startup = Some(startup_tx);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_runner(config, false, Some(runner_shutdown))
+                    run_runner(config, false, Some(runner_shutdown), &mut startup)
                         .map_err(|error| error.to_string())
                 }))
                 .unwrap_or_else(|_| Err("runner supervision task panicked".to_owned()));
+                if let Some(startup) = startup.take() {
+                    let startup_result = match &result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let _ = startup.send(startup_result);
+                }
                 let _ = task_completion.send((task_id, result));
             }) {
-            Ok(handle) => workers.push(handle),
+            Ok(handle) => {
+                workers.push(handle);
+                match startup_rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(local_id, error, "runner initialization failed");
+                    }
+                    Err(_) => {
+                        tracing::error!(local_id, "runner initialization ended without a result");
+                    }
+                }
+            }
             Err(error) => {
                 tracing::error!(local_id, error = %error, "could not start runner supervision task");
                 failures.push(local_id);
@@ -252,6 +284,7 @@ fn run_runner(
     config: tines_runner_rs::config::Config,
     check: bool,
     shutdown: Option<tines_runner_rs::shutdown::ShutdownSignal>,
+    startup: &mut Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
 ) -> Result<(), Box<dyn Error>> {
     let connection = tines_runner_rs::runner::RunnerConnection::connect(&config)?;
     let _ownership = if check {
@@ -299,9 +332,16 @@ fn run_runner(
     }
     let issue_client = tines_runner_rs::protocol::client::Client::new(config.server_url.as_str())?;
     let execution_connection = connection.clone();
-    let default_capabilities_transport =
-        tines_runner_rs::executor_transport::ExecutorTransport::for_capabilities(&config);
-    let mut poller = tines_runner_rs::poll::PollLoop::new(connection, &config);
+    let capability_cache = tines_runner_rs::capability_cache::ExecutorCapabilityCache::default();
+    let mut poller = tines_runner_rs::poll::PollLoop::new_with_capability_cache(
+        connection,
+        &config,
+        capability_cache.clone(),
+    );
+    poller.state_mut().refresh_executor_capabilities();
+    if let Some(startup) = startup.take() {
+        let _ = startup.send(Ok(()));
+    }
     let boot_id = poller.state().instance_id().to_owned();
     let failure_reporter = poller.state().failure_reporter();
     let last_logged_concurrency = Cell::new(config.max_concurrent as u32);
@@ -335,13 +375,7 @@ fn run_runner(
                 tracing::info!(run_id, "supervisor settled run; stopping local work without finish reporting");
             }
 
-            let force_capability_refresh = response
-                .assignments
-                .iter()
-                .any(|assignment| assignment.effort.is_some());
-            let capabilities = state
-                .refresh_executor_capabilities(force_capability_refresh)
-                .clone();
+            state.refresh_executor_capabilities();
             for assignment in &response.assignments {
                 let run_id = assignment.run.id.clone();
                 if response.released_assignments.contains(&run_id) {
@@ -381,9 +415,7 @@ fn run_runner(
                 let worker_config = config.clone();
                 let worker_connection = execution_connection.clone();
                 let worker_client = issue_client.clone();
-                let worker_default_capabilities_transport =
-                    default_capabilities_transport.clone();
-                let worker_capabilities = capabilities.clone();
+                let worker_capability_cache = capability_cache.clone();
                 let worker_failure_reporter = failure_reporter.clone();
                 let worker_assignment = assignment.clone();
                 let worker_shutdown = shutdown.clone();
@@ -397,14 +429,13 @@ fn run_runner(
                             &worker_shutdown,
                             &worker_active_runs,
                         );
-                        tines_runner_rs::assignment_worker::run_assignment_with_reporter(
+                        tines_runner_rs::assignment_worker::run_assignment_with_cache_reporter(
                             &worker_config,
                             &worker_connection,
                             &worker_client,
                             worker_assignment,
                             run_logs,
-                            &worker_default_capabilities_transport,
-                            &worker_capabilities,
+                            &worker_capability_cache,
                             &worker_failure_reporter,
                             &worker_cancellation,
                             &context,

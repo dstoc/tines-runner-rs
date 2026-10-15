@@ -16,6 +16,7 @@ use tines_runner_rs::execution_protocol::{
     TinesExecutionContext, WorkspacePolicy,
 };
 use tines_runner_rs::executor_transport::{ExecutorTransport, ExecutorTransportError};
+use tines_runner_rs::logging::FailureReporter;
 use tines_runner_rs::process::ProcessExit;
 #[cfg(target_os = "linux")]
 use tines_runner_rs::process::{EXECUTOR_TRANSPORT_TERMINATION_GRACE, ProcessIdentity};
@@ -347,6 +348,32 @@ fn discovers_capabilities_through_the_configured_executor_command() {
     assert_eq!(
         fs::read_to_string(args_path).unwrap(),
         "run\n--rm\n-i\nrunner-image\ncapabilities\n"
+    );
+}
+
+#[test]
+fn scoped_capability_discovery_passes_the_effective_harness_to_the_executor() {
+    let directory = TestDirectory::new();
+    let args_path = directory.0.join("capability-args");
+    let stub = directory.0.join("capability-executor");
+    write_executable(
+        &stub,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'\n",
+            args_path.display(),
+            codex_capabilities_document()
+        ),
+    );
+    let transport =
+        configured_capabilities_transport(vec![stub.to_string_lossy().into_owned()], &directory.0);
+
+    let capabilities =
+        transport.discover_capabilities_reported_for_harness(&FailureReporter::default(), "codex");
+
+    assert!(capabilities.supports("codex"));
+    assert_eq!(
+        fs::read_to_string(args_path).expect("read capability arguments"),
+        "capabilities\n--harness\ncodex\n"
     );
 }
 

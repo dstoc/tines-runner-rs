@@ -457,6 +457,90 @@ fn stop_gracefully(fake: &FakeTines, runner: &mut RunnerProcess) {
 }
 
 #[test]
+fn named_runner_initial_capability_discovery_is_serialized() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let control = directory.path.join("capability-probes");
+    fs::create_dir_all(&control).expect("create capability probe directory");
+    let probe = directory.path.join("serialized-capability-executor");
+    fs::write(
+        &probe,
+        r##"#!/bin/sh
+label=$1
+control=$2
+if [ "${3:-}" = capabilities ]; then
+    : > "$control/$label-started"
+    while ! mkdir "$control/lock" 2>/dev/null; do sleep 0.002; done
+    active=0
+    if [ -f "$control/active" ]; then active=$(cat "$control/active"); fi
+    active=$((active + 1))
+    printf '%s\n' "$active" > "$control/active"
+    if [ "$active" -gt 1 ]; then : > "$control/overlap"; fi
+    rmdir "$control/lock"
+    sleep 0.25
+    while ! mkdir "$control/lock" 2>/dev/null; do sleep 0.002; done
+    active=$(cat "$control/active")
+    active=$((active - 1))
+    printf '%s\n' "$active" > "$control/active"
+    rmdir "$control/lock"
+    printf '%s\n' '{"version":1,"harnesses":{"codex":{"version":"codex-init-test"}}}'
+    exit 0
+fi
+cat >/dev/null
+printf '%s\n' '{"version":1,"type":"result","status":"completed","exit_code":0,"interrupted":false}'
+"##,
+    )
+    .expect("write serialized capability executor");
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))
+        .expect("make capability executor executable");
+    let config_path = directory.path.join("serialized-runners.toml");
+    let executor = |id: &str| {
+        serde_json::to_string(&vec![
+            probe.to_string_lossy().into_owned(),
+            id.to_owned(),
+            control.to_string_lossy().into_owned(),
+        ])
+        .expect("encode serialized executor argv")
+    };
+    let workspaces = directory.path.join("workspaces");
+    fs::create_dir_all(&workspaces).expect("create runner workspace parent");
+    let config = format!(
+        "[server]\nurl = {:?}\n\n[runners.first]\nname = \"serialized-first\"\ncredentials_file = {:?}\nrunner_type = \"codex\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n\n[runners.second]\nname = \"serialized-second\"\ncredentials_file = {:?}\nrunner_type = \"codex\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n\n[storage]\nstate_dir = {:?}\n",
+        fake.url(),
+        directory.path.join("first/credentials.toml"),
+        executor("first"),
+        workspaces,
+        directory.path.join("second/credentials.toml"),
+        executor("second"),
+        workspaces,
+        directory.path.join("state")
+    );
+    fs::write(&config_path, config).expect("write serialized runner config");
+
+    let mut runner = directory.runner_for(&config_path, None, Some("fake-bootstrap-key"));
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        let registrations = requests
+            .iter()
+            .filter(|request| request.target == "/api/v1/runners/register")
+            .count();
+        let poll_targets = poll_requests(requests)
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        registrations == 2 && poll_targets.len() == 2
+    });
+
+    assert!(control.join("first-started").is_file());
+    assert!(control.join("second-started").is_file());
+    assert!(
+        !control.join("overlap").exists(),
+        "runner initialization must wait for the first capability probe to finish"
+    );
+    runner.assert_running();
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
 fn one_daemon_supervises_named_runners_with_independent_state_and_shutdown() {
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
