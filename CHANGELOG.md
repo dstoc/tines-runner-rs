@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/dstoc/tines-runner-rs/compare/v0.8.2...v0.9.0) (2026-10-15)
+
+
+### Features
+
+* serialize harness capability discovery ([#84](https://github.com/dstoc/tines-runner-rs/issues/84)) ([6b68981](https://github.com/dstoc/tines-runner-rs/commit/6b689812d99f93c4f5a0e8f83dcf7adb26893bd2))
+
 ## [0.8.2](https://github.com/dstoc/tines-runner-rs/compare/v0.8.1...v0.8.2) (2026-10-09)
 
 
