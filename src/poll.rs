@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
-use std::time::Instant;
 
 use crate::assignment::PreparedAssignment;
+use crate::capability_cache::{CapabilitySnapshot, ExecutorCapabilityCache};
 use crate::config::Config;
 use crate::executor_capabilities::ExecutorCapabilities;
 use crate::executor_transport::ExecutorTransport;
@@ -45,7 +45,8 @@ pub struct PollState {
     effort_capability_harness: Option<&'static str>,
     tines_capability_harness: Option<&'static str>,
     executor_capabilities: Option<ExecutorCapabilities>,
-    executor_capabilities_refreshed_at: Option<Instant>,
+    executor_capability_revision: u64,
+    capability_cache: ExecutorCapabilityCache,
     failure_reporter: FailureReporter,
 }
 
@@ -61,7 +62,15 @@ pub enum AssignmentAdmission {
 }
 
 impl PollState {
+    #[cfg(test)]
     fn new(config: &Config) -> Self {
+        Self::new_with_capability_cache(config, ExecutorCapabilityCache::default())
+    }
+
+    fn new_with_capability_cache(
+        config: &Config,
+        capability_cache: ExecutorCapabilityCache,
+    ) -> Self {
         Self {
             instance_id: uuid::Uuid::new_v4().to_string(),
             owned_runs: BTreeSet::new(),
@@ -81,7 +90,8 @@ impl PollState {
             effort_capability_harness: config.runner_type.effort_capability_harness(),
             tines_capability_harness: config.runner_type.tines_capability_harness(),
             executor_capabilities: None,
-            executor_capabilities_refreshed_at: None,
+            executor_capability_revision: 0,
+            capability_cache,
             failure_reporter: FailureReporter::default(),
         }
     }
@@ -180,29 +190,33 @@ impl PollState {
         !self.cancellation_acks.is_empty()
     }
 
-    /// Refresh the executor report when it expires, or before an effort-bearing
-    /// assignment when `force` is true.
-    pub fn refresh_executor_capabilities(&mut self, force: bool) -> &ExecutorCapabilities {
-        let now = Instant::now();
-        let expired = self
-            .executor_capabilities
-            .as_ref()
-            .is_none_or(|capabilities| {
-                capabilities.refresh_due(self.executor_capabilities_refreshed_at, now)
-            });
-        if force || expired {
-            self.executor_capabilities = Some(
-                self.capabilities_transport
-                    .discover_capabilities_reported_for_harness(
-                        &self.failure_reporter,
-                        self.executor_harness,
-                    ),
-            );
-            self.executor_capabilities_refreshed_at = Some(now);
-        }
+    /// Load the cached report for this runner's configured harness.
+    pub fn refresh_executor_capabilities(&mut self) -> &ExecutorCapabilities {
+        let snapshot = self.capability_cache.get_or_discover(
+            &self.capabilities_transport,
+            self.executor_harness,
+            &self.failure_reporter,
+        );
+        self.executor_capability_revision = snapshot.revision;
+        self.executor_capabilities = Some(snapshot.capabilities);
         self.executor_capabilities
             .as_ref()
-            .expect("executor capabilities are discovered before use")
+            .expect("executor capabilities are cached before use")
+    }
+
+    /// Cache shared with assignment workers for this runner.
+    pub fn capability_cache(&self) -> ExecutorCapabilityCache {
+        self.capability_cache.clone()
+    }
+
+    /// Snapshot currently advertised by the poll loop.
+    pub fn capability_snapshot(&self) -> Option<CapabilitySnapshot> {
+        self.executor_capabilities
+            .clone()
+            .map(|capabilities| CapabilitySnapshot {
+                capabilities,
+                revision: self.executor_capability_revision,
+            })
     }
 
     /// Shared operational failure tracking for capability probes and workers.
@@ -352,10 +366,18 @@ pub struct PollLoop {
 
 impl PollLoop {
     pub fn new(connection: RunnerConnection, config: &Config) -> Self {
+        Self::new_with_capability_cache(connection, config, ExecutorCapabilityCache::default())
+    }
+
+    pub fn new_with_capability_cache(
+        connection: RunnerConnection,
+        config: &Config,
+        capability_cache: ExecutorCapabilityCache,
+    ) -> Self {
         Self {
             connection,
             interval: config.poll_interval,
-            state: PollState::new(config),
+            state: PollState::new_with_capability_cache(config, capability_cache),
         }
     }
 
@@ -407,7 +429,7 @@ impl PollLoop {
             if !should_continue(&self.state) {
                 break;
             }
-            self.state.refresh_executor_capabilities(false);
+            self.state.refresh_executor_capabilities();
             let request = self.state.request();
             match self.connection.poll(&request) {
                 Ok(response) => {
@@ -637,7 +659,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -753,12 +775,24 @@ mod tests {
     }
 
     fn cache_empty_capabilities(poller: &mut PollLoop) {
-        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
-            version: 1,
-            harnesses: BTreeMap::new(),
-            discovery_error: None,
-        });
-        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
+        set_cached_capabilities(
+            poller.state_mut(),
+            ExecutorCapabilities {
+                version: 1,
+                harnesses: BTreeMap::new(),
+                discovery_error: None,
+            },
+        );
+    }
+
+    fn set_cached_capabilities(state: &mut PollState, capabilities: ExecutorCapabilities) {
+        let snapshot = state.capability_cache.insert(
+            &state.capabilities_transport,
+            state.executor_harness,
+            capabilities.clone(),
+        );
+        state.executor_capability_revision = snapshot.revision;
+        state.executor_capabilities = Some(capabilities);
     }
 
     #[test]
@@ -899,19 +933,21 @@ mod tests {
             accepts_asserted_effort: Some(true),
             discovery_error: None,
         };
-        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
-            version: 1,
-            harnesses: BTreeMap::from([(
-                "codex".to_owned(),
-                ExecutorHarnessCapabilities {
-                    version: "codex-cli 0.153.4".to_owned(),
-                    effort: Some(effort),
-                    discovery_error: None,
-                },
-            )]),
-            discovery_error: None,
-        });
-        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
+        set_cached_capabilities(
+            poller.state_mut(),
+            ExecutorCapabilities {
+                version: 1,
+                harnesses: BTreeMap::from([(
+                    "codex".to_owned(),
+                    ExecutorHarnessCapabilities {
+                        version: "codex-cli 0.153.4".to_owned(),
+                        effort: Some(effort),
+                        discovery_error: None,
+                    },
+                )]),
+                discovery_error: None,
+            },
+        );
         let polls = Cell::new(0);
 
         poller
@@ -963,19 +999,21 @@ mod tests {
             accepts_asserted_effort: None,
             discovery_error: None,
         };
-        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
-            version: 1,
-            harnesses: BTreeMap::from([(
-                "antigravity".to_owned(),
-                ExecutorHarnessCapabilities {
-                    version: "agy 1.3.1".to_owned(),
-                    effort: Some(effort),
-                    discovery_error: None,
-                },
-            )]),
-            discovery_error: None,
-        });
-        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
+        set_cached_capabilities(
+            poller.state_mut(),
+            ExecutorCapabilities {
+                version: 1,
+                harnesses: BTreeMap::from([(
+                    "antigravity".to_owned(),
+                    ExecutorHarnessCapabilities {
+                        version: "agy 1.3.1".to_owned(),
+                        effort: Some(effort),
+                        discovery_error: None,
+                    },
+                )]),
+                discovery_error: None,
+            },
+        );
         let polls = Cell::new(0);
 
         poller
@@ -1024,19 +1062,21 @@ mod tests {
         config.runner_type = RunnerType::Custom;
         let connection = RunnerConnection::connect(&config).expect("load runner connection");
         let mut poller = PollLoop::new(connection, &config);
-        poller.state_mut().executor_capabilities = Some(ExecutorCapabilities {
-            version: 1,
-            harnesses: BTreeMap::from([(
-                "custom".to_owned(),
-                ExecutorHarnessCapabilities {
-                    version: "custom-agent 1.0".to_owned(),
-                    effort: None,
-                    discovery_error: None,
-                },
-            )]),
-            discovery_error: None,
-        });
-        poller.state_mut().executor_capabilities_refreshed_at = Some(Instant::now());
+        set_cached_capabilities(
+            poller.state_mut(),
+            ExecutorCapabilities {
+                version: 1,
+                harnesses: BTreeMap::from([(
+                    "custom".to_owned(),
+                    ExecutorHarnessCapabilities {
+                        version: "custom-agent 1.0".to_owned(),
+                        effort: None,
+                        discovery_error: None,
+                    },
+                )]),
+                discovery_error: None,
+            },
+        );
         let polls = Cell::new(0);
 
         poller
@@ -1065,7 +1105,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn executor_capability_cache_refreshes_on_expiry_and_before_effort_work() {
+    fn executor_capability_cache_does_not_refresh_with_elapsed_time() {
         let directory = TestDirectory::new();
         let counter = directory.0.join("capability-probes");
         let document = r#"{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}"#;
@@ -1092,17 +1132,13 @@ mod tests {
         .expect("valid runner config");
         let mut state = PollState::new(&config);
 
-        assert!(state.refresh_executor_capabilities(false).supports("codex"));
-        assert!(state.refresh_executor_capabilities(false).supports("codex"));
+        assert!(state.refresh_executor_capabilities().supports("codex"));
+        assert!(state.refresh_executor_capabilities().supports("codex"));
         assert_eq!(fs::read(&counter).unwrap().len(), 1);
 
-        state.refresh_executor_capabilities(true);
-        assert_eq!(fs::read(&counter).unwrap().len(), 2);
-
-        state.executor_capabilities_refreshed_at =
-            Some(Instant::now() - Duration::from_secs(10 * 60));
-        state.refresh_executor_capabilities(false);
-        assert_eq!(fs::read(&counter).unwrap().len(), 3);
+        std::thread::sleep(Duration::from_millis(20));
+        state.refresh_executor_capabilities();
+        assert_eq!(fs::read(&counter).unwrap().len(), 1);
     }
 
     #[test]
@@ -1574,10 +1610,24 @@ mod tests {
         let mut state = PollState::new(&config);
 
         let events = capture_events(|| {
-            state.refresh_executor_capabilities(true);
-            state.refresh_executor_capabilities(true);
+            state.refresh_executor_capabilities();
+            state.refresh_executor_capabilities();
+            let snapshot = state
+                .capability_snapshot()
+                .expect("initial capability snapshot");
+            let repeated_failure = state.capability_cache.refresh_if_unchanged(
+                &state.capabilities_transport,
+                state.executor_harness,
+                snapshot.revision,
+                &state.failure_reporter,
+            );
             fs::remove_file(&fail_flag).expect("allow probe recovery");
-            state.refresh_executor_capabilities(true);
+            state.capability_cache.refresh_if_unchanged(
+                &state.capabilities_transport,
+                state.executor_harness,
+                repeated_failure.revision,
+                &state.failure_reporter,
+            );
         });
 
         let probe_warnings = events

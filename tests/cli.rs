@@ -160,6 +160,8 @@ fn capabilities_mode_reports_codex_from_its_executor_environment() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
         .arg("capabilities")
+        .arg("--harness")
+        .arg("codex")
         .env("PATH", search_path)
         .output()
         .expect("run executor capability mode");
@@ -172,6 +174,7 @@ fn capabilities_mode_reports_codex_from_its_executor_environment() {
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("decode capability document");
     assert_eq!(document["version"], 1);
+    assert!(document["harnesses"].get("antigravity").is_none());
     assert_eq!(
         document["harnesses"]["codex"]["version"],
         "codex-fake 0.1.0"
@@ -180,6 +183,56 @@ fn capabilities_mode_reports_codex_from_its_executor_environment() {
         document["harnesses"]["codex"]["effort"]["models"],
         serde_json::json!([])
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_capability_mode_does_not_probe_codex() {
+    let directory = TestDirectory::new();
+    let bin = directory.0.join("bin");
+    fs::create_dir_all(&bin).expect("create fake executor PATH");
+    let codex_marker = directory.0.join("codex-probed");
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexit 19\n",
+            codex_marker.display()
+        ),
+    )
+    .expect("write Codex marker command");
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
+        .expect("make Codex command executable");
+    let antigravity = bin.join("agy");
+    fs::write(
+        &antigravity,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'agy 1.3.1\\n'; exit 0; fi\nif [ \"$1\" = \"models\" ]; then printf 'gemini-3.8-flash model\\n'; exit 0; fi\nexit 2\n",
+    )
+    .expect("write Antigravity command");
+    fs::set_permissions(&antigravity, fs::Permissions::from_mode(0o755))
+        .expect("make Antigravity command executable");
+    let mut search_path = vec![bin];
+    search_path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let search_path = std::env::join_paths(search_path).expect("build fake executor PATH");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tines-runner-rs"))
+        .args(["capabilities", "--harness", "antigravity"])
+        .env("PATH", search_path)
+        .output()
+        .expect("run selected Antigravity capability mode");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("decode capability document");
+    assert!(document["harnesses"].get("codex").is_none());
+    assert!(document["harnesses"].get("antigravity").is_some());
+    assert!(!codex_marker.exists());
 }
 
 #[cfg(unix)]
@@ -478,6 +531,62 @@ fn execute_runs_harness_and_emits_one_terminal_protocol_result() {
             .is_none(),
         "one-shot preparation removes its workspace after successful setup"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_uses_daemon_verified_effort_capabilities_without_codex_probes() {
+    let directory = TestDirectory::new();
+    let probe_log = directory.0.join("codex-probes");
+    let workspace_parent = directory.0.join("executor-workspaces");
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/execution-request-v1.json"))
+            .expect("valid execution request fixture");
+    fixture["execution"]["workspace"]["parent"] =
+        serde_json::Value::String(workspace_parent.to_string_lossy().into_owned());
+    fixture["assignment"]["effort"]["capability_digest"] = serde_json::Value::String(
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945".to_owned(),
+    );
+    fixture["assignment"]["effort"]["verification"] =
+        serde_json::Value::String("asserted".to_owned());
+    fixture["effort_capabilities"] = serde_json::json!({
+        "version": 1,
+        "daemon_version": "0.1.0",
+        "harness": "codex",
+        "harness_version": "codex-fake 0.1.0",
+        "catalog_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "models": [],
+        "accepts_asserted_effort": true
+    });
+
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then printf 'version\\n' >> '{}'; printf '%s\\n' 'codex-fake 0.1.0'; exit 0; fi\nif [ \"${{1:-}}\" = \"app-server\" ]; then printf 'models\\n' >> '{}'; while IFS= read -r message; do case \"$message\" in *'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"id\":1,\"result\":{{}}}}' ;; *'\"method\":\"model/list\"'*) printf '%s\\n' '{{\"id\":3,\"result\":{{\"data\":[],\"nextCursor\":null}}}}' ;; esac; done; exit 0; fi\nprintf 'execution\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"verified-capabilities\"}}' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+        probe_log.display(),
+        probe_log.display(),
+        probe_log.display()
+    );
+    let output = run_executor_with_codex(fixture.to_string().as_bytes(), &directory, &script);
+
+    assert!(
+        output.status.success(),
+        "execute rejected daemon-verified effort evidence: {}; events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(probe_log).expect("read Codex invocation counter"),
+        "execution\n",
+        "the actual executor must validate the passed report without version or model probes"
+    );
+    let mut parser = ExecutionEventParser::default();
+    let events = parser
+        .push(&output.stdout)
+        .expect("executor output should be JSONL");
+    assert!(parser.finish().unwrap().is_none());
+    assert!(matches!(
+        events.last().map(|event| &event.kind),
+        Some(ExecutionEventKind::Result { result }) if result.status == TerminalStatus::Completed
+    ));
 }
 
 #[cfg(target_os = "linux")]

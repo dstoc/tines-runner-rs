@@ -457,6 +457,90 @@ fn stop_gracefully(fake: &FakeTines, runner: &mut RunnerProcess) {
 }
 
 #[test]
+fn named_runner_initial_capability_discovery_is_serialized() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let control = directory.path.join("capability-probes");
+    fs::create_dir_all(&control).expect("create capability probe directory");
+    let probe = directory.path.join("serialized-capability-executor");
+    fs::write(
+        &probe,
+        r##"#!/bin/sh
+label=$1
+control=$2
+if [ "${3:-}" = capabilities ]; then
+    : > "$control/$label-started"
+    while ! mkdir "$control/lock" 2>/dev/null; do sleep 0.002; done
+    active=0
+    if [ -f "$control/active" ]; then active=$(cat "$control/active"); fi
+    active=$((active + 1))
+    printf '%s\n' "$active" > "$control/active"
+    if [ "$active" -gt 1 ]; then : > "$control/overlap"; fi
+    rmdir "$control/lock"
+    sleep 0.25
+    while ! mkdir "$control/lock" 2>/dev/null; do sleep 0.002; done
+    active=$(cat "$control/active")
+    active=$((active - 1))
+    printf '%s\n' "$active" > "$control/active"
+    rmdir "$control/lock"
+    printf '%s\n' '{"version":1,"harnesses":{"codex":{"version":"codex-init-test"}}}'
+    exit 0
+fi
+cat >/dev/null
+printf '%s\n' '{"version":1,"type":"result","status":"completed","exit_code":0,"interrupted":false}'
+"##,
+    )
+    .expect("write serialized capability executor");
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))
+        .expect("make capability executor executable");
+    let config_path = directory.path.join("serialized-runners.toml");
+    let executor = |id: &str| {
+        serde_json::to_string(&vec![
+            probe.to_string_lossy().into_owned(),
+            id.to_owned(),
+            control.to_string_lossy().into_owned(),
+        ])
+        .expect("encode serialized executor argv")
+    };
+    let workspaces = directory.path.join("workspaces");
+    fs::create_dir_all(&workspaces).expect("create runner workspace parent");
+    let config = format!(
+        "[server]\nurl = {:?}\n\n[runners.first]\nname = \"serialized-first\"\ncredentials_file = {:?}\nrunner_type = \"codex\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n\n[runners.second]\nname = \"serialized-second\"\ncredentials_file = {:?}\nrunner_type = \"codex\"\nexecutor = {}\nexecutor_cwd = \"~\"\nworkspace_parent = {:?}\npoll_interval_seconds = 1\n\n[storage]\nstate_dir = {:?}\n",
+        fake.url(),
+        directory.path.join("first/credentials.toml"),
+        executor("first"),
+        workspaces,
+        directory.path.join("second/credentials.toml"),
+        executor("second"),
+        workspaces,
+        directory.path.join("state")
+    );
+    fs::write(&config_path, config).expect("write serialized runner config");
+
+    let mut runner = directory.runner_for(&config_path, None, Some("fake-bootstrap-key"));
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        let registrations = requests
+            .iter()
+            .filter(|request| request.target == "/api/v1/runners/register")
+            .count();
+        let poll_targets = poll_requests(requests)
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        registrations == 2 && poll_targets.len() == 2
+    });
+
+    assert!(control.join("first-started").is_file());
+    assert!(control.join("second-started").is_file());
+    assert!(
+        !control.join("overlap").exists(),
+        "runner initialization must wait for the first capability probe to finish"
+    );
+    runner.assert_running();
+    stop_gracefully(&fake, &mut runner);
+}
+
+#[test]
 fn one_daemon_supervises_named_runners_with_independent_state_and_shutdown() {
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
@@ -1066,6 +1150,134 @@ fn supervisor_cancellation_terminates_native_executor_and_codex_descendants() {
 }
 
 #[test]
+fn capability_refresh_does_not_block_cancellation_polling() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    let events = directory.path.join("events");
+    let captures = directory.path.join("captures");
+    let control = directory.path.join("control");
+    let workspaces = directory.path.join("workspaces");
+    let state_dir = directory.path.join("state");
+    for path in [&events, &captures, &control, &workspaces] {
+        fs::create_dir_all(path).expect("create capability-refresh fixture directory");
+    }
+
+    let capability_probe = directory.path.join("blocking-capability-probe");
+    fs::write(
+        &capability_probe,
+        r##"#!/bin/sh
+set -eu
+control=$1
+printf x >> "$control/probe-count"
+count=$(wc -c < "$control/probe-count")
+if [ "$count" -gt 1 ]; then
+    : > "$control/refresh-started"
+    while [ ! -f "$control/release-refresh" ]; do sleep 0.01; done
+fi
+printf '%s\n' '{"version":1,"harnesses":{"codex":{"version":"codex-fake 0.1.0","effort":{"version":1,"daemon_version":"0.1.0","harness":"codex","harness_version":"codex-fake 0.1.0","catalog_digest":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","models":[],"accepts_asserted_effort":true}}}}'
+"##,
+    )
+    .expect("write blocking capability probe");
+    fs::set_permissions(&capability_probe, fs::Permissions::from_mode(0o755))
+        .expect("make capability probe executable");
+
+    let executor_args = executor(&stub, "refresh-test", &events, &captures, &control);
+    let capability_args = serde_json::to_string(&vec![
+        capability_probe.to_string_lossy().into_owned(),
+        control.to_string_lossy().into_owned(),
+    ])
+    .expect("encode capability probe argv");
+    let config_path = directory.path.join("config/tines-runner-rs");
+    fs::create_dir_all(&config_path).expect("create runner config directory");
+    fs::write(
+        config_path.join("config.toml"),
+        format!(
+            "[server]\nurl = {:?}\n[runner]\nname = \"capability-refresh-test\"\nexecutor_cwd = \"~\"\nexecutor = {}\ncapabilities_executor = {}\nworkspace_parent = {:?}\nmax_concurrent = 2\npoll_interval_seconds = 1\n[storage]\ncredentials_file = {:?}\nstate_dir = {:?}\n",
+            fake.url(),
+            executor_args,
+            capability_args,
+            workspaces,
+            directory.path.join("credentials.toml"),
+            state_dir
+        ),
+    )
+    .expect("write capability-refresh runner config");
+
+    let first_run = "arun_capability_refresh_cancelled";
+    fs::write(control.join(format!("{first_run}.child")), "start child")
+        .expect("configure the first run to remain active");
+    fake.enqueue_poll(json!({
+        "assignments": [assignment(first_run, 5, Vec::new())],
+        "cancels": []
+    }));
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    wait_for_file(
+        &control.join(format!("{first_run}.pid")),
+        Duration::from_secs(15),
+    );
+
+    let stale_run = "arun_capability_refresh_stale";
+    let mut stale_assignment = assignment(stale_run, 5, Vec::new());
+    stale_assignment["effort"] = json!({
+        "version": 1,
+        "value": "high",
+        "capability_digest": "stale-capability-catalog",
+        "verification": "asserted"
+    });
+    fake.enqueue_poll(json!({"assignments": [stale_assignment], "cancels": []}));
+    wait_for_file(&control.join("refresh-started"), Duration::from_secs(15));
+
+    fake.enqueue_poll(json!({
+        "assignments": [],
+        "cancel_requests": [{"run_id": first_run, "token": "refresh-cancel-token"}],
+        "cancels": []
+    }));
+    fake.wait_for(Duration::from_secs(10), |requests| {
+        poll_requests(requests).iter().any(|request| {
+            request.json()["cancellation_acks"]
+                .as_array()
+                .is_some_and(|acks| {
+                    acks.iter().any(|ack| {
+                        ack["run_id"] == first_run && ack["token"] == "refresh-cancel-token"
+                    })
+                })
+        })
+    });
+    assert!(
+        !control.join("release-refresh").exists(),
+        "the cancellation must be acknowledged while the capability probe remains blocked"
+    );
+    assert_process_stopped(
+        fs::read_to_string(control.join(format!("{first_run}.pid")))
+            .expect("read first run child PID")
+            .trim()
+            .parse::<u32>()
+            .expect("parse first run child PID"),
+    );
+
+    fs::write(control.join("release-refresh"), "release")
+        .expect("release capability refresh probe");
+    fake.wait_for(Duration::from_secs(15), |requests| {
+        poll_requests(requests).iter().any(|request| {
+            request.json()["declined_assignments"]
+                .as_array()
+                .is_some_and(|declined| declined.contains(&json!(stale_run)))
+        })
+    });
+    assert_eq!(
+        fs::read(control.join("probe-count"))
+            .expect("read capability probe count")
+            .len(),
+        2,
+        "initial discovery and one event-driven refresh should each run once"
+    );
+
+    stop_gracefully(&fake, &mut runner);
+    assert!(fake.unexpected_requests().is_empty());
+}
+
+#[test]
 fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
     let directory = TestDirectory::new();
     let fake = FakeTines::start();
@@ -1255,6 +1467,56 @@ fn tines_end_to_end_acceptance_routes_issue_and_completes_the_run() {
         "unexpected protocol requests: {:?}",
         fake.unexpected_requests()
     );
+}
+
+#[test]
+fn daemon_passes_its_verified_effort_report_to_executor_request() {
+    let directory = TestDirectory::new();
+    let fake = FakeTines::start();
+    let stub = directory.create_stub();
+    directory.configure(fake.url().as_str(), &stub, 1, false);
+    let run_id = "arun_verified_effort_request";
+    let mut assignment = assignment(run_id, 5, Vec::new());
+    assignment["effort"] = json!({
+        "version": 1,
+        "value": "high",
+        "capability_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "verification": "asserted"
+    });
+    fake.enqueue_poll(json!({"assignments": [assignment], "cancels": []}));
+    directory.write_events(
+        run_id,
+        [json!({
+            "version": 1,
+            "type": "result",
+            "status": "completed",
+            "exit_code": 0,
+            "interrupted": false
+        })],
+    );
+
+    let mut runner = directory.runner(Some("fake-bootstrap-key"));
+    let finishes = fake.wait_for_finishes(1, Duration::from_secs(20));
+    assert_eq!(finishes[0]["status"], "completed");
+    let request_path = directory
+        .path
+        .join(format!("captures/{run_id}.request.json"));
+    let executor_request: Value =
+        serde_json::from_slice(&fs::read(request_path).expect("read executor request"))
+            .expect("decode executor request");
+    assert_eq!(executor_request["effort_capabilities"]["harness"], "codex");
+    assert_eq!(
+        executor_request["effort_capabilities"]["catalog_digest"],
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    );
+    assert_eq!(executor_request["effort_capabilities"]["models"], json!([]));
+    assert_eq!(
+        executor_request["assignment"]["effort"]["verification"],
+        "asserted"
+    );
+
+    stop_gracefully(&fake, &mut runner);
+    assert!(fake.unexpected_requests().is_empty());
 }
 
 #[test]

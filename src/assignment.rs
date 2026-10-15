@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::config::{Config, ConfigResolution, MatchContext};
+use crate::effort::EffortCapabilities;
 use crate::protocol::RunnerAssignment;
 use crate::protocol::client::{Client, ClientError, RunLogBuffer};
 
@@ -12,17 +13,28 @@ use crate::protocol::client::{Client, ClientError, RunLogBuffer};
 pub struct PreparedAssignment {
     resolved: ResolvedAssignment,
     run_logs: RunLogBuffer,
+    effort_capabilities: Option<EffortCapabilities>,
 }
 
 impl PreparedAssignment {
     pub fn new(resolved: ResolvedAssignment) -> Self {
         let run_logs = RunLogBuffer::for_assignment(resolved.assignment());
-        Self { resolved, run_logs }
+        Self {
+            resolved,
+            run_logs,
+            effort_capabilities: None,
+        }
     }
 
     /// Share the ordered run-log stream with the poll loop and executor worker.
     pub fn with_run_log_buffer(mut self, run_logs: RunLogBuffer) -> Self {
         self.run_logs = run_logs;
+        self
+    }
+
+    /// Attach the daemon-verified effort report for this execution request.
+    pub fn with_effort_capabilities(mut self, capabilities: Option<EffortCapabilities>) -> Self {
+        self.effort_capabilities = capabilities;
         self
     }
 
@@ -32,6 +44,10 @@ impl PreparedAssignment {
 
     pub fn assignment(&self) -> &RunnerAssignment {
         self.resolved.assignment()
+    }
+
+    pub fn effort_capabilities(&self) -> Option<&EffortCapabilities> {
+        self.effort_capabilities.as_ref()
     }
 
     /// Return the shared log stream for execution and supervisor coordination.
@@ -62,6 +78,7 @@ impl fmt::Debug for PreparedAssignment {
         f.debug_struct("PreparedAssignment")
             .field("resolved", &self.resolved)
             .field("run_logs", &self.run_logs)
+            .field("effort_capabilities", &self.effort_capabilities)
             .finish()
     }
 }

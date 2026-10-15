@@ -3,6 +3,7 @@
 pub mod assignment;
 pub mod assignment_worker;
 pub mod cancellation;
+pub mod capability_cache;
 pub mod config;
 pub mod credentials;
 pub mod diagnostic;

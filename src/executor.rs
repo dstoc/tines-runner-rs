@@ -205,7 +205,10 @@ pub fn execute_request(
     if output_error.is_none() {
         let capabilities =
             if request.assignment.effort.is_some() && request.execution.harness == "codex" {
-                EffortCapabilities::discover(crate::VERSION)
+                request
+                    .effort_capabilities
+                    .clone()
+                    .unwrap_or_else(|| EffortCapabilities::discover(crate::VERSION))
             } else {
                 EffortCapabilities {
                     version: 1,

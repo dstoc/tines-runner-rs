@@ -226,7 +226,9 @@ Each runner needs its own credentials file and Tines registration. The daemon
 keeps each runner's poll loop, capability cache, concurrency limit, and recovery
 state separate. Set `TINES_API_KEY` for the first `--check` of each runner.
 Pass `--runner <id>` to start only one named runner for debugging or a
-specialized deployment.
+specialized deployment. When one daemon starts several runners, it completes
+each runner's initial capability discovery before it begins the next runner's
+initialization. Polling and assignment workers run independently after startup.
 
 ### 3. Start the daemon
 
@@ -359,18 +361,22 @@ own filesystem when it exits, even if the executor retained them. Mount the
 workspace path to persistent storage to keep executor workspaces after the
 container exits.
 
-Capability discovery also crosses the executor boundary. The daemon invokes
-`capabilities_executor` when it is set and otherwise uses the resolved
-`executor` command. It appends `capabilities` and runs the command from the same
-required `executor_cwd` used for assignments. The daemon caches the versioned
-report for ten minutes. The report includes the built-in custom harness and
-discovers Codex and Antigravity inside the executor environment. Antigravity
-uses `agy --version` and `agy models`; its discovered model slugs are sent to
+Capability discovery also crosses the executor boundary. For Codex or
+Antigravity, the daemon invokes `capabilities_executor` when it is set and
+otherwise uses the resolved `executor` command. It appends
+`capabilities --harness <runner_type>` and runs the command from the same
+required `executor_cwd` used for assignments. The executor probes only that
+native harness and returns its versioned report with static custom support.
+Custom runners use static support and do not invoke a capability executor.
+Antigravity uses `agy --version` and `agy models`; its model slugs are sent to
 Tines under the `pi` capability identity with no selectable effort values.
-Assignments with explicit Antigravity effort are declined. The daemon refreshes
-the report before it accepts assignments with enforced effort. An invalid
-report or unsupported harness or effort causes the daemon to decline the
-incompatible assignment.
+Assignments with explicit Antigravity effort are declined. The daemon keeps
+reports in memory until it detects stale data. If an effort assignment is not
+supported by the cached report, the daemon refreshes it once before it declines
+the assignment. A classified model or effort incompatibility from execution
+refreshes the report for future assignments. Other execution failures do not
+invalidate it, and the daemon does not retry the failed assignment. Assignment
+overrides cache reports by effective executor transport and harness.
 
 Use `capabilities_executor` when the normal transport needs per-run credentials
 that a capability probe does not need. For example, with
@@ -400,7 +406,9 @@ the same image and mounts, so the probe reports the harness that assignments
 will use. If an override changes `executor` to a different harness environment,
 set `capabilities_executor` in a matching override to probe that environment.
 Capability discovery does not receive the assignment run key, and the daemon
-removes inherited Tines credentials from the probe environment.
+removes inherited Tines credentials from the probe environment. A native
+runner receives `capabilities --harness codex` or
+`capabilities --harness antigravity`, according to its effective runner type.
 `capabilities_executor` is also resolved per assignment through
 `[[runners.<id>.override]]` entries. Like `executor`, it is an argv array and
 the daemon launches it without a shell.

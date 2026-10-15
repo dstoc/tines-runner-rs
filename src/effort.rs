@@ -15,7 +15,6 @@ use crate::protocol::{RunnerAssignment, RunnerAssignmentEffort};
 
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_STDOUT: usize = 1024 * 1024;
-pub const MAX_EFFORT_CAPABILITIES_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_MODELS: usize = 256;
 const MAX_EFFORTS_PER_MODEL: usize = 16;
 const RECOGNIZED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -97,12 +96,6 @@ impl EffortCapabilities {
             accepts_asserted_effort: None,
             discovery_error: Some(truncate(reason, 200)),
         }
-    }
-
-    /// Return true after the report has expired or when no report exists yet.
-    pub fn refresh_due(&self, refreshed_at: Option<Instant>, now: Instant) -> bool {
-        refreshed_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= MAX_EFFORT_CAPABILITIES_AGE)
     }
 
     /// Check that this report has a valid catalog and belongs to `harness`.
@@ -567,7 +560,6 @@ mod tests {
     use crate::protocol::{RunReference, RunnerAssignment, RunnerAssignmentEffort};
     use std::io::{self, Read};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
 
     fn capabilities() -> EffortCapabilities {
         success_report(
@@ -728,15 +720,6 @@ mod tests {
             .is_err()
         );
         assert!(report.accepts_asserted_effort.unwrap());
-    }
-
-    #[test]
-    fn refresh_is_ttl_gated_and_missing_data_refreshes_immediately() {
-        let report = capabilities();
-        let now = Instant::now();
-        assert!(report.refresh_due(None, now));
-        assert!(!report.refresh_due(Some(now), now + Duration::from_secs(599)));
-        assert!(report.refresh_due(Some(now), now + Duration::from_secs(600)));
     }
 
     #[test]

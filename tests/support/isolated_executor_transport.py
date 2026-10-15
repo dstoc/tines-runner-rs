@@ -10,7 +10,9 @@ import sys
 import threading
 
 captures, runner_binary, executor_bin, executor_home = sys.argv[1:5]
-mode = sys.argv[-1]
+arguments = sys.argv[5:]
+capability_index = arguments.index("capabilities") if "capabilities" in arguments else None
+mode = "capabilities" if capability_index is not None else arguments[-1]
 child = None
 received_signal = None
 
@@ -63,7 +65,7 @@ if mode == "capabilities":
     capability_capture = os.path.join(captures, f"capabilities-{os.getpid()}.json")
     save_json(capability_capture, record)
     child = subprocess.Popen(
-        [runner_binary, "capabilities"],
+        [runner_binary, *arguments[capability_index:]],
         cwd=os.getcwd(),
         env=child_environment,
         stdin=subprocess.DEVNULL,

@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_json::{Map, Value};
 
 use crate::config::{RepositoryCheckoutPolicy, RetentionMode};
+use crate::effort::EffortCapabilities;
 use crate::protocol::RunnerAssignment;
 
 /// The current daemon/executor protocol version.
@@ -28,6 +29,9 @@ pub struct ExecutionRequest {
     pub tines: TinesExecutionContext,
     pub execution: LocalExecutionPolicy,
     pub assignment: RunnerAssignment,
+    /// Daemon-verified Codex catalog used to validate enforced effort locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_capabilities: Option<EffortCapabilities>,
 }
 
 impl ExecutionRequest {

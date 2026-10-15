@@ -95,15 +95,22 @@ pub fn execution_request(
             }
             assignment
         },
+        effort_capabilities: None,
     }
 }
 
 /// A direct argv command and its required daemon-side working directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ExecutorTransport {
     argv: Vec<String>,
     executor_cwd: PathBuf,
     capabilities_transport_name: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CapabilityTransportIdentity {
+    argv: Vec<String>,
+    executor_cwd: PathBuf,
 }
 
 impl ExecutorTransport {
@@ -140,6 +147,14 @@ impl ExecutorTransport {
     /// Name of the configuration field that selected this transport.
     pub fn config_source(&self) -> &'static str {
         self.capabilities_transport_name
+    }
+
+    /// Return the effective probe command identity, without its display source.
+    pub(crate) fn capability_cache_identity(&self) -> CapabilityTransportIdentity {
+        CapabilityTransportIdentity {
+            argv: self.argv.clone(),
+            executor_cwd: self.executor_cwd.clone(),
+        }
     }
 
     /// Return a stable, sanitized identifier for grouping probe failures.
@@ -180,6 +195,13 @@ impl ExecutorTransport {
     fn discover_capabilities_with_stderr(
         &self,
     ) -> Result<(ExecutorCapabilities, Option<String>), ExecutorTransportError> {
+        self.discover_capabilities_with_stderr_for_harness(None)
+    }
+
+    fn discover_capabilities_with_stderr_for_harness(
+        &self,
+        harness: Option<&str>,
+    ) -> Result<(ExecutorCapabilities, Option<String>), ExecutorTransportError> {
         let program = self
             .argv
             .first()
@@ -190,7 +212,11 @@ impl ExecutorTransport {
         let mut command = Command::new(program);
         command
             .args(self.argv.iter().skip(1))
-            .arg(CAPABILITIES_MODE)
+            .arg(CAPABILITIES_MODE);
+        if let Some(harness) = harness {
+            command.args(["--harness", harness]);
+        }
+        command
             .current_dir(working_directory)
             .stdin(std::process::Stdio::null());
         command.env_clear();
@@ -265,7 +291,7 @@ impl ExecutorTransport {
         configured_harness: Option<&str>,
     ) -> ExecutorCapabilities {
         let path = self.diagnostic_identity();
-        match self.discover_capabilities_with_stderr() {
+        match self.discover_capabilities_with_stderr_for_harness(configured_harness) {
             Ok((capabilities, stderr)) => {
                 let scoped_path =
                     configured_harness.map(|harness| format!("{path}:harness:{harness}"));

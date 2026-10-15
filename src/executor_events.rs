@@ -86,6 +86,14 @@ impl ExecutorEventStream {
     ) -> FinishRunRequest {
         self.report.finish_request(failure, stderr, interrupted)
     }
+
+    /// Whether a failed Codex run returned a classified model or effort error.
+    pub fn model_effort_incompatibility(&self) -> bool {
+        self.report.model_effort_incompatibility
+            && self.report.result.as_ref().is_some_and(|result| {
+                result.status == TerminalStatus::Failed && !result.interrupted
+            })
+    }
 }
 
 /// A protocol failure and any logs parsed earlier in the same stdout chunk.
@@ -114,6 +122,7 @@ struct ExecutorRunReport {
     latest_pricing: Option<ExecutionPricingEvidence>,
     latest_rate_limit: Option<ExecutionRateLimit>,
     latest_provider_error: Option<String>,
+    model_effort_incompatibility: bool,
     result: Option<TerminalResult>,
 }
 
@@ -158,6 +167,7 @@ impl ExecutorRunReport {
             latest_pricing: None,
             latest_rate_limit: None,
             latest_provider_error: None,
+            model_effort_incompatibility: false,
             result: None,
         }
     }
@@ -170,7 +180,13 @@ impl ExecutorRunReport {
                 self.latest_session = Some(id);
                 None
             }
-            ExecutionEventKind::ProviderError { message, .. } => {
+            ExecutionEventKind::ProviderError {
+                provider,
+                code,
+                message,
+            } => {
+                self.model_effort_incompatibility =
+                    is_model_effort_incompatibility(&provider, code.as_deref());
                 self.latest_provider_error = Some(message);
                 None
             }
@@ -354,6 +370,21 @@ impl ExecutorRunReport {
             resume_at,
         }
     }
+}
+
+fn is_model_effort_incompatibility(provider: &str, code: Option<&str>) -> bool {
+    provider == "codex"
+        && matches!(
+            code,
+            Some(
+                "invalid_model"
+                    | "model_not_found"
+                    | "unsupported_model"
+                    | "unsupported_effort"
+                    | "unsupported_reasoning_effort"
+                    | "reasoning_effort_not_supported"
+            )
+        )
 }
 
 fn render_log(stream: LogStream, message: &str) -> Option<String> {
@@ -635,6 +666,40 @@ mod tests {
             let finish = stream.finish_request(None, "", false);
             assert_eq!(finish.status, expected_status);
             assert_eq!(finish.judgment, expected_judgment);
+        }
+    }
+
+    #[test]
+    fn only_classified_codex_model_or_effort_failures_mark_capabilities_stale() {
+        let cases = [
+            ("codex", "model_not_found", true),
+            ("codex", "unsupported_reasoning_effort", true),
+            ("codex", "invalid_request_error", false),
+            ("other", "model_not_found", false),
+        ];
+        for (provider, code, expected) in cases {
+            let mut stream = ExecutorEventStream::new(&request());
+            stream
+                .push(&line(json!({
+                    "version":1,
+                    "type":"provider_error",
+                    "provider":provider,
+                    "code":code,
+                    "message":"rejected"
+                })))
+                .expect("parse provider error");
+            stream
+                .push(&line(json!({
+                    "version":1,
+                    "type":"result",
+                    "status":"failed",
+                    "exit_code":1,
+                    "error":"rejected",
+                    "interrupted":false
+                })))
+                .expect("parse failed result");
+            stream.finish().expect("terminal result");
+            assert_eq!(stream.model_effort_incompatibility(), expected);
         }
     }
 }

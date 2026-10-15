@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tines_runner_rs::assignment::{PreparedAssignment, resolve_assignment};
-use tines_runner_rs::assignment_worker::{AssignmentTaskOutcome, run_assignment};
+use tines_runner_rs::assignment_worker::{
+    AssignmentTaskOutcome, run_assignment, run_assignment_with_cache_reporter,
+};
 use tines_runner_rs::cancellation::CancellationToken;
+use tines_runner_rs::capability_cache::ExecutorCapabilityCache;
 use tines_runner_rs::config::Config;
 use tines_runner_rs::credentials::{CredentialStore, RunnerCredentials};
 use tines_runner_rs::effort::EffortCapabilities;
@@ -21,6 +24,7 @@ use tines_runner_rs::execution::{
     ExecutionContext, ExecutionOutcome, execute_assignment_cancellable,
 };
 use tines_runner_rs::executor_capabilities::{ExecutorCapabilities, ExecutorHarnessCapabilities};
+use tines_runner_rs::logging::FailureReporter;
 use tines_runner_rs::protocol::RunnerAssignment;
 use tines_runner_rs::protocol::RunnerAssignmentEffort;
 use tines_runner_rs::protocol::client::Client;
@@ -245,6 +249,27 @@ printf '%s\n' '{"version":1,"type":"result","status":"completed","exit_code":0,"
     .expect("write executor stub");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
         .expect("make executor stub executable");
+    path
+}
+
+fn provider_failure_executor(directory: &TestDirectory, name: &str, code: &str) -> PathBuf {
+    let path = directory.0.join(name);
+    let capability_count = directory.0.join(format!("{name}-capabilities"));
+    let execution_count = directory.0.join(format!("{name}-executions"));
+    let effort = capabilities();
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = capabilities ]; then\n  printf x >> '{}'\n  printf '%s\\n' '{{\"version\":1,\"harnesses\":{{\"codex\":{{\"version\":\"stub\",\"effort\":{{\"version\":1,\"daemon_version\":\"test-runner\",\"harness\":\"codex\",\"harness_version\":\"stub\",\"catalog_digest\":\"{}\",\"models\":[],\"accepts_asserted_effort\":false}}}}}}}}'\n  exit 0\nfi\nprintf x >> '{}'\ncat >/dev/null\nprintf '%s\\n' '{{\"version\":1,\"type\":\"provider_error\",\"provider\":\"codex\",\"code\":\"{}\",\"message\":\"request rejected\"}}' '{{\"version\":1,\"type\":\"result\",\"status\":\"failed\",\"exit_code\":1,\"error\":\"request rejected\",\"interrupted\":false}}'\n",
+            capability_count.display(),
+            effort.catalog_digest,
+            execution_count.display(),
+            code
+        ),
+    )
+    .expect("write provider-error executor");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("make provider-error executor executable");
     path
 }
 
@@ -565,6 +590,108 @@ fn executor_effort_capabilities_authorize_effort_without_a_legacy_launcher() {
 }
 
 #[test]
+fn cached_unsupported_effort_refreshes_once_before_declining() {
+    let directory = TestDirectory::new();
+    let executor =
+        provider_failure_executor(&directory, "unsupported-effort-executor", "model_not_found");
+    let (server_url, server, _log_seen) = cancellation_server(1);
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
+    let active_runs =
+        ActiveRunStore::open(directory.0.join("active-runs.json")).expect("load active-run state");
+    let shutdown = ShutdownSignal::inactive();
+    let context = ExecutionContext::new(&shutdown, &active_runs);
+    let mut assignment = assignment(None);
+    assignment.run.model = Some("unsupported-model".to_owned());
+    assignment.effort = Some(RunnerAssignmentEffort {
+        version: 1,
+        value: "high".to_owned(),
+        capability_digest: Some(capabilities().catalog_digest),
+        verification: Some("asserted".to_owned()),
+    });
+
+    let outcome = run_assignment_with_cache_reporter(
+        &config,
+        &connection,
+        &client,
+        assignment,
+        tines_runner_rs::protocol::client::RunLogBuffer::new(),
+        &ExecutorCapabilityCache::default(),
+        &FailureReporter::default(),
+        &CancellationToken::default(),
+        &context,
+    )
+    .expect("refresh unsupported effort before declining");
+
+    assert!(matches!(
+        outcome,
+        AssignmentTaskOutcome::Declined(reason)
+            if reason.contains("unsupported-model effort support could not be verified")
+    ));
+    assert_eq!(
+        fs::read(directory.0.join("unsupported-effort-executor-capabilities"))
+            .expect("read capability probe count")
+            .len(),
+        2
+    );
+    assert!(
+        !directory
+            .0
+            .join("unsupported-effort-executor-executions")
+            .exists(),
+        "unsupported assignments do not start the executor"
+    );
+    let requests = server.join().expect("join fake Tines server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
+}
+
+#[test]
+fn only_classified_model_or_effort_failures_refresh_capabilities() {
+    for (code, expected_probes) in [("model_not_found", 2), ("authentication_error", 1)] {
+        let directory = TestDirectory::new();
+        let executor = provider_failure_executor(&directory, "provider-failure-executor", code);
+        let (server_url, server, _log_seen) = cancellation_server(3);
+        let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
+        let active_runs = ActiveRunStore::open(directory.0.join("active-runs.json"))
+            .expect("load active-run state");
+        let shutdown = ShutdownSignal::inactive();
+        let context = ExecutionContext::new(&shutdown, &active_runs);
+
+        let outcome = run_assignment_with_cache_reporter(
+            &config,
+            &connection,
+            &client,
+            assignment(None),
+            tines_runner_rs::protocol::client::RunLogBuffer::new(),
+            &ExecutorCapabilityCache::default(),
+            &FailureReporter::default(),
+            &CancellationToken::default(),
+            &context,
+        )
+        .expect("settle provider failure");
+
+        assert_eq!(outcome, AssignmentTaskOutcome::Finished);
+        assert_eq!(
+            fs::read(directory.0.join("provider-failure-executor-capabilities"))
+                .expect("read capability probe count")
+                .len(),
+            expected_probes,
+            "provider error code {code} controls refresh"
+        );
+        assert_eq!(
+            fs::read(directory.0.join("provider-failure-executor-executions"))
+                .expect("read execution count")
+                .len(),
+            1,
+            "the assignment is never automatically rerun"
+        );
+        let requests = server.join().expect("join fake Tines server");
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/finish "));
+    }
+}
+
+#[test]
 fn codex_to_custom_override_accepts_effort_without_codex_effort_capabilities() {
     let directory = TestDirectory::new();
     let (server_url, server, _log_seen) = cancellation_server(3);
@@ -629,9 +756,9 @@ fn codex_to_custom_override_accepts_effort_without_codex_effort_capabilities() {
 }
 
 #[test]
-fn custom_override_still_requires_verified_custom_harness_support() {
+fn custom_override_uses_static_support_without_a_capability_probe() {
     let directory = TestDirectory::new();
-    let (server_url, server, _log_seen) = cancellation_server(1);
+    let (server_url, server, _log_seen) = cancellation_server(3);
     let executor = successful_executor(&directory, "unsupported-custom-executor");
     let (config, client, connection) = configured_with_overrides(
         &directory,
@@ -668,15 +795,12 @@ fn custom_override_still_requires_verified_custom_harness_support() {
     )
     .expect("decline a custom run without custom capability support");
 
-    assert!(matches!(
-        outcome,
-        AssignmentTaskOutcome::Declined(reason)
-            if reason.contains("configured executor could not verify support for the custom harness")
-    ));
+    assert_eq!(outcome, AssignmentTaskOutcome::Finished);
     let requests = server.join().expect("join fake Tines server");
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 3);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
-    assert!(!directory.0.join("workspaces").exists());
+    assert!(requests[1].starts_with("POST /api/v1/runs/arun_cancel/logs "));
+    assert!(requests[2].starts_with("POST /api/v1/runs/arun_cancel/finish "));
 }
 
 #[test]
@@ -751,7 +875,9 @@ fn antigravity_effort_is_declined_before_capability_or_harness_launch() {
 fn codex_effort_assignments_still_require_verified_effort_support() {
     let directory = TestDirectory::new();
     let (server_url, server, _log_seen) = cancellation_server(1);
-    let (config, client, connection) = configured(&directory, &server_url, None);
+    let executor =
+        provider_failure_executor(&directory, "unsupported-asserted-effort", "model_not_found");
+    let (config, client, connection) = configured(&directory, &server_url, Some(&executor));
     let default_executor = tines_runner_rs::executor_transport::ExecutorTransport::new(
         config.executor.clone(),
         config.executor_cwd.clone(),
@@ -786,6 +912,13 @@ fn codex_effort_assignments_still_require_verified_effort_support() {
         AssignmentTaskOutcome::Declined(reason)
             if reason == "the assigned model effort support could not be verified"
     ));
+    assert_eq!(
+        fs::read(directory.0.join("unsupported-asserted-effort-capabilities"))
+            .expect("read capability probe count")
+            .len(),
+        1,
+        "the cached report is refreshed once before decline"
+    );
     let requests = server.join().expect("join fake Tines server");
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("GET /api/v1/issues/iss_cancel "));
